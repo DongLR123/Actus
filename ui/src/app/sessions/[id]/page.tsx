@@ -15,6 +15,7 @@ import {
 import { ChatInput } from "@/components/chat-input";
 import { MarkdownRenderer } from "@/components/markdown-renderer";
 import { SessionHeader } from "@/components/session-header";
+import { StatusIndicator } from "@/components/status-indicator";
 import { SessionTaskDock } from "@/components/session-task-dock";
 import { WorkbenchPanel } from "@/components/workbench-panel";
 import { useIsMobile } from "@/hooks/use-mobile";
@@ -39,6 +40,7 @@ import {
   getToolDisplayCopy,
   normalizeMessageAttachments,
 } from "@/lib/session-ui";
+import { getSessionStatusMeta } from "@/lib/status-copy";
 import { cn } from "@/lib/utils";
 import { normalizeUnixSeconds } from "@/lib/takeover/normalize";
 import { useSessionStore } from "@/lib/store/session-store";
@@ -534,6 +536,10 @@ export default function SessionPage() {
     () => deriveSessionProgressSummary(eventList),
     [eventList]
   );
+  const currentStatusMeta = useMemo(
+    () => getSessionStatusMeta(visibleSession?.status || "pending"),
+    [visibleSession?.status]
+  );
   const workbenchVisible = (!isMobile && desktopWorkbenchVisible) || (isMobile && mobileWorkbenchOpen);
   const isCurrentSessionStreaming = Boolean(sessionId) && isChatting && chatSessionId === sessionId;
   const sessionRunning =
@@ -758,7 +764,10 @@ export default function SessionPage() {
         <main className="flex min-w-0 flex-1 flex-col">
           <div className="mb-3 flex items-center justify-between">
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <span>当前状态：{visibleSession?.status || "pending"}</span>
+              <span className="inline-flex items-center gap-1">
+                <span>当前状态：</span>
+                <StatusIndicator meta={currentStatusMeta} />
+              </span>
               {sessionRunning ? (
                 <span className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-0.5 text-amber-700 dark:bg-amber-500/10 dark:text-amber-400">
                   <Loader2 size={12} className="animate-spin" />

@@ -110,10 +110,38 @@ describe("SessionTaskDock", () => {
     expect(screen.getByText("执行步骤1")).toBeInTheDocument();
     expect(screen.getAllByText("执行步骤2").length).toBeGreaterThan(1);
     expect(screen.getByText("执行步骤3")).toBeInTheDocument();
+    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(screen.getByText("执行中")).toBeInTheDocument();
+    expect(screen.getByText("待执行")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "收起全部步骤" })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "收起全部步骤" }));
     expect(screen.queryByText("执行步骤1")).not.toBeInTheDocument();
+  });
+
+  it("步骤状态支持 started/failed 的统一中文映射", () => {
+    render(
+      <SessionTaskDock
+        summary={{
+          completed: 0,
+          total: 2,
+          currentStep: "步骤A",
+          hasPlan: true,
+          steps: [
+            { id: "a", description: "步骤A", status: "started" },
+            { id: "b", description: "步骤B", status: "failed" },
+          ],
+        }}
+        files={files}
+        onPreviewFile={() => {}}
+        onDownloadFile={() => {}}
+      />
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "展开任务摘要" }));
+    fireEvent.click(screen.getByRole("button", { name: "展开全部步骤" }));
+    expect(screen.getAllByText("执行中").length).toBeGreaterThan(0);
+    expect(screen.getByText("失败")).toBeInTheDocument();
   });
 
   it("仅一个步骤时不显示展开全部入口", () => {

@@ -1,14 +1,15 @@
 "use client";
 
-import { CheckCircle2, ChevronDown, ChevronUp, CircleDashed, Loader2, XCircle } from "lucide-react";
+import { ChevronDown, ChevronUp } from "lucide-react";
 import { memo, useMemo, useState } from "react";
 
+import { StatusIndicator } from "@/components/status-indicator";
 import type { FileInfo } from "@/lib/api/types";
 import {
   formatFileSize,
-  type SessionProgressStepStatus,
   type SessionProgressSummary,
 } from "@/lib/session-ui";
+import { getStepStatusMeta } from "@/lib/status-copy";
 import { cn } from "@/lib/utils";
 
 type SessionTaskDockProps = {
@@ -19,32 +20,6 @@ type SessionTaskDockProps = {
   onDownloadFile: (file: FileInfo) => void;
   className?: string;
 };
-
-function getStepStatusText(status: SessionProgressStepStatus): string {
-  if (status === "completed") {
-    return "已完成";
-  }
-  if (status === "failed") {
-    return "失败";
-  }
-  if (status === "running" || status === "started") {
-    return "进行中";
-  }
-  return "待执行";
-}
-
-function renderStepStatusIcon(status: SessionProgressStepStatus) {
-  if (status === "completed") {
-    return <CheckCircle2 size={14} className="text-emerald-500" />;
-  }
-  if (status === "failed") {
-    return <XCircle size={14} className="text-red-500" />;
-  }
-  if (status === "running" || status === "started") {
-    return <Loader2 size={14} className="animate-spin text-amber-500" />;
-  }
-  return <CircleDashed size={14} className="text-muted-foreground" />;
-}
 
 export const SessionTaskDock = memo(function SessionTaskDock({
   summary,
@@ -154,6 +129,7 @@ export const SessionTaskDock = memo(function SessionTaskDock({
                     <div className="max-h-56 space-y-2 overflow-y-auto rounded-lg border border-border bg-card/80 p-2">
                       {summary.steps.map((step, index) => {
                         const isCurrent = index === currentStepIndex;
+                        const stepStatusMeta = getStepStatusMeta(step.status);
                         return (
                           <div
                             key={`${step.id}-${index}`}
@@ -164,12 +140,9 @@ export const SessionTaskDock = memo(function SessionTaskDock({
                                 : "border-border bg-card"
                             )}
                           >
-                            <div className="mt-0.5 shrink-0">{renderStepStatusIcon(step.status)}</div>
                             <div className="min-w-0 flex-1">
                               <p className="truncate text-sm text-foreground/90">{step.description}</p>
-                              <p className="text-xs text-muted-foreground">
-                                {getStepStatusText(step.status)}
-                              </p>
+                              <StatusIndicator meta={stepStatusMeta} className="text-xs" />
                             </div>
                           </div>
                         );

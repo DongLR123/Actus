@@ -139,6 +139,9 @@ describe("SessionPage", () => {
 
     render(<SessionPage />);
 
+    expect(screen.getByText("当前状态：")).toBeInTheDocument();
+    expect(screen.getByText("已完成")).toBeInTheDocument();
+    expect(screen.queryByText("completed")).not.toBeInTheDocument();
     expect(screen.queryByText("正在执行中")).not.toBeInTheDocument();
   });
 
@@ -153,6 +156,10 @@ describe("SessionPage", () => {
     };
 
     render(<SessionPage />);
+
+    expect(screen.getByText("当前状态：")).toBeInTheDocument();
+    expect(screen.getByText("执行中")).toBeInTheDocument();
+    expect(screen.queryByText("running")).not.toBeInTheDocument();
 
     await waitFor(() => {
       expect(sessionStoreState.fetchSessionById).toHaveBeenCalledWith("s-b", {

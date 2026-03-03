@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { Loader2, Moon, Plus, Sun, Trash } from "lucide-react";
+import { Moon, Plus, Sun, Trash } from "lucide-react";
 import { useTheme } from "next-themes";
 
+import { StatusIndicator } from "@/components/status-indicator";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -15,6 +16,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { formatRelativeTime } from "@/lib/session-ui";
+import { getSessionStatusMeta } from "@/lib/status-copy";
 import { useSessionStore } from "@/lib/store/session-store";
 
 export function LeftPanel() {
@@ -100,12 +102,10 @@ export function LeftPanel() {
             </button>
             <div className="mt-1 flex items-center justify-between">
               <div className="flex items-center gap-1.5">
-                <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
-                  {session.status === "running" ? (
-                    <Loader2 size={11} className="animate-spin text-amber-500" />
-                  ) : null}
-                  {session.status}
-                </span>
+                <StatusIndicator
+                  meta={getSessionStatusMeta(session.status)}
+                  className="text-[11px]"
+                />
                 {session.unread_message_count > 0 ? (
                   <span className="rounded-full bg-primary px-1.5 py-0.5 text-[10px] text-primary-foreground">
                     {session.unread_message_count}

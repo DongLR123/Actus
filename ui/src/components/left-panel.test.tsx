@@ -39,6 +39,8 @@ describe("LeftPanel", () => {
     const { container } = render(<LeftPanel />);
 
     expect(screen.getByText("测试会话")).toBeInTheDocument();
+    expect(screen.getByText("执行中")).toBeInTheDocument();
+    expect(screen.queryByText("running")).not.toBeInTheDocument();
     const list = container.querySelector("aside > div.space-y-1") as HTMLElement;
     expect(list.className).toContain("overflow-y-auto");
   });
