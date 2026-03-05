@@ -56,6 +56,7 @@ class PlannerReActFlow(BaseFlow):
         a2a_tool: A2ATool,  # a2a远程agent
         skill_tool: SkillTool,  # 统一skill工具
         create_skill_tool: BaseTool | None = None,  # skill创建工具
+        brainstorm_skill_tool: BaseTool | None = None,  # skill头脑风暴工具
         overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
     ) -> None:
         """构造函数，完成规划与执行流的初始化"""
@@ -81,6 +82,8 @@ class PlannerReActFlow(BaseFlow):
         ]
         if create_skill_tool is not None:
             tools.append(create_skill_tool)
+        if brainstorm_skill_tool is not None:
+            tools.append(brainstorm_skill_tool)
 
         # 3.创建规划Agent
         self.planner = PlannerAgent(

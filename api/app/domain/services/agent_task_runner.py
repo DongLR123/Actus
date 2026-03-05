@@ -65,6 +65,7 @@ from app.application.services.skill_index_service import SkillIndexService
 from app.application.services.skill_selector import SkillSelectionMeta, SkillSelector
 from app.domain.services.flows.planner_react import PlannerReActFlow
 from app.domain.services.tools.a2a import A2ATool
+from app.domain.services.tools.brainstorm_skill import BrainstormSkillTool
 from app.domain.services.tools.create_skill import CreateSkillTool
 from app.domain.services.tools.mcp import MCPTool
 from app.domain.services.tools.skill import SkillTool
@@ -177,6 +178,13 @@ class AgentTaskRunner(TaskRunner):
             if skill_creator_service is not None
             else None
         )
+        self._brainstorm_skill_tool = (
+            BrainstormSkillTool(
+                skill_creator_service=skill_creator_service,
+            )
+            if skill_creator_service is not None
+            else None
+        )
         self._skill_index_service = SkillIndexService(
             skill_repository=self._skill_repository,
             skills_root=settings.skills_root_dir,
@@ -228,6 +236,7 @@ class AgentTaskRunner(TaskRunner):
             a2a_tool=self._a2a_tool,
             skill_tool=self._skill_tool,
             create_skill_tool=self._create_skill_tool,
+            brainstorm_skill_tool=self._brainstorm_skill_tool,
             overflow_config=self._overflow_config,
         )
 
@@ -728,6 +737,20 @@ class AgentTaskRunner(TaskRunner):
                 logger.debug("读取Skill Creator工具摘要失败，降级为空: %s", exc)
                 creator_tools = []
 
+        if self._brainstorm_skill_tool is not None:
+            try:
+                for schema in self._brainstorm_skill_tool.get_tools():
+                    if not isinstance(schema, dict):
+                        continue
+                    function_info = schema.get("function")
+                    if not isinstance(function_info, dict):
+                        continue
+                    tool_name = function_info.get("name")
+                    if isinstance(tool_name, str) and tool_name:
+                        creator_tools.append(tool_name)
+            except Exception as exc:
+                logger.debug("读取Brainstorm工具摘要失败，降级为空: %s", exc)
+
         lines = [
             "## Available Tool Summary",
             f"- shell: {', '.join(shell_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])}",
@@ -1055,7 +1078,7 @@ class AgentTaskRunner(TaskRunner):
                         event.tool_content = SkillToolContent(
                             skill_result="(Skill工具无可用结果)"
                         )
-                elif event.tool_name == "create_skill":
+                elif event.tool_name in ("generate_skill", "install_skill", "brainstorm_skill"):
                     if event.function_result and event.function_result.data is not None:
                         event.tool_content = SkillToolContent(
                             skill_result=event.function_result.data

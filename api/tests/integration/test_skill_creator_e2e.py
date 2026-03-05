@@ -9,7 +9,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from app.application.services.skill_creator_service import SkillCreatorService
-from app.domain.models.skill_creator import SkillCreationProgress, SkillCreationResult
+from app.domain.models.skill_creator import (
+    SkillCreationProgress,
+    SkillCreationResult,
+    SkillGeneratedFiles,
+)
 from app.domain.models.tool_result import ToolResult
 
 pytestmark = pytest.mark.anyio
@@ -121,4 +125,92 @@ async def test_full_pipeline_with_mocked_llm_and_sandbox() -> None:
     assert "validating" in steps
     assert "installing" in steps
 
+    mock_skill_service.install_skill.assert_called_once()
+
+
+async def test_brainstorm_generate_install_flow() -> None:
+    """端到端测试：brainstorm (analyze) → generate → install 完整流程。"""
+    mock_llm = AsyncMock()
+    mock_github = MagicMock()
+    mock_github.research_keywords = AsyncMock(return_value=[])
+    mock_github.format_research_report = MagicMock(return_value="无参考")
+    mock_skill_service = AsyncMock()
+    mock_skill_service.install_skill = AsyncMock(
+        return_value=SimpleNamespace(id="translator--abc12345", name="translator")
+    )
+    mock_sandbox = AsyncMock()
+    mock_sandbox.write_file = AsyncMock(return_value=ToolResult(success=True, message="ok"))
+    mock_sandbox.exec_command = AsyncMock(return_value=ToolResult(success=True, message="ok"))
+
+    service = SkillCreatorService(
+        llm=mock_llm,
+        github_client=mock_github,
+        skill_service=mock_skill_service,
+    )
+
+    # Step 1: brainstorm (analyze)
+    mock_llm.invoke.return_value = {
+        "role": "assistant",
+        "content": json.dumps(
+            {
+                "skill_name": "translator",
+                "description": "中英翻译",
+                "tools": [{"name": "translate", "description": "翻译", "parameters": []}],
+                "search_keywords": ["translate python"],
+                "estimated_deps": ["googletrans"],
+            }
+        ),
+    }
+    blueprint = await service.analyze("创建翻译工具")
+    assert blueprint.skill_name == "translator"
+
+    # Step 2: generate (with blueprint, skip analyze)
+    mock_llm.invoke.return_value = {
+        "role": "assistant",
+        "content": json.dumps(
+            {
+                "skill_md": "---\nname: translator\n---\n# Translator",
+                "manifest": {
+                    "name": "translator",
+                    "slug": "translator",
+                    "version": "0.1.0",
+                    "description": "中英翻译",
+                    "runtime_type": "native",
+                    "tools": [
+                        {
+                            "name": "translate",
+                            "description": "翻译",
+                            "parameters": {},
+                            "required": [],
+                            "entry": {"command": "python bundle/translate.py"},
+                        }
+                    ],
+                },
+                "scripts": [{"path": "bundle/translate.py", "content": "print('ok')"}],
+                "dependencies": ["googletrans"],
+            }
+        ),
+    }
+
+    generated_files = None
+    progress_steps = []
+    async for event in service.generate(
+        description="创建翻译工具",
+        sandbox=mock_sandbox,
+        blueprint=blueprint,
+    ):
+        if isinstance(event, SkillGeneratedFiles):
+            generated_files = event
+        elif isinstance(event, SkillCreationProgress):
+            progress_steps.append(event.step)
+
+    assert generated_files is not None
+    assert "analyzing" not in progress_steps
+    assert "researching" in progress_steps
+    assert "installing" not in progress_steps
+
+    # Step 3: install
+    result = await service.install(generated_files, installed_by="user-1")
+    assert result.skill_name == "translator"
+    assert "创建成功" in result.summary
     mock_skill_service.install_skill.assert_called_once()

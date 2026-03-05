@@ -211,6 +211,77 @@ class SkillCreatorService:
                 except Exception as exc:
                     logger.warning("销毁临时沙箱失败: %s", exc)
 
+    async def analyze(self, description: str) -> SkillBlueprint:
+        """公共分析接口，供 brainstorm_skill 工具调用。"""
+        return await self._analyze_requirement(description)
+
+    async def generate(
+        self,
+        description: str,
+        sandbox: Sandbox,
+        blueprint: SkillBlueprint | None = None,
+    ) -> AsyncGenerator[SkillCreationProgress | SkillGeneratedFiles, None]:
+        """执行 RESEARCHING → GENERATING → VALIDATING，返回生成文件，不安装。"""
+        if blueprint is None:
+            yield SkillCreationProgress(step="analyzing", message="正在分析需求...")
+            blueprint = await self._analyze_requirement(description)
+
+        yield SkillCreationProgress(step="researching", message="正在调研 GitHub 方案...")
+        repos = await self._research(blueprint)
+        report = self._github.format_research_report(repos)
+        yield SkillCreationProgress(
+            step="researching",
+            message=f"调研完成，找到 {len(repos)} 个参考仓库",
+            references=repos or None,
+        )
+
+        yield SkillCreationProgress(step="generating", message="正在生成 Skill 文件...")
+        files = await self._generate_files(blueprint, report)
+        yield SkillCreationProgress(
+            step="generating",
+            message=f"生成完成，共 {len(files.scripts)} 个脚本",
+        )
+
+        yield SkillCreationProgress(step="validating", message="正在执行沙箱验证...")
+        errors = await self._validate_in_sandbox(files, sandbox)
+        fix_round = 0
+        while errors and fix_round < MAX_FIX_RETRIES:
+            yield SkillCreationProgress(
+                step="validating",
+                message=f"检测到问题，正在自动修复（第 {fix_round + 1} 次）...",
+                detail=errors[0],
+            )
+            files = await self._fix_files(files, errors, blueprint, report)
+            errors = await self._validate_in_sandbox(files, sandbox)
+            fix_round += 1
+
+        if errors:
+            yield SkillCreationProgress(
+                step="validating",
+                message="沙箱验证失败",
+                detail=errors[0],
+            )
+            return
+
+        yield SkillCreationProgress(step="validating", message="沙箱验证通过")
+        yield files
+
+    async def install(self, files: SkillGeneratedFiles, installed_by: str) -> SkillCreationResult:
+        """公共安装接口，供 install_skill 工具调用。"""
+        installed_skill = await self._install(files, installed_by)
+        tool_names = [
+            str(tool.get("name") or "")
+            for tool in files.manifest.get("tools", [])
+            if isinstance(tool, dict)
+        ]
+        return SkillCreationResult(
+            skill_id=installed_skill.id,
+            skill_name=installed_skill.name,
+            tools=tool_names,
+            files_count=len(files.scripts) + 2,
+            summary=f"Skill '{installed_skill.name}' 创建成功",
+        )
+
     async def _analyze_requirement(self, description: str) -> SkillBlueprint:
         response = await self._llm.invoke(
             messages=[

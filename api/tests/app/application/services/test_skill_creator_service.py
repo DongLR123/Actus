@@ -109,6 +109,28 @@ class TestAnalyzeRequirement:
         assert "yt-dlp" in blueprint.estimated_deps
 
 
+    async def test_analyze_public_method(
+        self,
+        service: SkillCreatorService,
+        mock_llm: AsyncMock,
+    ) -> None:
+        mock_llm.invoke.return_value = {
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "skill_name": "translator",
+                    "description": "翻译工具",
+                    "tools": [{"name": "translate", "description": "翻译", "parameters": []}],
+                    "search_keywords": ["translate python"],
+                    "estimated_deps": ["googletrans"],
+                }
+            ),
+        }
+        blueprint = await service.analyze("创建一个翻译工具")
+        assert blueprint.skill_name == "translator"
+        assert len(blueprint.tools) == 1
+
+
 class TestGenerateFiles:
     async def test_generate_produces_valid_files(
         self,
@@ -268,3 +290,219 @@ class TestFullPipeline:
         assert "installing" in progress_steps
         assert len(results) == 1
         assert results[0].skill_name == "test-skill"
+
+
+class TestGenerate:
+    """Tests for the public generate() method."""
+
+    async def test_generate_returns_files_on_success(
+        self,
+        service: SkillCreatorService,
+        mock_llm: AsyncMock,
+        mock_sandbox: AsyncMock,
+    ) -> None:
+        """With blueprint provided, returns SkillGeneratedFiles, no 'installing' step."""
+        blueprint = SkillBlueprint(
+            skill_name="test-skill",
+            description="测试",
+            tools=[ToolDef(name="run", description="执行", parameters=[])],
+            search_keywords=["test python"],
+            estimated_deps=[],
+        )
+        generate_response = {
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "skill_md": "---\nname: test-skill\n---\n# Test",
+                    "manifest": {
+                        "name": "test-skill",
+                        "slug": "test-skill",
+                        "version": "0.1.0",
+                        "description": "测试",
+                        "runtime_type": "native",
+                        "tools": [
+                            {
+                                "name": "run",
+                                "description": "执行",
+                                "parameters": {},
+                                "required": [],
+                                "entry": {"command": "python bundle/run.py"},
+                            }
+                        ],
+                    },
+                    "scripts": [{"path": "bundle/run.py", "content": "print('ok')"}],
+                    "dependencies": [],
+                }
+            ),
+        }
+        mock_llm.invoke.return_value = generate_response
+
+        events: list = []
+        async for event in service.generate(
+            description="创建一个测试 skill",
+            sandbox=mock_sandbox,
+            blueprint=blueprint,
+        ):
+            events.append(event)
+
+        progress_steps = [
+            e.step for e in events if isinstance(e, SkillCreationProgress)
+        ]
+        file_results = [e for e in events if isinstance(e, SkillGeneratedFiles)]
+
+        # Should NOT have analyzing or installing steps
+        assert "analyzing" not in progress_steps
+        assert "installing" not in progress_steps
+        # Should have researching, generating, validating
+        assert "researching" in progress_steps
+        assert "generating" in progress_steps
+        assert "validating" in progress_steps
+        # Should yield SkillGeneratedFiles at the end
+        assert len(file_results) == 1
+        assert file_results[0].manifest["name"] == "test-skill"
+
+    async def test_generate_without_blueprint_runs_analyze(
+        self,
+        service: SkillCreatorService,
+        mock_llm: AsyncMock,
+        mock_sandbox: AsyncMock,
+    ) -> None:
+        """Without blueprint, includes 'analyzing' step."""
+        analyze_response = {
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "skill_name": "test-skill",
+                    "description": "测试",
+                    "tools": [{"name": "run", "description": "执行", "parameters": []}],
+                    "search_keywords": ["test python"],
+                    "estimated_deps": [],
+                }
+            ),
+        }
+        generate_response = {
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "skill_md": "---\nname: test-skill\n---\n# Test",
+                    "manifest": {
+                        "name": "test-skill",
+                        "slug": "test-skill",
+                        "version": "0.1.0",
+                        "description": "测试",
+                        "runtime_type": "native",
+                        "tools": [
+                            {
+                                "name": "run",
+                                "description": "执行",
+                                "parameters": {},
+                                "required": [],
+                                "entry": {"command": "python bundle/run.py"},
+                            }
+                        ],
+                    },
+                    "scripts": [{"path": "bundle/run.py", "content": "print('ok')"}],
+                    "dependencies": [],
+                }
+            ),
+        }
+        mock_llm.invoke.side_effect = [analyze_response, generate_response]
+
+        events: list = []
+        async for event in service.generate(
+            description="创建一个测试 skill",
+            sandbox=mock_sandbox,
+            blueprint=None,
+        ):
+            events.append(event)
+
+        progress_steps = [
+            e.step for e in events if isinstance(e, SkillCreationProgress)
+        ]
+        assert "analyzing" in progress_steps
+        assert "installing" not in progress_steps
+
+    async def test_generate_returns_validation_errors(
+        self,
+        service: SkillCreatorService,
+        mock_llm: AsyncMock,
+        mock_sandbox: AsyncMock,
+    ) -> None:
+        """Syntax error in script yields validation failure progress."""
+        blueprint = SkillBlueprint(
+            skill_name="bad-skill",
+            description="坏的",
+            tools=[ToolDef(name="run", description="运行", parameters=[])],
+            search_keywords=[],
+            estimated_deps=[],
+        )
+        generate_response = {
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "skill_md": "---\nname: bad-skill\n---\n# Bad",
+                    "manifest": {"name": "bad-skill", "tools": []},
+                    "scripts": [
+                        {"path": "bundle/run.py", "content": "def f(\n  broken"}
+                    ],
+                    "dependencies": [],
+                }
+            ),
+        }
+        # generate_files called once, then _fix_files calls generate_files again (MAX_FIX_RETRIES=2)
+        mock_llm.invoke.return_value = generate_response
+
+        events: list = []
+        async for event in service.generate(
+            description="创建坏的 skill",
+            sandbox=mock_sandbox,
+            blueprint=blueprint,
+        ):
+            events.append(event)
+
+        progress_events = [
+            e for e in events if isinstance(e, SkillCreationProgress)
+        ]
+        file_results = [e for e in events if isinstance(e, SkillGeneratedFiles)]
+
+        # Should NOT yield files on failure
+        assert len(file_results) == 0
+        # Last progress should indicate failure
+        last_progress = progress_events[-1]
+        assert "失败" in last_progress.message
+
+
+class TestInstallPublic:
+    """Tests for the public install() method."""
+
+    async def test_install_returns_creation_result(
+        self,
+        service: SkillCreatorService,
+        mock_skill_service: AsyncMock,
+    ) -> None:
+        files = SkillGeneratedFiles(
+            skill_md="---\nname: test-skill\n---\n# Test",
+            manifest={
+                "name": "test-skill",
+                "tools": [
+                    {"name": "run", "description": "执行"},
+                    {"name": "check", "description": "检查"},
+                ],
+            },
+            scripts=[
+                ScriptFile(path="bundle/run.py", content="print('ok')"),
+                ScriptFile(path="bundle/check.py", content="print('check')"),
+            ],
+            dependencies=[],
+        )
+
+        result = await service.install(files, installed_by="user-1")
+
+        assert isinstance(result, SkillCreationResult)
+        assert result.skill_id == "test-skill--abc12345"
+        assert result.skill_name == "test-skill"
+        assert result.tools == ["run", "check"]
+        # 2 scripts + 2 (SKILL.md + manifest.json)
+        assert result.files_count == 4
+        assert "创建成功" in result.summary
+        mock_skill_service.install_skill.assert_awaited_once()
