@@ -121,6 +121,13 @@ class BaseAgent(ABC):
 
         raise ValueError(f"未知工具: {tool_name}")
 
+    def _is_tool_confirmation_required(self, tool_name: str) -> bool:
+        """检查指定工具是否需要用户确认"""
+        for tool in self._tools:
+            if tool.has_tool(tool_name):
+                return tool.get_tool_confirmation_required(tool_name)
+        return False
+
     def _build_unknown_tool_result(self, function_name: str) -> ToolResult:
         """构建未知工具结果并回灌给 LLM，避免直接中断执行。"""
         available_names: list[str] = []
@@ -288,7 +295,7 @@ class BaseAgent(ABC):
         function_name = tool_call.get("function", {}).get("name")
         tool_call_id = tool_call.get("id")
 
-        # 4.判断下当前的工具是不是通知用户(message_ask_user)
+        # 4.判断下当前的工具是不是通知用户(message_ask_user)或需要确认的工具
         if function_name == "message_ask_user":
             self._memory.add_message(
                 {
@@ -298,8 +305,34 @@ class BaseAgent(ABC):
                     "content": message.model_dump_json(),
                 }
             )
+        elif self._is_tool_confirmation_required(function_name):
+            # 5.需要确认的工具：用户确认后注入工具结果，保留上下文
+            user_text = (message.message or "").strip().lower()
+            refused = user_text in {"否", "取消", "no", "cancel", "拒绝", "不"}
+            if refused:
+                result_content = ToolResult(
+                    success=False,
+                    message="用户已拒绝该操作",
+                ).model_dump_json()
+            else:
+                result_content = ToolResult(
+                    success=True,
+                    message="CONFIRMATION_GRANTED",
+                    data={"code": "CONFIRMATION_GRANTED"},
+                ).model_dump_json()
+                # 标记该工具已确认，下次拦截时跳过
+                if hasattr(self, "_confirmed_tool_names"):
+                    self._confirmed_tool_names.add(function_name)
+            self._memory.add_message(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "function_name": function_name,
+                    "content": result_content,
+                }
+            )
         else:
-            # 5.否则直接删除最后一条消息
+            # 6.否则直接删除最后一条消息
             self._memory.roll_back()
 
         # 6.将记忆持久化

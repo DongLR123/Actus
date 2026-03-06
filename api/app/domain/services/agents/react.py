@@ -41,11 +41,33 @@ class ReActAgent(BaseAgent):
     )
     _step_tool_attempt_rounds: int = 0
     _step_failed_tool_calls: int = 0
+    _step_ask_user_soft_hint_count: int = 0
+    _confirmed_tool_names: set = set()  # 已被用户确认的工具，跳过后续确认拦截
 
     def _intercept_tool_call(
         self, function_name: str, function_args: Dict[str, Any]
     ) -> ToolResult | None:
+        # 第一层：工具级强制确认（已确认的工具跳过）
+        if self._is_tool_confirmation_required(function_name):
+            if function_name in self._confirmed_tool_names:
+                self._confirmed_tool_names.discard(function_name)
+                return None
+            return ToolResult(
+                success=False,
+                message="TOOL_CONFIRMATION_REQUIRED",
+                data={
+                    "code": "TOOL_CONFIRMATION_REQUIRED",
+                    "tool_name": function_name,
+                    "function_args": function_args,
+                },
+            )
+
+        # 第二层：message_ask_user 软引导门控
         if function_name != "message_ask_user":
+            return None
+
+        # 如果已经收到过一次 SOFT_HINT，第二次直接放行
+        if self._step_ask_user_soft_hint_count >= 1:
             return None
 
         required_attempts = (
@@ -58,24 +80,28 @@ class ReActAgent(BaseAgent):
         if effective_attempt_score >= required_attempts:
             return None
 
+        # 软引导：返回 success=True + SOFT_HINT
+        self._step_ask_user_soft_hint_count += 1
         return ToolResult(
-            success=False,
-            message="ASK_USER_BLOCKED_BY_POLICY",
+            success=True,
+            message="SOFT_HINT: 建议先尝试使用工具自动解决。如确实需要用户介入，请再次调用 message_ask_user。",
             data={
-                "code": "ASK_USER_BLOCKED_BY_POLICY",
+                "code": "ASK_USER_SOFT_HINT",
                 "tool_attempt_rounds": self._step_tool_attempt_rounds,
-                "failed_tool_calls": self._step_failed_tool_calls,
                 "effective_attempt_score": effective_attempt_score,
                 "required_attempts": required_attempts,
-                "remaining_attempts": max(
-                    0, required_attempts - effective_attempt_score
-                ),
             },
         )
 
     def _on_tool_result(self, function_name: str, result: ToolResult) -> None:
         # message_ask_user 不计入尝试/失败计数，避免通过连续被拦截提问绕过门控。
         if function_name == "message_ask_user":
+            return
+        # require_confirmation 拦截的工具不计入
+        if (
+            isinstance(result.data, dict)
+            and result.data.get("code") == "TOOL_CONFIRMATION_REQUIRED"
+        ):
             return
         # 计数粒度：按每个 tool_call 计数（而非每轮LLM回合）；unknown-tool 同样会走这里。
         self._step_tool_attempt_rounds += 1
@@ -89,6 +115,7 @@ class ReActAgent(BaseAgent):
         # execute_step 与 Planner step 一一对应；无 Planner 时由 Runner 构造虚拟 step 并管理锁定。
         self._step_tool_attempt_rounds = 0
         self._step_failed_tool_calls = 0
+        self._step_ask_user_soft_hint_count = 0
 
         # 1.根据传递的内容生成执行消息
         query = EXECUTION_PROMPT.format(
@@ -106,7 +133,31 @@ class ReActAgent(BaseAgent):
         async for event in self.invoke(query):
             # 4.判断事件类型执行不同操作
             if isinstance(event, ToolEvent):
-                # 5.工具事件需要判断工具的名称是否为message_ask_user
+                # 5.处理工具级强制确认和 message_ask_user
+                if event.status == ToolEventStatus.CALLED:
+                    result_data = (
+                        event.function_result.data
+                        if event.function_result and event.function_result.data
+                        else {}
+                    )
+                    # 5a.工具级强制确认：向用户展示确认提示并暂停
+                    if (
+                        isinstance(result_data, dict)
+                        and result_data.get("code") == "TOOL_CONFIRMATION_REQUIRED"
+                    ):
+                        tool_name = result_data.get("tool_name", event.function_name)
+                        func_args = result_data.get("function_args", {})
+                        args_summary = ", ".join(
+                            f"{k}={v!r}" for k, v in func_args.items()
+                        )
+                        yield MessageEvent(
+                            role="assistant",
+                            message=f"即将执行 `{tool_name}({args_summary})`，是否继续？",
+                        )
+                        yield WaitEvent()
+                        return
+
+                # 6.message_ask_user 专用处理
                 if event.function_name == "message_ask_user":
                     if event.status == ToolEventStatus.CALLED:
                         result_data = (
@@ -114,13 +165,14 @@ class ReActAgent(BaseAgent):
                             if event.function_result and event.function_result.data
                             else {}
                         )
-                        blocked_by_policy = (
+                        # 6a.软引导提示：LLM 继续自动执行
+                        soft_hint = (
                             isinstance(result_data, dict)
-                            and result_data.get("code") == "ASK_USER_BLOCKED_BY_POLICY"
+                            and result_data.get("code") == "ASK_USER_SOFT_HINT"
                         )
-                        if blocked_by_policy:
+                        if soft_hint:
                             logger.info(
-                                "message_ask_user 在本 step 内被门控拦截，继续自动执行。"
+                                "message_ask_user 收到软引导提示，LLM 将继续自动执行。"
                             )
                             continue
 

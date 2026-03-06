@@ -17,6 +17,7 @@ def tool(
     description: str,
     parameters: Dict[str, Dict[str, Any]],
     required: List[str],
+    require_confirmation: bool = False,
 ) -> Callable:
     """定义OpenAI工具装饰器，用于将一个函数/方法添加上对应的工具声明"""
 
@@ -40,6 +41,7 @@ def tool(
         func._tool_name = name
         func._tool_description = description
         func._tool_schema = tool_schema
+        func._require_confirmation = require_confirmation
 
         return func
 
@@ -97,6 +99,16 @@ class BaseTool:
                 and getattr(method, "_tool_name") == tool_name
             ):
                 return True
+        return False
+
+    def get_tool_confirmation_required(self, tool_name: str) -> bool:
+        """查询指定工具是否需要用户确认"""
+        for _, method in inspect.getmembers(self, inspect.ismethod):
+            if (
+                hasattr(method, "_tool_name")
+                and getattr(method, "_tool_name") == tool_name
+            ):
+                return bool(getattr(method, "_require_confirmation", False))
         return False
 
     async def invoke(self, tool_name: str, **kwargs) -> ToolResult:
