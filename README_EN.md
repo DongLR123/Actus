@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">Actus</h1>
   <p align="center">
-    Self-hosted general-purpose AI Agent platform — Plan, reason, execute, all in one
+    A self-hosted AI Agent platform for planning, reasoning, execution, and human takeover
   </p>
   <p align="center">
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
@@ -15,162 +15,187 @@
 
 ---
 
-## Features
+## Overview
 
-- **ReAct Agent** — Reasoning + Acting pattern with multi-turn reasoning and tool calling
-- **MCP Tool Protocol** — Dynamically connect external tool servers via [Model Context Protocol](https://modelcontextprotocol.io/)
-- **A2A Protocol** — [Agent-to-Agent](https://google.github.io/A2A/) communication and collaboration
-- **Skill Ecosystem** — Independent Skill extension ecosystem, defined and installed via SKILL.md, filesystem-based storage, supporting GitHub / local directory dual sources
-- **Planner + ReAct Flow** — Two-phase agent orchestration: plan first, then execute
-- **Sandboxed Execution** — Docker-isolated code execution environment
-- **Long-running Command Friendly** — Shell long-running jobs (e.g. `npm start` / `pip install`) return `running` after a short wait, then continue via output polling / stop controls
-- **Remote Desktop** — Real-time sandbox desktop preview via noVNC, watch Agent actions directly in your browser
-- **Browser Automation** — Web interaction powered by Playwright with a custom DOM index extraction approach, connecting to sandbox Chromium via CDP for precise element-level interaction
-- **Multi-model Support** — Compatible with OpenAI API format (DeepSeek, Kimi, etc.)
-- **Streaming Output** — Real-time streaming responses with chain-of-thought display
-- **File Management** — MinIO/S3-compatible object storage for file upload/download
-- **User System** — JWT authentication with role-based access control
-- **Modern Frontend** — Next.js 16 + React 19 + shadcn/ui, Geist font, light / dark themes
+Actus is organized around three runtimes:
+
+- `api/`: FastAPI backend for sessions, agents, auth, files, settings, skills, and sandbox orchestration
+- `ui/`: Next.js 16 frontend for chat, task progress, workbench, settings, and admin views
+- `sandbox/`: per-session Docker sandbox with Shell, filesystem access, Chromium, and VNC/noVNC
+
+The default execution model is a `Planner + ReAct` flow: Actus first builds a plan, then executes it step by step while streaming plan updates, tool calls, messages, and takeover events back to the client.
+
+## Core Capabilities
+
+- **Planner + ReAct agent flow**
+- **Built-in tools** for file, shell, browser, search, and messaging
+- **MCP / A2A / Skill integrations** managed as first-class agent tools
+- **Skill v2 filesystem storage** under `/app/data/skills`
+- **Human takeover** for both `shell` and `browser` scopes
+- **Workbench UI** with terminal preview, browser preview, VNC, timeline scrubbing, and file preview
+- **Streaming transport** via SSE and WebSocket
+- **Containerized sandbox** with Chromium, Xvfb, x11vnc, and websockify
+- **Attachment storage** through MinIO / S3-compatible object storage
+- **JWT auth, admin tools, tool preferences, and runtime settings**
 
 ## Architecture
 
-```
+```text
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   UI (Next.js)│────▶│  API (FastAPI)│────▶│  PostgreSQL  │
+│ UI (Next.js) │────▶│ API (FastAPI)│────▶│ PostgreSQL   │
 └──────────────┘     │              │     └──────────────┘
-                     │   ┌────────┐ │     ┌──────────────┐
-                     │   │ Agent  │ │────▶│    Redis      │
-                     │   │ Engine │ │     └──────────────┘
-                     │   └───┬────┘ │     ┌──────────────┐
-                     │       │      │────▶│  MinIO / S3   │
-                     │   ┌───▼────┐ │     └──────────────┘
-                     │   │MCP/A2A │ │     ┌──────────────┐
-                     │   │/Skill  │ │
-                     │   │Tools   │ │────▶│  Sandbox      │
-                     │   └────────┘ │     │  (Docker)     │
-                     └──────────────┘     └──────────────┘
+                     │ Agent / Auth │────▶│ Redis        │
+                     │ Files / Skill│     └──────────────┘
+                     │ Settings     │────▶│ MinIO / S3   │
+                     │ Sandbox Ctrl │     └──────────────┘
+                     └──────┬───────┘
+                            │ Docker
+                            ▼
+                     ┌──────────────┐
+                     │ Sandbox      │
+                     │ Shell/File   │
+                     │ Chromium/VNC │
+                     └──────────────┘
 ```
 
-The backend follows **Clean Architecture + DDD** layered design.
+For backend layering and runtime composition, see [项目架构.md](项目架构.md).
 
-## Quick Start
+## Docker Compose Quick Start
 
-### Prerequisites
+### Requirements
 
 - Docker Engine + Docker Compose v2
-- At least 6 GB memory available for Docker
-- A MinIO / S3-compatible object storage service
+- At least 6 GB RAM available to Docker
+- A reachable MinIO / S3-compatible bucket that already exists
+- A valid LLM API key
 
-### One-click Deployment
+### Start the stack
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/your-org/Actus.git
+git clone https://github.com/hahaliu1029/Actus.git
 cd Actus
 
-# 2. Configure environment variables
 cp .env.example .env
-# Edit .env with your database password, JWT secret, MinIO credentials, etc.
+# Edit .env and provide at least:
+# POSTGRES_PASSWORD
+# JWT_SECRET_KEY
+# MINIO_ENDPOINT
+# MINIO_ACCESS_KEY
+# MINIO_SECRET_KEY
+# MINIO_BUCKET_NAME
+# NEXT_PUBLIC_API_BASE_URL
 
-# 3. Configure Agent runtime parameters
-cp api/config.yaml.example api/config.yaml
-# Edit api/config.yaml with your LLM API key and MCP/A2A configurations
-# Skills are stored on the filesystem at /app/data/skills (configurable via SKILLS_ROOT_DIR)
-# Install and manage Skills in the frontend under Settings -> Skill Ecosystem
-
-# 4. Start all services
 docker compose --env-file .env up -d --build
 
-# 5. Create admin account (recommended)
+# Optional: create a super admin
 docker compose exec api python scripts/create_super_admin.py
 ```
 
-After startup, visit:
+After startup:
 
-- Frontend: http://localhost:80 (or `http://localhost:${UI_PORT}`)
-- API Docs: http://localhost:8000/docs
+- UI: `http://localhost`
+- API docs: `http://localhost:8000/docs`
 
-In container deployment, the frontend uses a two-layer setup: `ui` (nginx gateway) -> `ui-app` (Next.js runtime).
+### Runtime config notes
 
-### Local Development
+- In container mode, the backend uses `/app/data/config.yaml` inside the `api-data` volume
+- If the file does not exist, the backend creates one from code defaults
+- The recommended way to configure LLM, MCP, A2A, and Skill policies is through the frontend settings UI
+- `api/config.yaml.example` is mainly for **local backend development** or manual pre-seeding
+
+### Rebuild sandbox code correctly
+
+The Compose service name is `sandbox-image`, not `sandbox`. After changing files under `sandbox/`, use:
 
 ```bash
-# Backend
-cd api
-pip install -r requirements.txt
-bash dev.sh
+docker compose --env-file .env build sandbox-image api
+docker compose --env-file .env up -d --force-recreate api
 
-# Frontend
+# Optional: remove old temporary sandbox containers
+docker ps --format '{{.Names}}' | grep '^actus-sb-' | xargs -r docker rm -f
+```
+
+## Local Development
+
+### Frontend
+
+```bash
 cd ui
 npm install
 npm run dev
 ```
 
-### Rebuild Sandbox Runtime After Sandbox Code Changes
+### Backend
 
-When you modify code under `sandbox/` (for example `sandbox/app/services/shell.py`), do **not** run `docker compose up ... sandbox` (there is no `sandbox` service in compose). Use:
+Local backend development does **not** use the same variables as the root Compose `.env`. `api/core/config.py` reads runtime settings from `api/.env`, for example:
 
 ```bash
-# 1) Rebuild sandbox image and API image
-docker compose --env-file .env build sandbox-image api
+cd api
+cp config.yaml.example config.yaml
 
-# 2) Force recreate API container so new sessions use the latest sandbox image
-docker compose --env-file .env up -d --force-recreate api
+cat > .env <<'EOF'
+ENV=development
+LOG_LEVEL=INFO
+APP_CONFIG_FILEPATH=config.yaml
+SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/manus
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+REDIS_DB=0
+MINIO_ENDPOINT=s3.example.com
+MINIO_ACCESS_KEY=replace-me
+MINIO_SECRET_KEY=replace-me
+MINIO_SECURE=true
+MINIO_BUCKET_NAME=replace-me
+JWT_SECRET_KEY=replace-with-a-strong-random-string
+SANDBOX_IMAGE=actus-sandbox:latest
+SANDBOX_NAME_PREFIX=actus-sb
+EOF
 
-# 3) Optional: remove old temporary sandbox containers to avoid stale reuse
-docker ps --format '{{.Names}}' | grep '^actus-sb-' | xargs -r docker rm -f
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+bash dev.sh
 ```
 
-## Project Structure
+You will also need PostgreSQL, Redis, a built `sandbox-image`, and an accessible MinIO/S3 bucket.
 
+## Tests
+
+```bash
+# Backend
+cd api
+pytest
+
+# Frontend
+cd ui
+npm run test
 ```
+
+## Repository Layout
+
+```text
 Actus/
-├── api/                 # Backend service (FastAPI)
-│   ├── app/             # Application code (Clean Architecture layers)
-│   │   ├── domain/      #   Domain layer (models, agents, tools, prompts, Skill domain models)
-│   │   ├── application/ #   Application layer (use case orchestration, Skill install/select/index services)
-│   │   ├── infrastructure/ # Infrastructure layer (DB, filesystem Skill repository, external services)
-│   │   └── interfaces/  #   Interface layer (routes, schemas, DI)
-│   ├── core/            # Core config & security
-│   ├── alembic/         # Database migrations
-│   ├── scripts/         # Admin scripts (including Skill migration scripts)
-│   └── tests/           # Tests
-├── ui/                  # Frontend (Next.js)
-├── sandbox/             # Sandbox service (code execution)
-├── docker-compose.yml   # Container orchestration
-└── DEPLOY.md            # Deployment guide
+├── api/                  # FastAPI backend
+├── ui/                   # Next.js frontend
+├── sandbox/              # Docker sandbox source
+├── docker-compose.yml    # Compose stack
+├── DEPLOY.md             # Deployment guide
+├── api.md                # English API reference
+├── api_zhcn.md           # Chinese API reference
+└── 项目架构.md             # Architecture notes
 ```
 
 ## Documentation
 
-- [Deployment Guide](DEPLOY.md) — Docker Compose deployment steps
-- [API Reference](api.md) — Complete REST API documentation
-- [API 文档 (中文)](api_zhcn.md) — REST API 接口文档
-- [Architecture](项目架构.md) — Backend architecture design (Chinese)
-- [Contributing](CONTRIBUTING.md) — How to contribute
-
-## Tech Stack
-
-| Component | Technology |
-|-----------|-----------|
-| Backend | FastAPI + Uvicorn |
-| Frontend | Next.js 16 + React 19 |
-| UI / Styling | Tailwind CSS v4 + shadcn/ui + Geist font |
-| State Management | Zustand |
-| Database | PostgreSQL 17 + SQLAlchemy 2.0 (async) |
-| Cache/Queue | Redis (Redis Streams) |
-| Object Storage | MinIO / S3-compatible |
-| LLM Integration | OpenAI SDK (DeepSeek, Kimi, etc.) |
-| Agent Protocols | MCP SDK + A2A + Skill Layer |
-| Browser Automation | Playwright + Custom DOM Index Extraction |
-| Sandbox | Docker container isolation |
-| Auth | JWT + bcrypt |
-| Testing | pytest + Vitest |
-
-## Contributing
-
-We welcome Issues and Pull Requests! Please read the [Contributing Guide](CONTRIBUTING.md) for details.
+- [Deployment Guide](DEPLOY.md)
+- [English API Reference](api.md)
+- [中文 API 文档](api_zhcn.md)
+- [Architecture Notes](项目架构.md)
+- [API README](api/README.md)
+- [UI README](ui/README.md)
+- [Sandbox README](sandbox/README.md)
+- [Contributing](CONTRIBUTING.md)
 
 ## License
 
-This project is licensed under the [Apache License 2.0](LICENSE).
+Actus is released under the [Apache License 2.0](LICENSE).

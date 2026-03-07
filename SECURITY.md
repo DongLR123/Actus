@@ -10,11 +10,12 @@
 
 **请不要通过公开的 GitHub Issue 报告安全漏洞。**
 
-如果你发现了安全漏洞，请通过以下方式私密报告：
+如果你发现了安全漏洞，请优先通过以下方式私密报告：
 
-1. **GitHub Security Advisory**（推荐）：前往本仓库的 "Security" 标签页，点击 "Report a vulnerability" 提交私密安全报告。
+1. **GitHub Security Advisory**（推荐）：
+   <https://github.com/hahaliu1029/Actus/security/advisories/new>
 
-2. **电子邮件**：发送邮件至项目维护者，邮件标题请包含 `[SECURITY]` 前缀。
+2. 如果需要补充更敏感的材料，请先通过 Security Advisory 与维护者建立私密沟通，再按维护者提供的渠道继续同步。
 
 ### 报告内容
 

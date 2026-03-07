@@ -1,8 +1,12 @@
 # API 文档（简体中文）
 
-基础路径：`/api`
+本文档按当前代码中的实际路由整理，基础路径为 `/api`。
 
-所有 JSON 响应都使用统一包裹格式：
+## 基础约定
+
+### 响应包裹
+
+大多数 JSON 接口返回统一结构：
 
 ```json
 {
@@ -12,52 +16,226 @@
 }
 ```
 
-认证说明：
-- 需要登录的接口使用 `Authorization: Bearer <access_token>`。
-- 管理员接口要求 `role=super_admin`。
-- 未绑定认证依赖的接口可匿名访问。
-- `sessions` / `files` 模块全部要求 Bearer token，普通用户仅可访问自己的资源。
-- 管理员允许跨用户访问 `sessions` / `files` 资源。
-- VNC WebSocket 需通过 query 参数传递 `token`：`/api/sessions/{session_id}/vnc?token=<access_token>`。
+注意：
 
-限流说明：
-- 请求超限返回 HTTP `429`，并带 `Retry-After` 响应头。
-- 统一响应体示例：`{"code":429,"msg":"请求过多，请稍后重试","data":{"retry_after":N}}`。
-- 限流依赖 Redis，Redis 不可用时返回 HTTP `503`。
+- 部分错误虽然 `HTTP status` 仍可能为 `200`，但 `code` 会是业务错误码
+- 显式迁移接口会返回 `410`
+- 文件下载、微信回调、SSE、WebSocket 不使用统一 JSON 包裹
 
-说明：大部分错误通过响应体 `code`/`msg` 返回，HTTP 状态码可能仍为 200。
+### 认证
 
-## Skill 运行时同步（目录型 Skill）
+- 需要登录的接口使用 `Authorization: Bearer <access_token>`
+- 管理员接口要求 `role=super_admin`
+- WebSocket 鉴权通过 query 参数传递 `token`
 
-- 该能力不变更 HTTP API，仅调整服务端运行时内部链路。
-- 会话启动时先同步初始选中 Skill 子集，再后台补齐其余已启用 Skill。
-- 单会话内采用静态版本：不做中途刷新，Skill 更新在下一会话生效。
-- native Skill 在缺少 `entry.exec_dir` 时，默认执行目录为 `/home/ubuntu/workspace/.skills/<skill_id>`。
+### 限流
 
-## OpenAPI
+- 超限返回 `429`
+- 响应体示例：`{"code":429,"msg":"请求过多，请稍后重试","data":{"retry_after":N}}`
+- 限流依赖 Redis；Redis 不可用时相关接口会返回 `503`
 
-- Swagger UI：`/docs`
-- ReDoc：`/redoc`
-- 规范文件：`/openapi.json`
-- 导出：
+### 流式与实时通道
 
-```bash
-curl -o openapi.json http://localhost:8000/openapi.json
-```
+- SSE：
+  - `POST /sessions/stream`
+  - `POST /sessions/{session_id}/chat`
+  - `POST /v2/skills/create`
+- WebSocket：
+  - `/sessions/{session_id}/takeover/shell/ws?takeover_id=...&token=...`
+  - `/sessions/{session_id}/vnc?token=...`
 
-## 数据模型
+### 会话状态
 
-### HealthStatus
+`pending | running | takeover_pending | takeover | waiting | completed`
 
-```json
-{
-  "service": "string",
-  "status": "ok | error",
-  "details": "string"
-}
-```
+### 对话 SSE 事件类型
 
-### FileInfo
+`message | title | step | plan | tool | wait | control | done | error`
+
+## 运行时配置说明
+
+- Docker Compose 模式下，业务配置文件位于 `/app/data/config.yaml`
+- 本地后端开发默认使用 `api/config.yaml`
+- Skill v2 默认存储目录为 `/app/data/skills`
+
+## 认证模块 `/auth`
+
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| `POST` | `/auth/register` | 否 | 注册用户，返回用户信息和 token |
+| `POST` | `/auth/login` | 否 | 用户名或邮箱登录 |
+| `POST` | `/auth/refresh` | 否 | 刷新 access token |
+| `GET` | `/auth/me` | 是 | 获取当前用户 |
+| `PUT` | `/auth/me` | 是 | 更新当前用户昵称、头像 |
+| `GET` | `/auth/wechat/authorize` | 否 | 获取微信网页授权 URL |
+| `GET` | `/auth/wechat/callback` | 否 | 微信回调，处理后重定向前端 |
+
+## 状态模块 `/status`
+
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| `GET` | `/status/` | 是 | 检查 FastAPI、PostgreSQL、Redis、MinIO 健康状态 |
+| `GET` | `/status/minio` | 是 | 检查 MinIO 连通性；`smoke=true` 时执行读写自检 |
+| `POST` | `/status/minio/upload` | 管理员 | 通过 multipart/form-data 上传测试文件到 MinIO |
+
+## 设置模块 `/app-config`
+
+### LLM 与 Agent
+
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| `GET` | `/app-config/llm` | 是 | 获取 LLM 配置（不回传 `api_key`） |
+| `POST` | `/app-config/llm` | 管理员 | 更新 LLM 配置 |
+| `GET` | `/app-config/agent` | 是 | 获取 Agent 配置 |
+| `POST` | `/app-config/agent` | 管理员 | 更新 Agent 配置 |
+
+`AgentConfig` 除 `max_iterations`、`max_retries`、`max_search_results` 外，还包含 `skill_selection` 子配置。
+
+### MCP
+
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| `GET` | `/app-config/mcp-servers` | 是 | 获取 MCP 服务列表与探测到的工具名 |
+| `POST` | `/app-config/mcp-servers` | 管理员 | 新增或更新 MCP 服务配置 |
+| `POST` | `/app-config/mcp-servers/{server_name}/delete` | 管理员 | 删除 MCP 服务 |
+| `POST` | `/app-config/mcp-servers/{server_name}/enabled` | 管理员 | 更新 MCP 服务全局启用状态 |
+
+### A2A
+
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| `GET` | `/app-config/a2a-servers` | 是 | 获取 A2A 服务列表 |
+| `POST` | `/app-config/a2a-servers` | 管理员 | 新增 A2A 服务（传 `base_url`） |
+| `POST` | `/app-config/a2a-servers/{a2a_id}/delete` | 管理员 | 删除 A2A 服务 |
+| `POST` | `/app-config/a2a-servers/{a2a_id}/enabled` | 管理员 | 更新 A2A 服务全局启用状态 |
+
+## Skill 模块
+
+### 旧接口（迁移提示）
+
+以下接口保留为迁移提示，调用时返回 `410 SKILL_API_MOVED`：
+
+- `GET /app-config/skills`
+- `POST /app-config/skills/install`
+- `POST /app-config/skills/{skill_id}/enabled`
+- `POST /app-config/skills/{skill_id}/delete`
+
+### Skill v2 `/v2/skills`
+
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| `GET` | `/v2/skills` | 管理员 | 获取 Skill 列表 |
+| `POST` | `/v2/skills/install` | 管理员 | 从 GitHub 或本地目录安装 Skill |
+| `POST` | `/v2/skills/create` | 管理员 | AI 创建 Skill，SSE 返回进度和结果 |
+| `POST` | `/v2/skills/{skill_key}/enabled` | 管理员 | 更新 Skill 全局启用状态 |
+| `DELETE` | `/v2/skills/{skill_key}` | 管理员 | 删除 Skill |
+| `GET` | `/v2/skills/policy` | 是 | 获取 Skill 风险策略 |
+| `POST` | `/v2/skills/policy` | 管理员 | 更新 Skill 风险策略 |
+| `GET` | `/v2/skills/{skill_key}` | 管理员 | 获取 Skill 详情、工具定义、bundle 文件索引 |
+
+关键字段：
+
+- `source_type`: `local | github`
+- `runtime_type`: `native | mcp | a2a`
+- `mode`: `off | enforce_confirmation`
+
+## 用户工具偏好
+
+### 旧版 `/user/tools`
+
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| `GET` | `/user/tools/mcp` | 是 | 获取带用户偏好的 MCP 工具列表 |
+| `POST` | `/user/tools/mcp/{server_name}/enabled` | 是 | 设置 MCP 工具个人启用状态 |
+| `GET` | `/user/tools/a2a` | 是 | 获取带用户偏好的 A2A 工具列表 |
+| `POST` | `/user/tools/a2a/{a2a_id}/enabled` | 是 | 设置 A2A 工具个人启用状态 |
+| `GET` | `/user/tools/skills` | 是 | 已迁移，返回 `410` |
+| `POST` | `/user/tools/skills/{skill_id}/enabled` | 是 | 已迁移，返回 `410` |
+
+### Skill 偏好 v2 `/v2/user/tools`
+
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| `GET` | `/v2/user/tools/skills` | 是 | 获取 Skill 工具列表与个人偏好 |
+| `POST` | `/v2/user/tools/skills/{skill_key}/enabled` | 是 | 设置 Skill 工具个人启用状态 |
+
+## 文件模块 `/files`
+
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| `POST` | `/files` | 是 | 上传附件到对象存储并关联用户 |
+| `GET` | `/files/{file_id}` | 是 | 获取文件元数据 |
+| `GET` | `/files/{file_id}/download` | 是 | 下载文件内容 |
+| `DELETE` | `/files/{file_id}` | 是 | 删除文件 |
+
+## 管理员模块 `/admin`
+
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| `GET` | `/admin/users` | 管理员 | 分页获取用户列表 |
+| `GET` | `/admin/users/{user_id}` | 管理员 | 获取用户详情 |
+| `PUT` | `/admin/users/{user_id}/status` | 管理员 | 更新用户状态 |
+| `DELETE` | `/admin/users/{user_id}` | 管理员 | 删除用户 |
+
+## 会话模块 `/sessions`
+
+### 普通 HTTP / SSE 接口
+
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| `POST` | `/sessions` | 是 | 创建新会话 |
+| `POST` | `/sessions/stream` | 是，SSE | 流式推送会话列表 |
+| `GET` | `/sessions` | 是 | 获取会话列表 |
+| `POST` | `/sessions/{session_id}/clear-unread-message-count` | 是 | 清空未读消息数 |
+| `POST` | `/sessions/{session_id}/delete` | 是 | 删除会话 |
+| `POST` | `/sessions/{session_id}/chat` | 是，SSE | 向会话发送消息并流式接收事件 |
+| `GET` | `/sessions/{session_id}` | 是 | 获取会话详情和历史事件 |
+| `GET` | `/sessions/{session_id}/takeover` | 是 | 获取当前接管状态 |
+| `POST` | `/sessions/{session_id}/takeover/start` | 是 | 发起接管；`request_status=starting` 时 HTTP 为 `202` |
+| `POST` | `/sessions/{session_id}/takeover/renew` | 是 | 续期接管租约 |
+| `POST` | `/sessions/{session_id}/takeover/reject` | 是 | 处理 AI 发起的接管请求 |
+| `POST` | `/sessions/{session_id}/takeover/end` | 是 | 结束接管并选择继续或完成 |
+| `POST` | `/sessions/{session_id}/takeover/reopen` | 是 | 在窗口期内补救重开接管 |
+| `POST` | `/sessions/{session_id}/stop` | 是 | 停止当前任务 |
+| `GET` | `/sessions/{session_id}/files` | 是 | 获取会话文件列表 |
+| `POST` | `/sessions/{session_id}/file` | 是 | 读取沙箱中文件内容 |
+| `POST` | `/sessions/{session_id}/shell` | 是 | 读取指定 shell 会话输出 |
+
+### WebSocket 接口
+
+| 路径 | 认证 | 说明 |
+|------|------|------|
+| `/sessions/{session_id}/takeover/shell/ws?takeover_id=...&token=...` | Query token | 接管态终端双向交互 |
+| `/sessions/{session_id}/vnc?token=...` | Query token | noVNC WebSocket 代理 |
+
+补充说明：
+
+- `takeover/shell/ws` 会发送 JSON 状态消息和终端字节流
+- `/vnc` 会把浏览器的 WebSocket 数据转发到沙箱 VNC 服务
+
+## 常用数据模型
+
+### `LLMConfig`
+
+包含：
+
+- `base_url`
+- `api_key`（读取接口不返回）
+- `model_name`
+- `temperature`
+- `max_tokens`
+- `context_window`
+- `context_overflow_guard_enabled`
+- `overflow_retry_cap`
+- `soft_trigger_ratio`
+- `hard_trigger_ratio`
+- `reserved_output_tokens`
+- `reserved_output_tokens_cap_ratio`
+- `token_estimator`
+- `token_safety_factor`
+- `unknown_model_context_window`
+
+### `FileInfo`
 
 ```json
 {
@@ -71,1061 +249,44 @@ curl -o openapi.json http://localhost:8000/openapi.json
 }
 ```
 
-### LLMConfig
-
-```json
-{
-  "base_url": "https://api.deepseek.com",
-  "api_key": "string",
-  "model_name": "deepseek-reasoner",
-  "temperature": 0.7,
-  "max_tokens": 8192,
-  "context_window": 32768,
-  "context_overflow_guard_enabled": false,
-  "overflow_retry_cap": 2,
-  "soft_trigger_ratio": 0.85,
-  "hard_trigger_ratio": 0.95,
-  "reserved_output_tokens": 4096,
-  "reserved_output_tokens_cap_ratio": 0.25,
-  "token_estimator": "hybrid",
-  "token_safety_factor": 1.15,
-  "unknown_model_context_window": 32768
-}
-```
-
-说明：LLMConfig 响应不包含 `api_key`。
-补充说明：
-- `context_window` 为空时按模型映射自动推断。
-- `context_overflow_guard_enabled` 用于开启上下文超限治理。
-- `hard_trigger_ratio` 必须大于 `soft_trigger_ratio`。
-
-### AgentConfig
-
-```json
-{
-  "max_iterations": 100,
-  "max_retries": 3,
-  "max_search_results": 10
-}
-```
-
-### SessionStatus
-
-`pending | running | waiting | completed`
-
-### CreateSessionResponse
-
-```json
-{
-  "session_id": "string"
-}
-```
-
-### ListSessionItem
-
-```json
-{
-  "session_id": "string",
-  "title": "string",
-  "latest_message": "string",
-  "latest_message_at": "string | null",
-  "status": "pending | running | waiting | completed",
-  "unread_message_count": 0
-}
-```
-
-### ListSessionResponse
-
-```json
-{
-  "sessions": [
-    {
-      "session_id": "string",
-      "title": "string",
-      "latest_message": "string",
-      "latest_message_at": "string | null",
-      "status": "pending | running | waiting | completed",
-      "unread_message_count": 0
-    }
-  ]
-}
-```
-
-### UserRole
-
-`super_admin | user`
-
-### UserStatus
-
-`active | inactive | banned`
-
-### RegisterRequest
-
-```json
-{
-  "username": "string",
-  "email": "string",
-  "password": "string",
-  "nickname": "string"
-}
-```
-
-`username` 或 `email` 至少提供一个。
-
-### LoginRequest
-
-```json
-{
-  "username": "string",
-  "email": "string",
-  "password": "string"
-}
-```
-
-`username` 或 `email` 至少提供一个。
-
-### RefreshTokenRequest
-
-```json
-{
-  "refresh_token": "string"
-}
-```
-
-### UpdateUserRequest
-
-```json
-{
-  "nickname": "string",
-  "avatar": "string"
-}
-```
-
-### TokenResponse
-
-```json
-{
-  "access_token": "string",
-  "refresh_token": "string",
-  "token_type": "bearer"
-}
-```
-
-### UserResponse
-
-```json
-{
-  "id": "string",
-  "username": "string",
-  "email": "string",
-  "nickname": "string",
-  "avatar": "string",
-  "role": "super_admin | user",
-  "status": "active | inactive | banned",
-  "created_at": "string"
-}
-```
-
-### LoginResponse
-
-```json
-{
-  "user": {
-    "id": "string",
-    "username": "string",
-    "email": "string",
-    "nickname": "string",
-    "avatar": "string",
-    "role": "super_admin | user",
-    "status": "active | inactive | banned",
-    "created_at": "string"
-  },
-  "tokens": {
-    "access_token": "string",
-    "refresh_token": "string",
-    "token_type": "bearer"
-  }
-}
-```
-
-### UserStatusUpdateRequest
-
-```json
-{
-  "status": "active | inactive | banned"
-}
-```
-
-### UserListResponse
-
-```json
-{
-  "users": [
-    {
-      "id": "string",
-      "username": "string",
-      "email": "string",
-      "nickname": "string",
-      "avatar": "string",
-      "role": "super_admin | user",
-      "status": "active | inactive | banned",
-      "created_at": "string"
-    }
-  ],
-  "total": 0
-}
-```
-
-### ToolPreferenceRequest
-
-```json
-{
-  "enabled": true
-}
-```
-
-### ToolWithPreference
+### `ToolWithPreference`
 
 ```json
 {
   "tool_id": "string",
   "tool_name": "string",
-  "description": "string",
+  "description": "string | null",
   "enabled_global": true,
   "enabled_user": true
 }
 ```
 
-### ToolListResponse
+### `StartTakeoverRequest`
 
 ```json
 {
-  "tools": [
-    {
-      "tool_id": "string",
-      "tool_name": "string",
-      "description": "string",
-      "enabled_global": true,
-      "enabled_user": true
-    }
-  ]
+  "scope": "shell"
 }
 ```
 
-### MCPConfig
+### `RenewTakeoverRequest`
 
 ```json
 {
-  "mcpServers": {
-    "server_name": {
-      "transport": "stdio | sse | streamable_http",
-      "enabled": true,
-      "description": "string",
-      "env": {
-        "ANY": "value"
-      },
-      "command": "string",
-      "args": [
-        "string"
-      ],
-      "url": "string",
-      "headers": {
-        "ANY": "value"
-      }
-    }
-  }
+  "takeover_id": "string"
 }
 ```
 
-校验规则：
-- `transport` 为 `sse` 或 `streamable_http` 时必须提供 `url`。
-- `transport` 为 `stdio` 时必须提供 `command`。
-
-### ListMCPServerResponse
+### `EndTakeoverRequest`
 
 ```json
 {
-  "mcp_servers": [
-    {
-      "server_name": "string",
-      "enabled": true,
-      "transport": "stdio | sse | streamable_http",
-      "tools": [
-        "string"
-      ]
-    }
-  ]
+  "handoff_mode": "continue"
 }
 ```
 
-### ListA2AServerResponse
-
-```json
-{
-  "a2a_servers": [
-    {
-      "id": "string",
-      "name": "string",
-      "description": "string",
-      "input_modes": [
-        "string"
-      ],
-      "output_modes": [
-        "string"
-      ],
-      "streaming": false,
-      "push_notifications": false,
-      "enabled": true
-    }
-  ]
-}
-```
-
-### MinIO Ping Response Data
-
-```json
-{
-  "ok": true,
-  "reachable": true,
-  "endpoint": "string",
-  "secure": true,
-  "bucket": "string",
-  "bucket_exists": true
-}
-```
-
-### MinIO Smoke Test Response Data
-
-```json
-{
-  "ok": true,
-  "endpoint": "string",
-  "secure": true,
-  "bucket": "string",
-  "bucket_exists": true,
-  "object": "string",
-  "uploaded_bytes": 0,
-  "downloaded_bytes": 0,
-  "match": true
-}
-```
-
-当 bucket 不存在时，`bucket_exists` 为 false，且 `error` 为 `bucket_not_exists`。
-
-## 认证模块
-
-### POST `/api/auth/register`
-
-用户注册。
-
-请求体：`RegisterRequest`
-
-响应：`Response[LoginResponse]`
-
-### POST `/api/auth/login`
-
-使用用户名或邮箱登录。
-
-请求体：`LoginRequest`
-
-响应：`Response[LoginResponse]`
-
-### POST `/api/auth/refresh`
-
-刷新访问令牌。
-
-请求体：`RefreshTokenRequest`
-
-响应：`Response[TokenResponse]`
-
-### GET `/api/auth/me`
-
-获取当前用户信息。
-
-认证：需要 Bearer token。
-
-响应：`Response[UserResponse]`
-
-### PUT `/api/auth/me`
-
-更新当前用户信息。
-
-认证：需要 Bearer token。
-
-请求体：`UpdateUserRequest`
-
-响应：`Response[UserResponse]`
-
-### GET `/api/auth/wechat/authorize`
-
-获取微信 OAuth 授权 URL。
-
-查询参数：
-- `state` (string, 可选)
-- `scope` (string, 默认 `snsapi_userinfo`)
-
-响应数据：
-
-```json
-{
-  "authorize_url": "string"
-}
-```
-
-### GET `/api/auth/wechat/callback`
-
-微信 OAuth 回调。
-
-查询参数：
-- `code` (string, 必填)
-- `state` (string, 可选)
-
-响应：HTTP 重定向到前端页面，URL 参数包含 token 或 error。
-
-## 状态模块
-
-### GET `/api/status`
-
-系统健康检查。
-
-响应：`Response[List[HealthStatus]]`
-- 任一服务为 `error` 时返回 `code=503`。
-
-### GET `/api/status/minio`
-
-MinIO 健康检查。
-
-查询参数：
-- `smoke` (bool, 默认 false)：执行 put/get/remove 自检。
-- `bucket` (string, 可选)：指定 bucket。
-
-响应：`Response`，数据为 MinIO ping 或 smoke-test 信息。
-
-### POST `/api/status/minio/upload`
-
-MinIO 上传文件测试（multipart/form-data）。
-
-表单：
-- `file` (file, 必填)
-
-查询参数：
-- `bucket` (string, 可选)
-- `object_name` (string, 可选)
-- `prefix` (string, 默认 `uploads`)
-- `presign` (bool, 默认 true)
-- `expiry_seconds` (int, 默认 3600)
-
-响应数据：
-
-```json
-{
-  "bucket": "string",
-  "object": "string",
-  "etag": "string",
-  "version_id": "string",
-  "filename": "string",
-  "content_type": "string",
-  "size": 0,
-  "presigned_get_url": "string"
-}
-```
-
-说明：
-- bucket 不存在时返回 `code=400` 且 `msg="bucket_not_exists"`。
-- `presign=true` 时才包含 `presigned_get_url`。
-
-## 应用配置模块
-
-### GET `/api/app-config/llm`
-
-获取 LLM 配置。
-
-响应：`Response[LLMConfig]`（不包含 api_key）
-
-### POST `/api/app-config/llm`
-
-更新 LLM 配置。
-
-请求体：`LLMConfig`
-- `api_key` 为空时表示不更新该字段。
-
-响应：`Response[LLMConfig]`（不包含 api_key）
-
-### GET `/api/app-config/agent`
-
-获取 Agent 配置。
-
-响应：`Response[AgentConfig]`
-
-### POST `/api/app-config/agent`
-
-更新 Agent 配置。
-
-请求体：`AgentConfig`
-
-响应：`Response[AgentConfig]`
-
-### GET `/api/app-config/mcp-servers`
-
-获取 MCP 服务器列表。
-
-响应：`Response[ListMCPServerResponse]`
-
-### POST `/api/app-config/mcp-servers`
-
-新增 MCP 服务器配置（支持一次传多个）。
-
-请求体：`MCPConfig`
-
-响应：`Response`（无 data）
-
-### POST `/api/app-config/mcp-servers/{server_name}/delete`
-
-删除 MCP 服务器配置。
-
-响应：`Response`（无 data）
-
-### POST `/api/app-config/mcp-servers/{server_name}/enabled`
-
-设置 MCP 服务器启用状态。
-
-请求体：
-
-```json
-{
-  "enabled": true
-}
-```
-
-响应：`Response`（无 data）
-
-### GET `/api/app-config/a2a-servers`
-
-获取 A2A 服务器列表。
-
-响应：`Response[ListA2AServerResponse]`
-
-### POST `/api/app-config/a2a-servers`
-
-新增 A2A 服务器。
-
-请求体：
-
-```json
-{
-  "base_url": "string"
-}
-```
-
-响应：`Response`（无 data）
-
-### POST `/api/app-config/a2a-servers/{a2a_id}/delete`
-
-删除 A2A 服务器。
-
-响应：`Response`（无 data）
-
-### POST `/api/app-config/a2a-servers/{a2a_id}/enabled`
-
-设置 A2A 服务器启用状态。
-
-请求体：
-
-```json
-{
-  "enabled": true
-}
-```
-
-响应：`Response`（无 data）
-
-## 用户工具偏好模块
-
-### GET `/api/user/tools/mcp`
-
-获取 MCP 工具列表（含用户偏好）。
-
-认证：需要 Bearer token。
-
-响应：`Response[ToolListResponse]`
-
-### POST `/api/user/tools/mcp/{server_name}/enabled`
-
-设置 MCP 工具个人启用状态。
-
-认证：需要 Bearer token。
-
-请求体：`ToolPreferenceRequest`
-
-响应：`Response`（无 data）
-
-### GET `/api/user/tools/a2a`
-
-获取 A2A 工具列表（含用户偏好）。
-
-认证：需要 Bearer token。
-
-响应：`Response[ToolListResponse]`
-
-### POST `/api/user/tools/a2a/{a2a_id}/enabled`
-
-设置 A2A 工具个人启用状态。
-
-认证：需要 Bearer token。
-
-请求体：`ToolPreferenceRequest`
-
-响应：`Response`（无 data）
-
-## 会话模块
-
-### POST `/api/sessions`
-
-为当前用户创建新会话。
-
-认证：需要 Bearer token。
-
-响应：`Response[CreateSessionResponse]`
-
-### GET `/api/sessions`
-
-获取当前用户会话列表。
-
-认证：需要 Bearer token。
-
-响应：`Response[ListSessionResponse]`
-
-### POST `/api/sessions/stream`
-
-流式获取会话列表（SSE）。
-
-认证：需要 Bearer token。
-
-说明：
-- 受请求频率限制与 SSE 并发连接限制（按用户）。
-
-### GET `/api/sessions/{session_id}`
-
-获取指定会话详情。
-
-认证：需要 Bearer token。
-
-说明：
-- 普通用户仅可访问自己的会话。
-- 管理员可跨用户访问。
-
-### POST `/api/sessions/{session_id}/chat`
-
-向指定会话发起聊天（SSE）。
-
-认证：需要 Bearer token。
-
-说明：
-- 普通用户仅可访问自己的会话。
-- 普通用户仅可引用自己上传的附件文件。
-- 管理员可跨用户访问会话并引用任意附件。
-- 受 chat 请求频率限制与 SSE 并发连接限制（按用户）。
-
-### POST `/api/sessions/{session_id}/stop`
-
-停止指定会话。
-
-认证：需要 Bearer token。
-
-说明：
-- 普通用户仅可停止自己的会话。
-- 管理员可跨用户停止会话。
-
-### POST `/api/sessions/{session_id}/clear-unread-message-count`
-
-清除当前用户指定会话的未读消息数。
-
-认证：需要 Bearer token。
-
-响应：`Response`（无 data）
-
-错误：
-- 403：会话不属于当前用户。
-- 404：会话不存在。
-
-### POST `/api/sessions/{session_id}/delete`
-
-删除当前用户指定会话。
-
-认证：需要 Bearer token。
-
-响应：`Response`（无 data）
-
-错误：
-- 403：会话不属于当前用户。
-- 404：会话不存在。
-
-### GET `/api/sessions/{session_id}/files`
-
-获取指定会话文件列表。
-
-认证：需要 Bearer token。
-
-说明：
-- 普通用户仅可访问自己的会话。
-- 管理员可跨用户访问。
-
-### POST `/api/sessions/{session_id}/file`
-
-读取指定会话沙箱文件内容。
-
-认证：需要 Bearer token。
-
-说明：
-- 普通用户仅可访问自己的会话。
-- 管理员可跨用户访问。
-
-### POST `/api/sessions/{session_id}/shell`
-
-读取指定会话的 Shell 输出。
-
-认证：需要 Bearer token。
-
-说明：
-- 普通用户仅可访问自己的会话。
-- 管理员可跨用户访问。
-- 长时间命令（如 `npm start` / `pip install`）通常会在执行端先返回 `running`，随后通过本接口持续读取输出。
-- 安装类命令会自动补齐常见非交互参数以降低卡在确认提示符的概率。
-
-### WS `/api/sessions/{session_id}/vnc?token=<access_token>`
-
-建立会话 VNC WebSocket 连接。
-
-认证：query token 必填。
-
-说明：
-- 普通用户仅可访问自己的会话。
-- 管理员可跨用户访问。
-- 受请求频率限制与 WS 并发连接限制（按用户）。
-
-## 管理员模块
-
-### GET `/api/admin/users`
-
-获取用户列表。
-
-认证：需要 Bearer token（仅 super_admin）。
-
-查询参数：
-- `skip` (int, 默认 0)
-- `limit` (int, 默认 100)
-
-响应：`Response[UserListResponse]`
-
-### GET `/api/admin/users/{user_id}`
-
-获取用户详情。
-
-认证：需要 Bearer token（仅 super_admin）。
-
-响应：`Response[UserResponse]`
-
-### PUT `/api/admin/users/{user_id}/status`
-
-更新用户状态。
-
-认证：需要 Bearer token（仅 super_admin）。
-
-请求体：`UserStatusUpdateRequest`
-
-响应：`Response`（无 data）
-
-说明：
-- 不能修改自己的状态。
-- 不能修改其他管理员的状态。
-
-### DELETE `/api/admin/users/{user_id}`
-
-删除用户。
-
-认证：需要 Bearer token（仅 super_admin）。
-
-响应：`Response`（无 data）
-
-说明：
-- 不能删除自己。
-- 不能删除其他管理员。
-
-## 文件模块
-
-### POST `/api/files`
-
-上传文件（multipart/form-data）。
-
-表单：
-- `file` (file, 必填)
-
-认证：需要 Bearer token。
-
-响应：`Response[FileInfo]`
-
-### GET `/api/files/{file_id}`
-
-获取文件信息。
-
-认证：需要 Bearer token。
-
-说明：
-- 普通用户仅可访问自己的文件。
-- 管理员可跨用户访问。
-
-响应：`Response[FileInfo]`
-
-### GET `/api/files/{file_id}/download`
-
-下载文件内容。
-
-认证：需要 Bearer token。
-
-说明：
-- 普通用户仅可访问自己的文件。
-- 管理员可跨用户访问。
-
-响应：文件流，响应头包含：
-- `Content-Disposition: attachment; filename*=utf-8''<encoded>`
-- `Content-Length: <bytes>`
-
-### DELETE `/api/files/{file_id}`
-
-删除文件。
-
-认证：需要 Bearer token。
-
-说明：
-- 普通用户仅可删除自己的文件。
-- 管理员可跨用户删除。
-
-响应：`Response`（无 data）
-
-## Skill 生态模块（v2）
-
-### 数据模型
-
-#### SkillInstallRequest
-
-```json
-{
-  "source_type": "local | github",
-  "source_ref": "string",
-  "manifest": {},
-  "skill_md": ""
-}
-```
-
-说明：
-- `source_type`：来源类型，`local` 为本地绝对路径，`github` 为 GitHub tree URL。
-- `source_ref`：来源引用（本地路径如 `/path/to/skill`，GitHub URL 如 `https://github.com/owner/repo/tree/main/skills/my-skill`）。
-- `manifest`：可选兼容字段，默认由 SKILL.md frontmatter 自动生成。
-- `skill_md`：可选 SKILL.md 内容覆盖，优先级高于 bundle 中的 SKILL.md。
-
-#### SkillItem
-
-```json
-{
-  "id": "string",
-  "slug": "string",
-  "name": "string",
-  "description": "",
-  "version": "0.1.0",
-  "source_type": "local | github",
-  "source_ref": "string",
-  "runtime_type": "native | mcp | a2a",
-  "enabled": true,
-  "installed_by": "string | null",
-  "created_at": "datetime",
-  "updated_at": "datetime",
-  "bundle_file_count": 0,
-  "context_ref_count": 0,
-  "last_sync_at": "string | null"
-}
-```
-
-#### SkillRiskPolicyItem
-
-```json
-{
-  "mode": "off | enforce_confirmation"
-}
-```
-
-### GET `/api/v2/skills`
-
-获取 Skill 列表。
-
-认证：需要 Bearer token（管理员）。
-
-响应：`Response[SkillListResponse]`
-
-### POST `/api/v2/skills/install`
-
-安装 Skill（支持 GitHub / 本地目录来源）。
-
-认证：需要 Bearer token（管理员）。
-
-请求体：`SkillInstallRequest`
-
-响应：`Response[SkillItem]`
-
-说明：
-- 安装流程：加载 bundle → 解析 SKILL.md frontmatter → 校验安全策略 → 构建 context_blob → 写入文件系统。
-- 同 slug 的 Skill 会被更新（保留 enabled 状态和 ID）。
-- Skill 存储路径：`SKILLS_ROOT_DIR`（默认 `/app/data/skills`）。
-
-### POST `/api/v2/skills/{skill_key}/enabled`
-
-更新 Skill 启用状态。
-
-认证：需要 Bearer token（管理员）。
-
-请求体：
-
-```json
-{
-  "enabled": true
-}
-```
-
-响应：`Response`（无 data）
-
-### DELETE `/api/v2/skills/{skill_key}`
-
-删除 Skill（同时清理用户工具偏好）。
-
-认证：需要 Bearer token（管理员）。
-
-响应：`Response`（无 data）
-
-### GET `/api/v2/skills/policy`
-
-获取 Skill 风险策略配置。
-
-认证：需要 Bearer token（管理员）。
-
-响应：`Response[SkillRiskPolicyItem]`
-
-### POST `/api/v2/skills/policy`
-
-更新 Skill 风险策略配置。
-
-认证：需要 Bearer token（管理员）。
-
-请求体：`SkillRiskPolicyItem`
-
-响应：`Response`（无 data）
-
-> **注意**：旧版 v1 Skill API（`/api/app-config/skills/*`）已返回 HTTP 410，请使用 v2 API。
-
-## cURL 示例
-
-基础地址：`http://localhost:8000`
-
-### 注册
-
-```bash
-curl -X POST http://localhost:8000/api/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"username":"demo","password":"password123","nickname":"Demo"}'
-```
-
-### 登录
-
-```bash
-curl -X POST http://localhost:8000/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"demo","password":"password123"}'
-```
-
-### 获取当前用户
-
-```bash
-curl -X GET http://localhost:8000/api/auth/me \
-  -H "Authorization: Bearer <access_token>"
-```
-
-### 获取用户列表（管理员）
-
-```bash
-curl -X GET "http://localhost:8000/api/admin/users?skip=0&limit=20" \
-  -H "Authorization: Bearer <access_token>"
-```
-
-### 创建会话
-
-```bash
-curl -X POST http://localhost:8000/api/sessions \
-  -H "Authorization: Bearer <access_token>"
-```
-
-### 获取会话列表
-
-```bash
-curl -X GET http://localhost:8000/api/sessions \
-  -H "Authorization: Bearer <access_token>"
-```
-
-### 清除会话未读消息数
-
-```bash
-curl -X POST http://localhost:8000/api/sessions/<session_id>/clear-unread-message-count \
-  -H "Authorization: Bearer <access_token>"
-```
-
-### 删除会话
-
-```bash
-curl -X POST http://localhost:8000/api/sessions/<session_id>/delete \
-  -H "Authorization: Bearer <access_token>"
-```
-
-### 获取 Skill 列表
-
-```bash
-curl -X GET http://localhost:8000/api/v2/skills \
-  -H "Authorization: Bearer <access_token>"
-```
-
-### 安装 Skill（本地目录）
-
-```bash
-curl -X POST http://localhost:8000/api/v2/skills/install \
-  -H "Authorization: Bearer <access_token>" \
-  -H "Content-Type: application/json" \
-  -d '{"source_type": "local", "source_ref": "/path/to/skill"}'
-```
-
-### 安装 Skill（GitHub）
-
-```bash
-curl -X POST http://localhost:8000/api/v2/skills/install \
-  -H "Authorization: Bearer <access_token>" \
-  -H "Content-Type: application/json" \
-  -d '{"source_type": "github", "source_ref": "https://github.com/owner/repo/tree/main/skills/my-skill"}'
-```
-
-### 启用/禁用 Skill
-
-```bash
-curl -X POST http://localhost:8000/api/v2/skills/<skill_key>/enabled \
-  -H "Authorization: Bearer <access_token>" \
-  -H "Content-Type: application/json" \
-  -d '{"enabled": true}'
-```
-
-### 删除 Skill
-
-```bash
-curl -X DELETE http://localhost:8000/api/v2/skills/<skill_key> \
-  -H "Authorization: Bearer <access_token>"
-```
-
-### 获取 Skill 风险策略
-
-```bash
-curl -X GET http://localhost:8000/api/v2/skills/policy \
-  -H "Authorization: Bearer <access_token>"
-```
+## OpenAPI
+
+- Swagger UI：`/docs`
+- ReDoc：`/redoc`
+- OpenAPI JSON：`/openapi.json`

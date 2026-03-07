@@ -1,104 +1,170 @@
-# Deployment Guide (Docker Compose)
+# Deployment Guide
 
-This guide deploys the full stack on one host:
+本指南对应当前 `docker-compose.yml` 的实际运行方式，适用于单机部署 Actus。
 
-- `ui` (nginx gateway)
-- `ui-app` (Next.js runtime)
-- `api` (FastAPI)
-- `postgres`
-- `redis`
-- sandbox image build for dynamic task containers
+## 部署拓扑
 
-## 1. Prerequisites
+Compose 会启动或构建以下组件：
+
+- `postgres`：持久化会话、用户、文件元数据
+- `redis`：限流、状态与部分运行时协调
+- `sandbox-image`：仅用于构建沙箱镜像，不常驻运行
+- `api`：FastAPI 后端
+- `ui-app`：Next.js 运行时
+- `ui`：nginx 网关，对外暴露前端入口
+
+Compose **不会** 启动 MinIO。你需要在外部提供一个可访问的 MinIO / S3 兼容服务，并提前创建 bucket。
+
+## 1. 前置条件
 
 - Docker Engine + Docker Compose v2
-- At least 6 GB memory available for Docker
+- 至少 6 GB Docker 可用内存
+- 可访问的 MinIO / S3 兼容对象存储
+- 可访问的 LLM 提供商 API
 
-## 2. Configure environment
+## 2. 配置环境变量
 
 ```bash
-cd /path/to/Actus-opensource
+git clone https://github.com/hahaliu1029/Actus.git
+cd Actus
 cp .env.example .env
 ```
 
-Edit `.env` at minimum:
+至少需要修改这些值：
 
-- `JWT_SECRET_KEY`
 - `POSTGRES_PASSWORD`
-- `NEXT_PUBLIC_API_BASE_URL`
+- `JWT_SECRET_KEY`
 - `MINIO_ENDPOINT`
 - `MINIO_ACCESS_KEY`
 - `MINIO_SECRET_KEY`
 - `MINIO_BUCKET_NAME`
+- `NEXT_PUBLIC_API_BASE_URL`
 
-`NEXT_PUBLIC_API_BASE_URL` must point to a browser-reachable API URL.
-Remote MinIO bucket must already exist and be reachable from `api`.
+补充说明：
 
-## 3. Start all services
+- `NEXT_PUBLIC_API_BASE_URL` 是**构建时注入**的前端 API 地址，必须是浏览器可访问的 URL
+- `MINIO_BUCKET_NAME` 对应的 bucket 需要事先存在
+- `SANDBOX_IMAGE` 默认是 `actus-sandbox:latest`
+- 如需调整浏览器接管能力，可额外配置 `SANDBOX_CHROME_ARGS`
+
+## 3. 启动全部服务
 
 ```bash
-cd /path/to/Actus-opensource
 docker compose --env-file .env up -d --build
 ```
 
-## 4. Verify runtime
+首次启动时，后端会：
+
+- 自动执行 Alembic 迁移
+- 初始化 PostgreSQL / Redis / MinIO 客户端
+- 如果 `/app/data/config.yaml` 不存在，则创建默认运行时配置
+
+## 4. 初始化管理员
 
 ```bash
-docker compose ps
-docker compose logs -f api
-```
-
-Open:
-
-- UI: `http://localhost:80` (or `http://localhost:${UI_PORT}`)
-- API docs: `http://localhost:8000/docs`
-
-## 5. Create super admin (optional but recommended)
-
-```bash
-cd /path/to/Actus-opensource
 docker compose exec api python scripts/create_super_admin.py
 ```
 
-## 6. Stop / restart
+## 5. 访问入口
+
+- UI：`http://localhost`（默认 `UI_PORT=80`）
+- API 文档：`http://localhost:8000/docs`
+- OpenAPI JSON：`http://localhost:8000/openapi.json`
+
+容器模式下，前端链路是：
+
+```text
+browser -> ui (nginx:80) -> ui-app (Next.js:3000) -> api
+```
+
+## 6. 配置运行时参数
+
+Compose 模式下，Actus 的业务运行时配置不读取仓库中的 `api/config.yaml`，而是读取 `api-data` volume 中的：
+
+```text
+/app/data/config.yaml
+```
+
+推荐做法：
+
+1. 先完成首次启动
+2. 登录前端后台
+3. 在 `设置` 中配置：
+   - 模型提供商
+   - MCP 服务器
+   - A2A Agent 配置
+   - Skill 风险策略
+   - Skill 安装与启用
+
+Skill 目录默认保存在：
+
+```text
+/app/data/skills
+```
+
+## 7. 验证部署
+
+```bash
+docker compose ps
+docker compose logs --tail=200 api
+docker compose logs --tail=200 ui
+```
+
+建议至少检查：
+
+- `api` 健康检查通过
+- `ui-app` 和 `ui` 健康检查通过
+- `http://localhost:8000/docs` 可打开
+- 前端登录后可以进入首页和设置页
+
+如需验证对象存储连通性，可以调用：
+
+- `GET /api/status/minio`
+- `GET /api/status/minio?smoke=true`
+
+或在容器内运行：
+
+```bash
+docker compose exec api python scripts/minio_smoke_test.py
+```
+
+## 8. 停止与清理
 
 ```bash
 docker compose down
-docker compose up -d
 ```
 
-To remove all persistent data volumes as well:
+删除持久化数据卷：
 
 ```bash
 docker compose down -v
 ```
 
-## 7. Rebuild sandbox runtime after sandbox code changes
+默认持久化卷：
 
-If you changed files under `sandbox/` (for example shell runtime behavior), use the following steps to apply updates correctly:
+- `postgres-data`
+- `redis-data`
+- `api-data`
+
+## 9. 更新沙箱代码后的重建方式
+
+如果你修改了 `sandbox/` 中的代码，不要运行不存在的 `sandbox` 服务。正确流程：
 
 ```bash
-# Rebuild sandbox image and API image
 docker compose --env-file .env build sandbox-image api
-
-# Force recreate API container
 docker compose --env-file .env up -d --force-recreate api
+```
 
-# Optional: remove existing temporary sandbox containers
+如需确保新会话不复用旧容器，可清理历史临时沙箱：
+
+```bash
 docker ps --format '{{.Names}}' | grep '^actus-sb-' | xargs -r docker rm -f
 ```
 
-Notes:
-- Compose service name is `sandbox-image` (not `sandbox`).
-- New sessions will use the updated sandbox image. Existing sessions may still bind to old temporary sandbox containers.
-- Frontend traffic path is `ui(nginx)` -> `ui-app(Next.js)` in container mode.
+## 10. 常见注意事项
 
-## Notes
-
-- API startup runs Alembic migrations automatically.
-- App config is persisted in `api-data` volume (`/app/data/config.yaml`).
-- **Skill data is stored on the filesystem** at `/app/data/skills` within the `api-data` volume (configurable via `SKILLS_ROOT_DIR` environment variable). Each Skill occupies a separate directory containing `meta.json`, `manifest.json`, `SKILL.md`, and an optional `bundle/` directory.
-- Sandbox containers are created by API through Docker socket mount.
-- MinIO is not started by compose. API connects to your remote MinIO using `.env` values.
-- If your deployment domain changes, rebuild UI so new `NEXT_PUBLIC_API_BASE_URL` is baked in.
-- Skills can be installed and managed through the frontend under **Settings → Skill Ecosystem**, supporting both GitHub and local directory sources.
+- 前端 API 地址变化后，需要重新构建 `ui-app`
+- `api` 通过挂载的 Docker Socket 动态创建会话沙箱
+- 沙箱镜像本身不常驻；真正执行任务的是 API 运行时按需创建的临时容器
+- 如果 Redis 不可用，限流相关接口会返回 `503`
+- 旧版 Skill API 会返回 `410`，请使用 `/api/v2/skills/*`

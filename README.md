@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">Actus</h1>
   <p align="center">
-    自托管的通用 AI Agent 平台 — 规划、推理、执行，一站完成
+    自托管的通用 AI Agent 平台，覆盖规划、推理、执行与人工接管全流程
   </p>
   <p align="center">
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License"></a>
@@ -15,163 +15,218 @@
 
 ---
 
-## 功能特性
+## 项目概览
 
-- **ReAct Agent** — 基于 Reasoning + Acting 模式的智能体，支持多轮推理与工具调用
-- **MCP 工具协议** — 通过 [Model Context Protocol](https://modelcontextprotocol.io/) 动态接入外部工具服务器
-- **A2A 协议** — 支持 [Agent-to-Agent](https://google.github.io/A2A/) 智能体间通信与协作
-- **Skill 生态** — 独立的 Skill 扩展生态，通过 SKILL.md 定义与安装，基于文件系统存储，支持 GitHub / 本地目录双来源
-- **Planner + ReAct 流程** — 先规划再执行的两阶段 Agent 流程编排
-- **沙箱执行** — Docker 隔离的代码执行环境，安全运行用户代码
-- **长命令友好** — Shell 长时间任务（如 `npm start` / `pip install`）短等待后返回 `running`，可持续读取输出与主动停止
-- **远程桌面** — 基于 noVNC 的沙箱桌面实时预览，浏览器内直接查看 Agent 操作画面
-- **浏览器自动化** — 基于 Playwright + DOM 索引方案的网页操作能力，通过 CDP 连接沙箱 Chromium，实时提取可交互元素并精确操作
-- **多模型支持** — 兼容 OpenAI API 格式（DeepSeek、Kimi 等）
-- **流式输出** — 实时流式响应，支持思考过程展示
-- **文件管理** — MinIO/S3 兼容的对象存储，支持文件上传下载
-- **用户系统** — JWT 认证、角色权限管理
-- **现代前端** — Next.js 16 + React 19 + shadcn/ui 组件库，Geist 字体，深色 / 浅色双主题
+Actus 由三个核心运行时组成：
+
+- `api/`：FastAPI 后端，负责会话、Agent、权限、文件、配置、Skill 生态与沙箱调度
+- `ui/`：Next.js 16 前端，提供聊天、任务摘要、工作台、设置页和管理界面
+- `sandbox/`：按会话动态拉起的 Docker 沙箱，内置 Shell、文件系统、Chromium、VNC/noVNC
+
+系统默认采用 `Planner + ReAct` 双阶段流程：先规划任务，再逐步执行，并在执行过程中通过 SSE 持续推送计划、步骤、工具调用、消息和接管事件。
+
+## 核心能力
+
+- **Planner + ReAct Agent**：支持规划、步骤执行、等待用户输入和任务完成总结
+- **内置工具链**：文件、Shell、浏览器、搜索、消息工具开箱即用
+- **MCP / A2A / Skill 扩展**：统一纳入 Agent 工具选择与运行时编排
+- **Skill v2 文件系统存储**：Skill 保存在 `/app/data/skills`，支持 GitHub 与本地目录安装
+- **人工接管**：支持 `shell` 和 `browser` 两类接管，包含申请、续期、结束、补救流程
+- **工作台视图**：终端预览、浏览器预览、VNC 画面、时间线回放、文件预览
+- **流式交互**：会话列表与对话执行均支持 SSE；接管终端和 VNC 使用 WebSocket
+- **容器化沙箱**：每个会话独立 Docker 容器，内置 Chromium、Xvfb、x11vnc、websockify
+- **对象存储与附件**：上传文件落到 MinIO/S3 兼容存储，并与会话关联
+- **用户与管理**：JWT 鉴权、超级管理员、用户管理、工具偏好、应用设置
 
 ## 架构概览
 
-```
+```text
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│   UI (Next.js)│────▶│  API (FastAPI)│────▶│  PostgreSQL  │
+│ UI (Next.js) │────▶│ API (FastAPI)│────▶│ PostgreSQL   │
 └──────────────┘     │              │     └──────────────┘
-                     │   ┌────────┐ │     ┌──────────────┐
-                     │   │ Agent  │ │────▶│    Redis      │
-                     │   │ Engine │ │     └──────────────┘
-                     │   └───┬────┘ │     ┌──────────────┐
-                     │       │      │────▶│  MinIO / S3   │
-                     │   ┌───▼────┐ │     └──────────────┘
-                     │   │MCP/A2A │ │     ┌──────────────┐
-                     │   │/Skill  │ │
-                     │   │Tools   │ │────▶│  Sandbox      │
-                     │   └────────┘ │     │  (Docker)     │
-                     └──────────────┘     └──────────────┘
+                     │ Agent / Auth │────▶│ Redis        │
+                     │ Files / Skill│     └──────────────┘
+                     │ Settings     │────▶│ MinIO / S3   │
+                     │ Sandbox Ctrl │     └──────────────┘
+                     └──────┬───────┘
+                            │ Docker
+                            ▼
+                     ┌──────────────┐
+                     │ Sandbox      │
+                     │ Shell/File   │
+                     │ Chromium/VNC │
+                     └──────────────┘
 ```
 
-后端采用 **整洁架构 (Clean Architecture) + DDD** 分层设计，详见 [项目架构文档](项目架构.md)。
+后端分层与关键模块见 [项目架构文档](项目架构.md)。
 
-## 快速开始
+## Docker Compose 快速开始
 
-### 环境要求
+### 前置条件
 
 - Docker Engine + Docker Compose v2
 - 至少 6 GB 可用内存
-- 一个可用的 MinIO / S3 兼容对象存储服务
+- 一个可用且已创建 bucket 的 MinIO / S3 兼容对象存储
+- 一个可用的 LLM API Key（启动后在设置页填写，或预写入运行时配置）
 
-### 一键部署
+### 启动步骤
 
 ```bash
-# 1. 克隆项目
-git clone https://github.com/your-org/Actus.git
+git clone https://github.com/hahaliu1029/Actus.git
 cd Actus
 
-# 2. 配置环境变量
 cp .env.example .env
-# 编辑 .env，填入你的数据库密码、JWT 密钥、MinIO 凭证等
+# 编辑 .env，至少填写：
+# POSTGRES_PASSWORD
+# JWT_SECRET_KEY
+# MINIO_ENDPOINT
+# MINIO_ACCESS_KEY
+# MINIO_SECRET_KEY
+# MINIO_BUCKET_NAME
+# NEXT_PUBLIC_API_BASE_URL
 
-# 3. 配置 Agent 运行时参数
-cp api/config.yaml.example api/config.yaml
-# 编辑 api/config.yaml，填入你的 LLM API Key 和 MCP/A2A 配置
-# Skill 存储在文件系统 /app/data/skills（可通过 SKILLS_ROOT_DIR 环境变量调整）
-# 通过前端「设置 -> Skill 生态」安装和管理 Skill
-
-# 4. 启动所有服务
 docker compose --env-file .env up -d --build
 
-# 5. 创建管理员账号（推荐）
+# 可选：创建超级管理员
 docker compose exec api python scripts/create_super_admin.py
 ```
 
-启动后访问：
+启动完成后访问：
 
-- 前端界面：http://localhost:80（或 `http://localhost:${UI_PORT}`）
-- API 文档：http://localhost:8000/docs
+- 前端：`http://localhost`（默认 `UI_PORT=80`）
+- API 文档：`http://localhost:8000/docs`
 
-容器部署下，前端采用两层结构：`ui`（nginx 网关）-> `ui-app`（Next.js 运行时）。
+### 运行时配置说明
 
-### 本地开发
+- Compose 模式下，后端运行时配置文件实际位于 `api-data` volume 内的 `/app/data/config.yaml`
+- 如果该文件不存在，后端会按代码默认值自动创建
+- 推荐在首次启动后，通过前端 `设置 -> 模型提供商 / MCP 服务器 / A2A Agent 配置 / Skill 生态` 完成配置
+- `api/config.yaml.example` 主要用于**本地后端开发**或你需要手工预填配置文件时参考
+
+### 修改 `sandbox/` 后的正确重建方式
+
+Compose 中的服务名是 `sandbox-image`，不是 `sandbox`。当你修改沙箱代码后，应使用：
 
 ```bash
-# 后端
-cd api
-pip install -r requirements.txt
-bash dev.sh
+docker compose --env-file .env build sandbox-image api
+docker compose --env-file .env up -d --force-recreate api
 
-# 前端
+# 可选：清理旧的临时沙箱容器
+docker ps --format '{{.Names}}' | grep '^actus-sb-' | xargs -r docker rm -f
+```
+
+## 本地开发
+
+### 前端本地开发
+
+```bash
 cd ui
 npm install
 npm run dev
 ```
 
-### 沙箱代码更新后的正确重建
+前端默认访问 `NEXT_PUBLIC_API_BASE_URL`，开发时通常指向 `http://localhost:8000/api`。
 
-当你修改了 `sandbox/` 代码（如 `sandbox/app/services/shell.py`）时，请不要执行 `docker compose up ... sandbox`（Compose 中没有该服务名），应使用：
+### 后端本地开发
+
+后端本地运行与 Compose 使用的根目录 `.env` 不是一套变量。`api/core/config.py` 读取的是 `api/.env` 中的运行时变量，例如：
 
 ```bash
-# 1) 重建沙箱镜像与 API 镜像
-docker compose --env-file .env build sandbox-image api
+cd api
+cp config.yaml.example config.yaml
 
-# 2) 强制重建 API 容器（确保后续新建会话使用新镜像）
-docker compose --env-file .env up -d --force-recreate api
+cat > .env <<'EOF'
+ENV=development
+LOG_LEVEL=INFO
+APP_CONFIG_FILEPATH=config.yaml
+SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/manus
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+REDIS_DB=0
+MINIO_ENDPOINT=s3.example.com
+MINIO_ACCESS_KEY=replace-me
+MINIO_SECRET_KEY=replace-me
+MINIO_SECURE=true
+MINIO_BUCKET_NAME=replace-me
+JWT_SECRET_KEY=replace-with-a-strong-random-string
+SANDBOX_IMAGE=actus-sandbox:latest
+SANDBOX_NAME_PREFIX=actus-sb
+EOF
 
-# 3) 可选：清理旧的临时沙箱容器，避免复用旧版本
-docker ps --format '{{.Names}}' | grep '^actus-sb-' | xargs -r docker rm -f
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+bash dev.sh
 ```
 
-## 项目结构
+本地后端开发通常还需要：
 
+- 启动 PostgreSQL、Redis
+- 预先构建 `sandbox-image`
+- 准备可访问的 MinIO/S3 bucket
+
+更详细说明见 [api/README.md](api/README.md)。
+
+## 测试
+
+```bash
+# 后端
+cd api
+pytest
+
+# 前端
+cd ui
+npm run test
 ```
+
+## 目录结构
+
+```text
 Actus/
-├── api/                 # 后端服务 (FastAPI)
-│   ├── app/             # 应用代码（整洁架构分层）
-│   │   ├── domain/      #   领域层（模型、Agent、工具、Prompt、Skill 领域模型）
-│   │   ├── application/ #   应用层（用例编排、Skill 安装/选择/索引服务）
-│   │   ├── infrastructure/ # 基础设施层（数据库、文件系统 Skill 仓储、外部服务）
-│   │   └── interfaces/  #   接口层（路由、Schema、依赖注入）
-│   ├── core/            # 核心配置与安全
-│   ├── alembic/         # 数据库迁移
-│   ├── scripts/         # 运维脚本（含 Skill 迁移脚本）
-│   └── tests/           # 测试
-├── ui/                  # 前端 (Next.js)
-├── sandbox/             # 沙箱服务 (代码执行环境)
-├── docker-compose.yml   # 容器编排
-├── DEPLOY.md            # 部署指南
-└── 项目架构.md            # 架构详细文档
+├── api/                  # FastAPI 后端
+│   ├── app/
+│   │   ├── application/  # 用例编排
+│   │   ├── domain/       # 领域模型、流程、工具、Prompt
+│   │   ├── infrastructure/ # 数据库/存储/外部实现
+│   │   └── interfaces/   # 路由、Schema、依赖注入
+│   ├── core/             # 环境配置、安全
+│   ├── scripts/          # 管理脚本
+│   └── tests/            # 后端测试
+├── ui/                   # Next.js 前端
+├── sandbox/              # Docker 沙箱镜像源码
+├── docker-compose.yml    # 容器编排
+├── DEPLOY.md             # 部署说明
+├── api_zhcn.md           # 中文 API 文档
+├── api.md                # English API reference
+└── 项目架构.md             # 架构说明
 ```
 
-## 文档
+## 文档索引
 
-- [部署指南](DEPLOY.md) — Docker Compose 部署详细步骤
-- [API 文档](api_zhcn.md) — 完整的 REST API 接口文档
-- [API Docs (English)](api.md) — REST API reference
-- [架构文档](项目架构.md) — 后端架构设计与编码规范
-- [贡献指南](CONTRIBUTING.md) — 如何参与项目开发
+- [部署指南](DEPLOY.md)
+- [中文 API 文档](api_zhcn.md)
+- [English API Reference](api.md)
+- [后端架构说明](项目架构.md)
+- [后端 README](api/README.md)
+- [前端 README](ui/README.md)
+- [沙箱 README](sandbox/README.md)
+- [贡献指南](CONTRIBUTING.md)
 
 ## 技术栈
 
 | 组件 | 技术 |
 |------|------|
-| 后端框架 | FastAPI + Uvicorn |
-| 前端框架 | Next.js 16 + React 19 |
-| UI / 样式 | Tailwind CSS v4 + shadcn/ui + Geist 字体 |
-| 状态管理 | Zustand |
-| 数据库 | PostgreSQL 17 + SQLAlchemy 2.0 (async) |
-| 缓存/队列 | Redis (Redis Streams) |
+| 后端 | FastAPI、Uvicorn、Pydantic v2 |
+| 数据库 | PostgreSQL 17、SQLAlchemy 2.0 async、Alembic |
+| 缓存 / 限流 | Redis |
 | 对象存储 | MinIO / S3 兼容 |
-| LLM 接入 | OpenAI SDK（DeepSeek、Kimi 等） |
-| Agent 协议 | MCP SDK + A2A + Skill Layer |
-| 浏览器自动化 | Playwright + 自研 DOM 索引提取 |
-| 沙箱 | Docker 容器隔离 |
-| 认证 | JWT + bcrypt |
-| 测试 | pytest + Vitest |
-
-## 参与贡献
-
-欢迎提交 Issue 和 Pull Request！请阅读 [贡献指南](CONTRIBUTING.md) 了解详情。
+| Agent | PlannerAgent、ReActAgent、PlannerReActFlow |
+| 扩展协议 | MCP、A2A、Skill |
+| 前端 | Next.js 16、React 19、Tailwind CSS 4、Zustand |
+| 浏览器执行 | Chromium、CDP、Playwright 风格 DOM 操作 |
+| 沙箱 | Docker、Supervisor、Xvfb、x11vnc、websockify |
+| 测试 | pytest、Vitest、Testing Library |
 
 ## 许可证
 
-本项目基于 [Apache License 2.0](LICENSE) 许可证开源。
+本项目基于 [Apache License 2.0](LICENSE) 开源。

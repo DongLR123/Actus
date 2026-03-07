@@ -2,6 +2,14 @@
 
 本文件记录项目的版本变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased] - 2026-03-07
+
+### 文档
+
+- 全量刷新仓库核心 Markdown 文档，使其与当前代码结构、Compose 服务、会话接管能力、Skill v2 路由和本地开发方式保持一致。
+- 修正文档中关于 `api/config.yaml`、`sandbox-image`、本地后端环境变量、前端构建时 API 地址注入方式的过时描述。
+- 重写中英文 README、部署说明、架构说明、子项目 README 和中英文 API 参考文档。
+
 ## [Unreleased] - 2026-02-24
 
 ### 变更

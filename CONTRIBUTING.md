@@ -1,42 +1,110 @@
 # 贡献指南
 
-感谢你对 Actus 的关注！我们欢迎任何形式的贡献，包括但不限于：
+本文档基于当前仓库结构和运行方式编写，适用于 [Actus](https://github.com/hahaliu1029/Actus)。
+
+## 你可以如何贡献
 
 - 报告 Bug
 - 提交功能建议
-- 提交代码修复或新功能
-- 完善文档
-- 分享使用经验
+- 修复代码问题
+- 完善测试
+- 更新文档
 
-## 开始之前
+## 开始前
 
-1. 阅读本贡献指南
-2. 阅读 [行为准则](CODE_OF_CONDUCT.md)
-3. 查看 [已有 Issue](https://github.com/your-org/Actus/issues)，避免重复
+建议先阅读：
 
-## 开发环境搭建
+- [行为准则](CODE_OF_CONDUCT.md)
+- [部署指南](DEPLOY.md)
+- [项目架构](项目架构.md)
 
-### 后端 (API)
+同时请先查看现有 Issue：
+
+- <https://github.com/hahaliu1029/Actus/issues>
+
+## 环境要求
+
+- Python 3.12（后端）
+- Node.js 22+（前端）
+- Docker + Docker Compose v2
+- PostgreSQL、Redis
+- 可访问的 MinIO / S3 兼容对象存储
+
+## 开发方式建议
+
+### 方式一：优先使用 Docker Compose 验证完整链路
+
+适合联调、部署验证、回归测试。
 
 ```bash
-# 推荐使用 Python 3.12
+cp .env.example .env
+docker compose --env-file .env up -d --build
+```
+
+### 方式二：本地运行前端或后端
+
+适合快速迭代某个子项目，但要注意前后端与 Compose 使用的配置来源不同。
+
+## 后端开发
+
+### 1. 启动依赖
+
+你至少需要 PostgreSQL、Redis，以及一个已经构建好的 `sandbox-image`。最简单做法是：
+
+```bash
+docker compose up -d postgres redis
+docker compose build sandbox-image
+```
+
+MinIO/S3 仍需自行准备，Compose 不会启动它。
+
+### 2. 配置本地后端环境
+
+`api/core/config.py` 读取的是 `api/.env`，不是根目录 Compose 用的 `.env`。建议在 `api/` 下创建：
+
+```dotenv
+ENV=development
+LOG_LEVEL=INFO
+APP_CONFIG_FILEPATH=config.yaml
+SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/manus
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+REDIS_DB=0
+MINIO_ENDPOINT=s3.example.com
+MINIO_ACCESS_KEY=replace-me
+MINIO_SECRET_KEY=replace-me
+MINIO_SECURE=true
+MINIO_BUCKET_NAME=a2a-mcp
+JWT_SECRET_KEY=replace-with-a-strong-random-string
+SANDBOX_IMAGE=actus-sandbox:latest
+SANDBOX_NAME_PREFIX=actus-sb
+```
+
+同时创建本地运行时配置：
+
+```bash
 cd api
-
-# 使用 uv（推荐）
-uv sync
-
-# 或使用 pip
-pip install -r requirements.txt
-
-# 复制配置文件
 cp config.yaml.example config.yaml
-# 编辑 config.yaml 填入你的 LLM API Key
+```
 
-# 启动开发服务器
+### 3. 安装依赖并启动
+
+```bash
+cd api
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 bash dev.sh
 ```
 
-### 前端 (UI)
+### 4. 后端测试
+
+```bash
+cd api
+pytest
+```
+
+## 前端开发
 
 ```bash
 cd ui
@@ -44,100 +112,67 @@ npm install
 npm run dev
 ```
 
-### 运行测试
+常用命令：
 
 ```bash
-# 后端测试
-cd api
-pytest
-
-# 前端测试
 cd ui
+npm run lint
 npm run test
+npm run build
 ```
 
-## 分支策略
+前端使用的主要环境变量：
 
-- `main` — 稳定分支，所有发布从此分支创建
-- `dev` — 开发分支，日常开发合并到此
-- `feature/*` — 功能分支，从 `dev` 创建
-- `fix/*` — 修复分支，从 `dev` 创建
+- `NEXT_PUBLIC_API_BASE_URL`
 
-## 提交 Pull Request
+该变量是**构建时注入**的；如果改了部署地址，需要重新构建前端。
 
-1. **Fork** 本仓库
-2. 从 `dev` 创建你的功能分支：`git checkout -b feature/my-feature dev`
-3. 编写代码并添加测试
-4. 确保所有测试通过：`pytest`（后端）/ `npm run test`（前端）
-5. 提交你的更改，使用清晰的 commit message
-6. 推送到你的 Fork：`git push origin feature/my-feature`
-7. 创建 Pull Request 到 `dev` 分支
+## 文档更新
 
-### Commit Message 规范
+如果你的改动影响了以下任意内容，请同步更新文档：
 
-使用 [Conventional Commits](https://www.conventionalcommits.org/) 格式：
+- API 路由或响应格式
+- 会话状态机 / 接管流程
+- Skill / MCP / A2A 配置方式
+- Docker Compose 服务名与部署步骤
+- 本地开发命令
 
-```
-<type>(<scope>): <description>
+## 分支与提交
 
-[optional body]
+推荐从 `main` 创建功能分支：
+
+```bash
+git checkout -b feature/<short-description>
 ```
 
-类型说明：
+提交信息建议使用 Conventional Commits：
 
-| 类型 | 说明 |
-|------|------|
-| `feat` | 新功能 |
-| `fix` | Bug 修复 |
-| `docs` | 文档更新 |
-| `style` | 代码格式（不影响功能） |
-| `refactor` | 重构（不新增功能或修复 Bug） |
-| `test` | 添加或修改测试 |
-| `chore` | 构建/工具/依赖变更 |
-
-示例：
-```
-feat(agent): add timeout support for MCP tool calls
-fix(ui): resolve session list scroll issue
-docs: update deployment guide for MinIO config
+```text
+feat(api): add takeover reopen endpoint
+fix(ui): handle image proxy failures
+docs: refresh deployment and API docs
 ```
 
-## 代码规范
+常见类型：
 
-### 后端
+- `feat`
+- `fix`
+- `docs`
+- `refactor`
+- `test`
+- `chore`
 
-- 遵循 [项目架构文档](项目架构.md) 中的分层规则和编码约束
-- Domain 层禁止依赖任何框架（不导入 FastAPI / SQLAlchemy 等）
-- 使用 Pydantic BaseModel 定义领域模型
-- 所有异步操作使用 `async/await`
-- 新增工具继承 `BaseTool` 并使用 `@tool` 装饰器
+## Pull Request 建议
 
-### 前端
+提交 PR 前请尽量完成以下检查：
 
-- 使用 TypeScript，避免 `any` 类型
-- 组件使用函数组件 + Hooks
-- 状态管理使用 Zustand
-- 样式使用 Tailwind CSS
-- 为新组件编写测试
+- 后端相关改动已运行 `pytest`
+- 前端相关改动已运行 `npm run test`
+- 如涉及构建链路，已运行 `npm run build`
+- 文档与代码一致
+- 未提交敏感信息、`.env` 或临时文件
 
-## 报告 Bug
+## Bug 与安全问题
 
-请使用 [Bug Report](https://github.com/your-org/Actus/issues/new?template=bug_report.yml) 模板创建 Issue，并尽可能提供：
-
-- 清晰的问题描述
-- 复现步骤
-- 期望行为 vs 实际行为
-- 运行环境信息（OS、Docker 版本、浏览器等）
-- 相关日志或截图
-
-## 功能建议
-
-请使用 [Feature Request](https://github.com/your-org/Actus/issues/new?template=feature_request.yml) 模板创建 Issue。
-
-## 安全漏洞
-
-**请不要在公开 Issue 中报告安全漏洞**。请参阅 [SECURITY.md](SECURITY.md) 了解安全问题的报告流程。
-
----
-
-再次感谢你的贡献！
+- 普通问题请使用 Issue：<https://github.com/hahaliu1029/Actus/issues>
+- 安全问题请不要公开提交，请参考 [SECURITY.md](SECURITY.md)
