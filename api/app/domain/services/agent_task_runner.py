@@ -139,6 +139,7 @@ class AgentTaskRunner(TaskRunner):
         skill_creator_service=None,  # skill创建服务
         skill_risk_policy: SkillRiskPolicy | None = None,  # skill风险策略
         overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
+        summary_llm: LLM | None = None,  # 摘要生成模型
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         self._agent_config = agent_config
@@ -238,6 +239,7 @@ class AgentTaskRunner(TaskRunner):
             create_skill_tool=self._create_skill_tool,
             brainstorm_skill_tool=self._brainstorm_skill_tool,
             overflow_config=self._overflow_config,
+            summary_llm=summary_llm,
         )
 
     async def _put_and_add_event(

@@ -1,10 +1,15 @@
+from __future__ import annotations
+
 from datetime import datetime
-from typing import List, Optional, Protocol
+from typing import TYPE_CHECKING, List, Optional, Protocol
 
 from app.domain.models.event import BaseEvent
 from app.domain.models.file import File
 from app.domain.models.memory import Memory
 from app.domain.models.session import Session, SessionStatus
+
+if TYPE_CHECKING:
+    from app.domain.models.conversation_summary import ConversationSummary
 
 
 class SessionRepository(Protocol):
@@ -84,4 +89,14 @@ class SessionRepository(Protocol):
 
     async def get_memory(self, session_id: str, agent_name: str) -> Memory:
         """根据传递的会话id+Agent名字获取记忆"""
+        ...
+
+    async def get_summary(self, session_id: str) -> list[ConversationSummary]:
+        """获取会话的对话摘要列表"""
+        ...
+
+    async def save_summary(
+        self, session_id: str, summaries: list[ConversationSummary]
+    ) -> None:
+        """保存会话的对话摘要列表"""
         ...

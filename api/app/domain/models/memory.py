@@ -1,9 +1,28 @@
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+_BROWSER_COMPACT_TOOLS = frozenset(["browser_view", "browser_navigate"])
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _extract_browser_summary(function_name: str, content: str) -> str:
+    """从 browser 工具的 HTML 内容中提取摘要。"""
+    title_match = _TITLE_RE.search(content)
+    title = title_match.group(1).strip() if title_match else ""
+    plain_text = re.sub(r"\s+", " ", _TAG_RE.sub(" ", content)).strip()
+    text_preview = plain_text[:200]
+
+    parts = [f"[已执行] {function_name}:"]
+    if title:
+        parts.append(f"页面标题: {title},")
+    parts.append(f"内容摘要: {text_preview}")
+    return " ".join(parts)
 
 
 class Memory(BaseModel):
@@ -36,16 +55,21 @@ class Memory(BaseModel):
         """回滚记忆，删除最后一条消息"""
         self.messages = self.messages[:-1]
 
-    def compact(self) -> None:
+    def compact(self, keep_summary: bool = False) -> None:
         """记忆压缩，将记忆中已经执行的工具(搜索/网页源码获取/浏览器访问结果等)这类已经执行过的消息进行压缩检索"""
         # 1.循环遍历所有的消息列表
         for message in self.messages:
             # 2.判断消息的角色是否为tool
             if self.get_message_role(message) == "tool":
-                if message.get("function_name") in ["browser_view", "browser_navigate"]:
-                    message["content"] = "(removed)"
+                if message.get("function_name") in _BROWSER_COMPACT_TOOLS:
+                    if keep_summary:
+                        message["content"] = _extract_browser_summary(
+                            message["function_name"], message.get("content", "")
+                        )
+                    else:
+                        message["content"] = "(removed)"
                     logger.debug(
-                        f"从记忆中移除对应工具的结果: {message['function_name']}"
+                        f"从记忆中压缩对应工具的结果: {message['function_name']}"
                     )
             # 3.压缩记忆时reasoning_content内容可以去除压缩上下文
             if "reasoning_content" in message:

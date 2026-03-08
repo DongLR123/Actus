@@ -318,3 +318,37 @@ class DBSessionRepository(SessionRepository):
 
         # 3.如果记忆不存在，则构建一个空记忆后返回
         return Memory(messages=[])
+
+    async def get_summary(self, session_id: str) -> list:
+        """获取会话的对话摘要列表"""
+        from app.domain.models.conversation_summary import ConversationSummary
+
+        stmt = select(SessionModel.memories["_summary"]).where(
+            SessionModel.id == session_id
+        )
+        result = await self.db_session.execute(stmt)
+        summary_data = result.scalar_one_or_none()
+
+        if not summary_data:
+            return []
+
+        rounds = summary_data.get("rounds", [])
+        return [ConversationSummary.model_validate(round) for round in rounds]
+
+    async def save_summary(self, session_id: str, summaries: list) -> None:
+        """保存会话的对话摘要列表"""
+        rounds_data = [summary.model_dump(mode="json") for summary in summaries]
+        patch_data = {"_summary": {"rounds": rounds_data}}
+
+        stmt = (
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .values(
+                memories=func.coalesce(SessionModel.memories, cast({}, JSONB))
+                + cast(patch_data, JSONB),
+            )
+        )
+        result = await self.db_session.execute(stmt)
+
+        if result.rowcount == 0:
+            raise ValueError(f"会话[{session_id}]不存在，请核实后重试")

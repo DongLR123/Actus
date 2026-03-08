@@ -620,6 +620,33 @@ async def test_runner_passes_overflow_config_to_flow(monkeypatch) -> None:
     assert runner._flow.kwargs["overflow_config"] is overflow_config
 
 
+async def test_runner_passes_summary_llm_to_flow(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.domain.services.agent_task_runner.PlannerReActFlow",
+        _CapturingFlow,
+    )
+
+    summary_llm = object()
+
+    runner = AgentTaskRunner(
+        uow_factory=_uow_factory,
+        llm=object(),
+        agent_config=AgentConfig(max_iterations=100, max_retries=3, max_search_results=10),
+        mcp_config=MCPConfig(mcpServers={}),
+        a2a_config=A2AConfig(a2a_servers=[]),
+        session_id="session-summary-llm",
+        user_id="user-summary-llm",
+        file_storage=object(),
+        json_parser=object(),
+        browser=object(),
+        search_engine=object(),
+        sandbox=_FakeSandbox(),
+        summary_llm=summary_llm,
+    )
+
+    assert runner._flow.kwargs["summary_llm"] is summary_llm
+
+
 async def test_initial_skills_do_not_seed_anchor(monkeypatch) -> None:
     monkeypatch.setattr(
         "app.domain.services.agent_task_runner.PlannerReActFlow",

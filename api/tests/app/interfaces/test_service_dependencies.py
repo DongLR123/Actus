@@ -3,6 +3,7 @@ from app.domain.models.app_config import (
     AgentConfig,
     AppConfig,
     LLMConfig,
+    MemoryConfig,
     MCPConfig,
     SkillRiskPolicy,
 )
@@ -83,3 +84,37 @@ def test_get_agent_service_builds_context_overflow_config_from_llm(monkeypatch) 
     assert overflow_config.token_estimator == "provider_api"
     assert overflow_config.token_safety_factor == 1.2
     assert overflow_config.unknown_model_context_window == 65536
+
+
+def test_get_agent_service_builds_dedicated_summary_llm(monkeypatch) -> None:
+    app_config = AppConfig(
+        llm_config=LLMConfig(
+            base_url="https://api.openai.com/v1",
+            api_key="key",
+            model_name="gpt-4o",
+        ),
+        agent_config=AgentConfig(
+            max_iterations=100,
+            max_retries=3,
+            max_search_results=10,
+            memory=MemoryConfig(summary_model="gpt-4o-mini"),
+        ),
+        mcp_config=MCPConfig(),
+        a2a_config=A2AConfig(),
+        skill_risk_policy=SkillRiskPolicy(),
+    )
+
+    monkeypatch.setattr(
+        service_dependencies,
+        "FileAppConfigRepository",
+        lambda *args, **kwargs: _FakeAppConfigRepository(app_config),
+    )
+    monkeypatch.setattr(service_dependencies, "OpenAILLM", _FakeLLM)
+    monkeypatch.setattr(service_dependencies, "MinioFileStorage", _FakeFileStorage)
+    monkeypatch.setattr(service_dependencies, "AgentService", _CapturedAgentService)
+
+    service = service_dependencies.get_agent_service(minio_store=object())
+    summary_llm = service.kwargs["summary_llm"]
+
+    assert isinstance(summary_llm, _FakeLLM)
+    assert summary_llm.llm_config.model_name == "gpt-4o-mini"

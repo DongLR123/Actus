@@ -1,8 +1,30 @@
-from fastapi.testclient import TestClient
+import httpx
+import pytest
 
+from app.application.services.status_service import StatusService
+from app.domain.models.health_status import HealthStatus
 from app.domain.models.user import User, UserRole, UserStatus
 from app.interfaces.dependencies.auth import get_current_user
+from app.interfaces.service_dependencies import get_status_service
 from app.main import app
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
+
+
+class _FakeStatusService(StatusService):
+    def __init__(self) -> None:
+        super().__init__(checkers=[])
+
+    async def check_all(self) -> list[HealthStatus]:
+        return [
+            HealthStatus(service="postgres", status="ok"),
+            HealthStatus(service="redis", status="ok"),
+        ]
 
 
 def _fake_user() -> User:
@@ -14,17 +36,24 @@ def _fake_user() -> User:
     )
 
 
-def test_get_status(client: TestClient) -> None:
-    """测试获取应用状态API接口"""
+async def test_get_status() -> None:
     app.dependency_overrides[get_current_user] = _fake_user
+    app.dependency_overrides[get_status_service] = lambda: _FakeStatusService()
     try:
-        response = client.get("/api/status")
-        data = response.json()
-
-        # 接口可达，返回 200 HTTP 状态码
-        assert response.status_code == 200
-        # 业务码为 200（全部健康）或 503（CI 无基础设施时部分异常），均为合法结果
-        assert data["code"] in (200, 503)
-        assert "data" in data
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://test",
+        ) as client:
+            response = await client.get("/api/status/")
     finally:
         app.dependency_overrides.pop(get_current_user, None)
+        app.dependency_overrides.pop(get_status_service, None)
+
+    data = response.json()
+    assert response.status_code == 200
+    assert data["code"] == 200
+    assert data["data"] == [
+        {"service": "postgres", "status": "ok", "details": ""},
+        {"service": "redis", "status": "ok", "details": ""},
+    ]

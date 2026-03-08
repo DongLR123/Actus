@@ -1,9 +1,26 @@
+import pytest
+
 from app.domain.models.app_config import AgentConfig
+from app.domain.models.conversation_summary import ConversationSummary
 from app.domain.models.context_overflow_config import ContextOverflowConfig
+from app.domain.models.message import Message
+from app.domain.models.plan import ExecutionStatus, Plan, Step
+from app.domain.models.session import Session, SessionStatus
+from app.domain.models.event import DoneEvent, PlanEvent, PlanEventStatus
 from app.domain.services.flows.planner_react import PlannerReActFlow
+
+pytestmark = pytest.mark.anyio
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
 
 
 class _DummyUoW:
+    def __init__(self, session=None) -> None:
+        self.session = session
+
     async def __aenter__(self) -> "_DummyUoW":
         return self
 
@@ -55,3 +72,243 @@ def test_planner_react_flow_passes_overflow_config_to_agents(monkeypatch) -> Non
 
     assert flow.planner.kwargs["overflow_config"] is overflow_config
     assert flow.react.kwargs["overflow_config"] is overflow_config
+
+
+class _FlowSessionRepo:
+    def __init__(self, session: Session) -> None:
+        self._session = session
+        self.updated_statuses: list[SessionStatus] = []
+        self.summaries: list[ConversationSummary] = []
+
+    async def get_by_id(self, _session_id: str) -> Session:
+        return self._session
+
+    async def update_status(self, _session_id: str, status: SessionStatus) -> None:
+        self.updated_statuses.append(status)
+        self._session.status = status
+
+    async def get_summary(self, _session_id: str) -> list[ConversationSummary]:
+        return list(self.summaries)
+
+    async def save_summary(
+        self, _session_id: str, summaries: list[ConversationSummary]
+    ) -> None:
+        self.summaries = list(summaries)
+
+
+class _FlowAgent:
+    def __init__(self, name: str = "agent", **kwargs) -> None:
+        self.name = name
+        self.kwargs = kwargs
+        self.inject_calls: list[dict] = []
+        self.update_plan_calls: list[dict] = []
+        self.compact_calls: list[bool] = []
+        self.summary_sets: list[list[ConversationSummary]] = []
+
+    def set_runtime_system_context(self, _context: str) -> None:
+        return None
+
+    def set_conversation_summaries(
+        self, summaries: list[ConversationSummary]
+    ) -> None:
+        self.summary_sets.append(list(summaries))
+
+    async def roll_back(self, _message: Message) -> None:
+        return None
+
+    def inject_context_anchor(
+        self,
+        session_status: str,
+        user_message: str,
+        original_request: str = "",
+        completed_steps: list[str] | None = None,
+    ) -> None:
+        self.inject_calls.append(
+            {
+                "session_status": session_status,
+                "user_message": user_message,
+                "original_request": original_request,
+                "completed_steps": completed_steps or [],
+            }
+        )
+
+    def get_latest_assistant_content(self, max_chars: int = 500) -> str:
+        return "来自react的执行摘要"[:max_chars]
+
+    async def execute_step(self, plan: Plan, step: Step, _message: Message):
+        step.status = ExecutionStatus.COMPLETED
+        step.success = True
+        step.result = "步骤执行完成"
+        if False:
+            yield None
+
+    async def compact_memory(self, keep_summary: bool = False) -> None:
+        self.compact_calls.append(keep_summary)
+
+    async def summarize(self):
+        if False:
+            yield None
+
+    async def create_plan(self, _message: Message):
+        if False:
+            yield None
+
+    async def update_plan(
+        self, plan: Plan, step: Step, execution_summary: str = ""
+    ):
+        self.update_plan_calls.append(
+            {
+                "plan": plan,
+                "step": step,
+                "execution_summary": execution_summary,
+            }
+        )
+        yield PlanEvent(plan=plan, status=PlanEventStatus.UPDATED)
+
+
+async def test_planner_react_flow_injects_anchor_and_passes_execution_summary(
+    monkeypatch,
+) -> None:
+    completed_step = Step(
+        description="已完成步骤",
+        status=ExecutionStatus.COMPLETED,
+        success=True,
+        result="ok",
+    )
+    pending_step = Step(description="待执行步骤")
+    plan = Plan(goal="完成数据分析", steps=[completed_step, pending_step])
+    session = Session(
+        id="session-anchor",
+        status=SessionStatus.RUNNING,
+        events=[PlanEvent(plan=plan, status=PlanEventStatus.CREATED)],
+    )
+    session_repo = _FlowSessionRepo(session)
+
+    planner_agent = _FlowAgent(name="planner")
+    react_agent = _FlowAgent(name="react")
+
+    monkeypatch.setattr(
+        "app.domain.services.flows.planner_react.PlannerAgent",
+        lambda **kwargs: planner_agent,
+    )
+    monkeypatch.setattr(
+        "app.domain.services.flows.planner_react.ReActAgent",
+        lambda **kwargs: react_agent,
+    )
+
+    flow = PlannerReActFlow(
+        uow_factory=lambda: _DummyUoW(session_repo),
+        llm=object(),
+        agent_config=AgentConfig(
+            max_iterations=100,
+            max_retries=3,
+            max_search_results=10,
+        ),
+        session_id="session-anchor",
+        json_parser=object(),
+        browser=object(),
+        sandbox=object(),
+        search_engine=object(),
+        mcp_tool=object(),
+        a2a_tool=object(),
+        skill_tool=object(),
+    )
+
+    events = [event async for event in flow.invoke(Message(message="继续执行"))]
+
+    assert planner_agent.inject_calls[0]["session_status"] == "running"
+    assert planner_agent.inject_calls[0]["user_message"] == "继续执行"
+    assert planner_agent.inject_calls[0]["original_request"] == "完成数据分析"
+    assert planner_agent.inject_calls[0]["completed_steps"] == ["已完成步骤"]
+    assert react_agent.inject_calls[0]["session_status"] == "running"
+    assert planner_agent.update_plan_calls[0]["execution_summary"] == "来自react的执行摘要"
+    assert react_agent.compact_calls == [True]
+    assert session_repo.updated_statuses[0] == SessionStatus.RUNNING
+    assert isinstance(events[-1], DoneEvent)
+
+
+class _SummaryJsonParser:
+    async def invoke(self, payload):
+        import json
+
+        if isinstance(payload, str):
+            return json.loads(payload)
+        return payload
+
+
+class _SummaryLLM:
+    async def invoke(self, **kwargs):
+        return {
+            "role": "assistant",
+            "content": (
+                '{"user_intent":"继续分析数据","plan_summary":"完成剩余步骤",'
+                '"execution_results":["步骤执行完成"],'
+                '"decisions":["保留现有方案"],"unresolved":[]}'
+            ),
+        }
+
+
+async def test_planner_react_flow_loads_and_generates_summaries(monkeypatch) -> None:
+    completed_step = Step(
+        description="已完成步骤",
+        status=ExecutionStatus.COMPLETED,
+        success=True,
+        result="ok",
+    )
+    pending_step = Step(description="待执行步骤")
+    plan = Plan(goal="完成数据分析", steps=[completed_step, pending_step])
+    session = Session(
+        id="session-summary",
+        status=SessionStatus.RUNNING,
+        events=[PlanEvent(plan=plan, status=PlanEventStatus.CREATED)],
+    )
+    session_repo = _FlowSessionRepo(session)
+    session_repo.summaries = [
+        ConversationSummary(
+            round_number=1,
+            user_intent="分析数据",
+            plan_summary="读取 CSV",
+            execution_results=["成功读取文件"],
+            decisions=["按月聚合"],
+            unresolved=[],
+        )
+    ]
+
+    planner_agent = _FlowAgent(name="planner")
+    react_agent = _FlowAgent(name="react")
+
+    monkeypatch.setattr(
+        "app.domain.services.flows.planner_react.PlannerAgent",
+        lambda **kwargs: planner_agent,
+    )
+    monkeypatch.setattr(
+        "app.domain.services.flows.planner_react.ReActAgent",
+        lambda **kwargs: react_agent,
+    )
+
+    flow = PlannerReActFlow(
+        uow_factory=lambda: _DummyUoW(session_repo),
+        llm=object(),
+        summary_llm=_SummaryLLM(),
+        agent_config=AgentConfig(
+            max_iterations=100,
+            max_retries=3,
+            max_search_results=10,
+        ),
+        session_id="session-summary",
+        json_parser=_SummaryJsonParser(),
+        browser=object(),
+        sandbox=object(),
+        search_engine=object(),
+        mcp_tool=object(),
+        a2a_tool=object(),
+        skill_tool=object(),
+    )
+
+    _ = [event async for event in flow.invoke(Message(message="继续执行"))]
+
+    assert planner_agent.summary_sets[0][0].round_number == 1
+    assert react_agent.summary_sets[0][0].round_number == 1
+    assert len(session_repo.summaries) == 2
+    assert session_repo.summaries[-1].round_number == 2
+    assert session_repo.summaries[-1].user_intent == "继续分析数据"

@@ -139,6 +139,12 @@ def get_agent_service(
 
     # 2.构建依赖实例
     llm = OpenAILLM(app_config.llm_config)
+    summary_llm = None
+    if app_config.agent_config.memory.summary_model:
+        summary_llm_config = app_config.llm_config.model_copy(
+            update={"model_name": app_config.agent_config.memory.summary_model}
+        )
+        summary_llm = OpenAILLM(summary_llm_config)
     file_storage = MinioFileStorage(
         bucket=settings.minio_bucket_name,
         minio_store=minio_store,
@@ -166,5 +172,6 @@ def get_agent_service(
         file_storage=file_storage,
         redis_client=redis_client,
         skill_creator_service=skill_creator_service,
+        summary_llm=summary_llm,
         # file_repository=file_repository,
     )

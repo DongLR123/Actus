@@ -1,5 +1,11 @@
 import pytest
-from app.domain.models.app_config import AgentConfig, LLMConfig
+from app.domain.models.app_config import (
+    A2AConfig,
+    AgentConfig,
+    AppConfig,
+    LLMConfig,
+    MCPConfig,
+)
 
 
 def test_llm_config_has_context_overflow_default_values() -> None:
@@ -78,3 +84,47 @@ def test_agent_config_rejects_invalid_continuation_pattern() -> None:
     error_message = str(exc_info.value)
     assert "continuation_patterns[0]" in error_message
     assert "^(继续$" in error_message
+
+
+def test_agent_config_has_default_memory_config() -> None:
+    config = AgentConfig()
+
+    assert config.memory.summary_enabled is True
+    assert config.memory.summary_model is None
+    assert config.memory.summary_max_rounds == 5
+    assert config.memory.summary_token_budget == 2000
+    assert config.memory.summary_min_steps == 2
+    assert config.memory.context_anchor_enabled is True
+    assert config.memory.compact_keep_summary is True
+
+
+def test_agent_config_accepts_custom_memory_config() -> None:
+    from app.domain.models.app_config import MemoryConfig
+
+    config = AgentConfig(
+        memory=MemoryConfig(
+            summary_enabled=False,
+            summary_model="gpt-4o-mini",
+            summary_max_rounds=3,
+            summary_token_budget=1000,
+            summary_min_steps=1,
+            context_anchor_enabled=False,
+            compact_keep_summary=False,
+        )
+    )
+
+    assert config.memory.summary_enabled is False
+    assert config.memory.summary_model == "gpt-4o-mini"
+    assert config.memory.summary_max_rounds == 3
+
+
+def test_app_config_accepts_legacy_bool_skill_risk_mode() -> None:
+    config = AppConfig(
+        llm_config=LLMConfig(),
+        agent_config=AgentConfig(),
+        mcp_config=MCPConfig(),
+        a2a_config=A2AConfig(),
+        skill_risk_policy={"mode": False},
+    )
+
+    assert config.skill_risk_policy.mode.value == "off"

@@ -128,13 +128,14 @@ class PlannerAgent(BaseAgent):
                 yield event
 
     async def update_plan(
-        self, plan: Plan, step: Step
+        self, plan: Plan, step: Step, execution_summary: str = ""
     ) -> AsyncGenerator[BaseEvent, None]:
-        """根据传递的原始规划+子步骤更新事件"""
+        """根据传递的原始规划+子步骤+执行摘要更新事件"""
         # 1.使用plan+step创建更新Plan提示词
         query = UPDATE_PLAN_PROMPT.format(
             plan=plan.model_dump_json(),
             step=step.model_dump_json(),
+            execution_summary=execution_summary or "无额外执行详情",
         )
 
         # 2.调用invoke获取对应的事件

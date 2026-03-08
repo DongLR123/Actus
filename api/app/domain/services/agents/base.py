@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 class BaseAgent(ABC):
     """基础Agent智能体"""
 
+    _ANCHOR_PREFIX = "[上下文回顾]"
     name: str = ""  # 智能体名字
     _system_prompt: str = ""  # 系统预设prompt
     _format: Optional[str] = None  # Agent的响应格式
@@ -58,16 +59,27 @@ class BaseAgent(ABC):
         self._tools = tools
         self._overflow_config = overflow_config or ContextOverflowConfig()
         self._runtime_system_context: str = ""
+        self._conversation_summaries: list = []
 
     def set_runtime_system_context(self, context: str) -> None:
         """设置运行时系统上下文（如动态激活的 Skill 指南）"""
         self._runtime_system_context = (context or "").strip()
 
+    def set_conversation_summaries(self, summaries: list) -> None:
+        """设置历史对话摘要，将在 system prompt 中注入。"""
+        self._conversation_summaries = summaries or []
+
     def _build_effective_system_prompt(self) -> str:
-        """构建当前生效的系统提示词（静态 + 运行时上下文）"""
-        if not self._runtime_system_context:
-            return self._system_prompt
-        return f"{self._system_prompt}\n\n{self._runtime_system_context}"
+        """构建当前生效的系统提示词（静态 + 运行时上下文 + 历史摘要）"""
+        parts = [self._system_prompt]
+        if self._runtime_system_context:
+            parts.append(self._runtime_system_context)
+        if self._conversation_summaries:
+            summary_lines = ["## 历史对话摘要"]
+            for summary in self._conversation_summaries:
+                summary_lines.append(summary.to_prompt_text())
+            parts.append("\n".join(summary_lines))
+        return "\n\n".join(parts)
 
     def _ensure_system_message(self) -> None:
         """确保记忆中的首条 system 消息与当前系统提示词一致"""
@@ -95,6 +107,49 @@ class BaseAgent(ABC):
 
         if first_message.get("content") != expected_system_prompt:
             first_message["content"] = expected_system_prompt
+
+    def get_latest_assistant_content(self, max_chars: int = 500) -> str:
+        """从 memory 中提取最近一条 assistant 消息的 content。"""
+        if self._memory is None:
+            return ""
+
+        for message in reversed(self._memory.messages):
+            if message.get("role") == "assistant" and message.get("content"):
+                content = message["content"]
+                return content[:max_chars] if len(content) > max_chars else content
+        return ""
+
+    def inject_context_anchor(
+        self,
+        session_status: str,
+        user_message: str,
+        original_request: str = "",
+        completed_steps: list[str] | None = None,
+    ) -> None:
+        """注入上下文锚点消息，帮助 LLM 维持多轮对话连贯性。"""
+        if self._memory is None:
+            return
+
+        for message in self._memory.messages:
+            if (
+                message.get("role") == "user"
+                and message.get("content", "").startswith(self._ANCHOR_PREFIX)
+            ):
+                return
+
+        if session_status == "waiting":
+            content = f"{self._ANCHOR_PREFIX}\n用户回复了你的提问: {user_message}"
+        else:
+            lines = [self._ANCHOR_PREFIX]
+            if original_request:
+                lines.append(f"- 用户原始需求：{original_request}")
+            if completed_steps:
+                lines.append(f"- 已完成步骤：{'；'.join(completed_steps)}")
+            lines.append(f"- 当前状态：{session_status}")
+            lines.append(f"- 用户新消息：{user_message}")
+            content = "\n".join(lines)
+
+        self._memory.add_message({"role": "user", "content": content})
 
     async def _ensure_memory(self) -> None:
         """确保智能体记忆是存在的"""
@@ -267,10 +322,10 @@ class BaseAgent(ABC):
                 self._session_id, self.name, self._memory
             )
 
-    async def compact_memory(self) -> None:
+    async def compact_memory(self, keep_summary: bool = False) -> None:
         """压缩Agent的记忆"""
         await self._ensure_memory()
-        self._memory.compact()
+        self._memory.compact(keep_summary=keep_summary)
         async with self._uow:
             await self._uow.session.save_memory(
                 self._session_id, self.name, self._memory

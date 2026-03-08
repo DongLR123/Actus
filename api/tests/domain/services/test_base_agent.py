@@ -3,6 +3,7 @@ from typing import Any
 import pytest
 
 from app.domain.models.app_config import AgentConfig
+from app.domain.models.conversation_summary import ConversationSummary
 from app.domain.models.event import ErrorEvent, MessageEvent, ToolEvent
 from app.domain.models.memory import Memory
 from app.domain.models.tool_result import ToolResult
@@ -172,6 +173,29 @@ async def test_runtime_system_context_updates_between_turns() -> None:
     memory = agent._uow.session._memory
     assert memory.messages[0]["role"] == "system"
     assert "Active skill: second" in memory.messages[0]["content"]
+
+
+async def test_conversation_summaries_are_injected_into_system_prompt() -> None:
+    agent = _build_agent(_SequenceLLM())
+    agent.set_conversation_summaries(
+        [
+            ConversationSummary(
+                round_number=1,
+                user_intent="分析数据",
+                plan_summary="读取 CSV",
+                execution_results=["成功读取文件"],
+                decisions=["按月聚合"],
+                unresolved=[],
+            )
+        ]
+    )
+
+    _ = [event async for event in agent.invoke("hello")]
+
+    memory = agent._uow.session._memory
+    assert "## 历史对话摘要" in memory.messages[0]["content"]
+    assert "第1轮" in memory.messages[0]["content"]
+    assert "分析数据" in memory.messages[0]["content"]
 
 
 async def test_invoke_unknown_tool_recovers_without_error_event() -> None:

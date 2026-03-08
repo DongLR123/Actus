@@ -109,6 +109,18 @@ class SkillSelectionPolicy(BaseModel):
         return self
 
 
+class MemoryConfig(BaseModel):
+    """对话记忆配置"""
+
+    summary_enabled: bool = True
+    summary_model: Optional[str] = None
+    summary_max_rounds: int = Field(5, ge=1, le=20)
+    summary_token_budget: int = Field(2000, ge=200, le=10000)
+    summary_min_steps: int = Field(2, ge=1, le=10)
+    context_anchor_enabled: bool = True
+    compact_keep_summary: bool = True
+
+
 class AgentConfig(BaseModel):
     """Agent通用配置"""
 
@@ -116,6 +128,7 @@ class AgentConfig(BaseModel):
     max_retries: int = Field(default=3, gt=1, lt=10)  # 最大重试次数
     max_search_results: int = Field(default=10, gt=1, lt=30)  # 最大搜索结果条数
     skill_selection: SkillSelectionPolicy = Field(default_factory=SkillSelectionPolicy)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
 
 class MCPTransport(str, Enum):
@@ -196,6 +209,20 @@ class SkillRiskPolicy(BaseModel):
     """Skill 风险控制配置"""
 
     mode: SkillRiskMode = SkillRiskMode.OFF
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_bool_mode(cls, data: Any) -> Any:
+        """兼容旧版 YAML 中将 off 解析为 False 的情况。"""
+        if isinstance(data, dict) and isinstance(data.get("mode"), bool):
+            normalized = dict(data)
+            normalized["mode"] = (
+                SkillRiskMode.ENFORCE_CONFIRMATION
+                if data["mode"]
+                else SkillRiskMode.OFF
+            )
+            return normalized
+        return data
 
 
 class AppConfig(BaseModel):

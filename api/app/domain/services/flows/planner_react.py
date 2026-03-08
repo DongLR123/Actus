@@ -42,6 +42,10 @@ logger = logging.getLogger(__name__)
 class PlannerReActFlow(BaseFlow):
     """规划与执行流"""
 
+    def _extract_react_execution_summary(self, max_chars: int = 500) -> str:
+        """从 ReAct Agent 提取最近一轮执行摘要。"""
+        return self.react.get_latest_assistant_content(max_chars=max_chars)
+
     def __init__(
         self,
         uow_factory: Callable[[], IUnitOfWork],  # 单元工作工厂
@@ -58,6 +62,7 @@ class PlannerReActFlow(BaseFlow):
         create_skill_tool: BaseTool | None = None,  # skill创建工具
         brainstorm_skill_tool: BaseTool | None = None,  # skill头脑风暴工具
         overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
+        summary_llm: LLM | None = None,  # 摘要生成模型
     ) -> None:
         """构造函数，完成规划与执行流的初始化"""
         # 1.流初始化数据配置
@@ -68,6 +73,8 @@ class PlannerReActFlow(BaseFlow):
         self.status = FlowStatus.IDLE
         self.plan: Optional[Plan] = None
         overflow_config = overflow_config or ContextOverflowConfig()
+        self._json_parser = json_parser
+        self._summary_llm = summary_llm or llm
 
         # 2.初始化Agent预设工具列表
         tools = [
@@ -109,7 +116,72 @@ class PlannerReActFlow(BaseFlow):
             tools=tools,
             overflow_config=overflow_config,
         )
+        self._memory_config = agent_config.memory
         logger.debug(f"创建执行Agent成功, 会话id: {self._session_id}")
+
+    async def _generate_summary(self, plan: Plan, round_number: int) -> None:
+        """在对话轮结束时生成并持久化对话摘要。"""
+        if not self._memory_config.summary_enabled:
+            return
+        if len(plan.steps) < self._memory_config.summary_min_steps:
+            return
+
+        try:
+            from app.domain.models.conversation_summary import ConversationSummary
+            from app.domain.services.prompts.summary import GENERATE_SUMMARY_PROMPT
+
+            steps_lines = []
+            for step in plan.steps:
+                status = "成功" if step.success else ("失败" if step.done else "未执行")
+                result_text = (step.result or "无结果记录")[:200]
+                steps_lines.append(
+                    f"- {step.description} [{status}]: {result_text}"
+                )
+
+            prompt = GENERATE_SUMMARY_PROMPT.format(
+                round_number=round_number,
+                plan_goal=plan.goal,
+                steps_summary="\n".join(steps_lines),
+            )
+
+            response = await self._summary_llm.invoke(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "你是一个对话摘要助手，请生成结构化摘要。",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+
+            content = response.get("content", "")
+            parsed = await self._json_parser.invoke(content)
+            if not isinstance(parsed, dict):
+                logger.warning("摘要生成结果非字典，跳过")
+                return
+
+            summary = ConversationSummary(
+                round_number=round_number,
+                user_intent=parsed.get("user_intent", plan.goal),
+                plan_summary=parsed.get("plan_summary", ""),
+                execution_results=parsed.get("execution_results", []),
+                decisions=parsed.get("decisions", []),
+                unresolved=parsed.get("unresolved", []),
+            )
+
+            uow = self._uow_factory()
+            async with uow:
+                existing = await uow.session.get_summary(self._session_id)
+                existing.append(summary)
+                max_rounds = self._memory_config.summary_max_rounds
+                if len(existing) > max_rounds:
+                    existing = existing[-max_rounds:]
+                await uow.session.save_summary(self._session_id, existing)
+
+            logger.info(f"成功生成第{round_number}轮对话摘要")
+        except Exception as exc:
+            logger.warning(f"摘要生成失败，跳过: {exc}")
 
     def set_skill_context(self, skill_context: str) -> None:
         """设置当前轮次激活 Skill 的系统上下文提示。"""
@@ -122,8 +194,17 @@ class PlannerReActFlow(BaseFlow):
         # session = await self._session_repository.get_by_id(self._session_id)
         async with self._uow:
             session = await self._uow.session.get_by_id(self._session_id)
+            summaries = []
+            if self._memory_config.summary_enabled:
+                summaries = await self._uow.session.get_summary(self._session_id)
         if not session:
             raise ValueError(f"会话[{self._session_id}]不存在, 请核实后尝试")
+
+        if self._memory_config.summary_enabled:
+            self.planner.set_conversation_summaries(summaries)
+            self.react.set_conversation_summaries(summaries)
+
+        current_plan = session.get_latest_plan()
 
         # 2.判断会话的状态是不是空闲
         #   如果不是则有可能有两种状态
@@ -136,6 +217,29 @@ class PlannerReActFlow(BaseFlow):
             )
             await self.planner.roll_back(message)
             await self.react.roll_back(message)
+
+            if self._memory_config.context_anchor_enabled:
+                completed_steps: list[str] = []
+                original_request = ""
+                if current_plan:
+                    completed_steps = [
+                        step.description for step in current_plan.steps if step.done
+                    ]
+                    original_request = current_plan.goal
+
+                status_str = session.status.value
+                self.planner.inject_context_anchor(
+                    session_status=status_str,
+                    user_message=message.message,
+                    original_request=original_request,
+                    completed_steps=completed_steps,
+                )
+                self.react.inject_context_anchor(
+                    session_status=status_str,
+                    user_message=message.message,
+                    original_request=original_request,
+                    completed_steps=completed_steps,
+                )
 
         # 3.如果会话状态等于运行中，则流需要重新规划内容/plan
         if session.status == SessionStatus.RUNNING:
@@ -154,7 +258,7 @@ class PlannerReActFlow(BaseFlow):
             )
 
         # 6.获取当前会话中最新事件
-        self.plan = session.get_latest_plan()
+        self.plan = current_plan
         logger.info(f"Planner&ReAct流接收消息: {message.message[:50]}...")
 
         # 7.定义当前正在执行的子步骤
@@ -224,14 +328,19 @@ class PlannerReActFlow(BaseFlow):
 
                 # 21.压缩执行Agent记忆，避免上下文腐化+消耗大量token
                 logger.info(f"压缩{self.react.name} Agent记忆/上下文")
-                await self.react.compact_memory()
+                await self.react.compact_memory(
+                    keep_summary=self._memory_config.compact_keep_summary
+                )
 
                 # 22.将状态更新为updating
                 self.status = FlowStatus.UPDATING
             elif self.status == FlowStatus.UPDATING:
                 # 23.流状态为更新表示需要更新计划
                 logger.info(f"Planner&ReAct流开始更新计划")
-                async for event in self.planner.update_plan(self.plan, step):
+                execution_summary = self._extract_react_execution_summary()
+                async for event in self.planner.update_plan(
+                    self.plan, step, execution_summary=execution_summary
+                ):
                     yield event
 
                 # 24.计划更新完成，需要执行相应的子步骤
@@ -254,6 +363,15 @@ class PlannerReActFlow(BaseFlow):
                 # 27.计划状态已完成则更新plan状态，并发送计划事件通知API已完成
                 self.plan.status = ExecutionStatus.COMPLETED
                 self.status = FlowStatus.IDLE
+
+                uow = self._uow_factory()
+                async with uow:
+                    existing_summaries = await uow.session.get_summary(
+                        self._session_id
+                    )
+                round_number = len(existing_summaries) + 1
+                await self._generate_summary(self.plan, round_number)
+
                 yield PlanEvent(status=PlanEventStatus.COMPLETED, plan=self.plan)
                 break
         # 28.任务已经结束则返回结束事件
