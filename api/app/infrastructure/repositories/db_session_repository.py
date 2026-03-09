@@ -381,6 +381,10 @@ class DBSessionRepository(SessionRepository):
         if not state_data:
             return None
 
+        # Reject payloads that contain no recognized SkillCreationState fields
+        if not (state_data.keys() & SkillCreationState.model_fields.keys()):
+            return None
+
         try:
             return SkillCreationState.model_validate(state_data)
         except ValidationError as exc:
