@@ -33,10 +33,12 @@ class MainGraphState(TypedDict):
     flow_status: str  # idle | planning | executing | updating | summarizing | completed
     session_id: str
     should_interrupt: bool
+    is_resuming: bool
 
     # Context
     original_request: str
     skill_context: str
+    conversation_summaries: list[str]  # 历史对话摘要文本（to_prompt_text() 输出）
 
 
 class ReactGraphState(TypedDict):

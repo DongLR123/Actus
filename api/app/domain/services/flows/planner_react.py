@@ -266,6 +266,7 @@ class PlannerReActFlow(BaseFlow):
             ),
             "session_id": self._session_id,
             "should_interrupt": False,
+            "is_resuming": is_resuming,
             "original_request": self._saved_original_request if is_resuming else "",
             "skill_context": self._skill_context,
             "conversation_summaries": summary_texts,
