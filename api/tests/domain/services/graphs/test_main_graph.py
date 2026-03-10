@@ -151,3 +151,53 @@ class TestMainGraphFlow:
         # Verify the plan language fallback is "zh" not "en"
         plan = result.get("plan")
         assert plan is not None
+
+    async def test_planner_receives_conversation_summaries(self, mock_json_parser):
+        """Planner system prompt should include conversation summaries when available."""
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        captured_system_content = []
+
+        async def capturing_invoke(**kwargs):
+            messages = kwargs.get("messages", [])
+            for m in messages:
+                if m.get("role") == "system":
+                    captured_system_content.append(m["content"])
+            return {
+                "content": '{"title":"Test","goal":"test","language":"zh","steps":[{"description":"step1"}],"message":"ok"}',
+                "role": "assistant",
+            }
+
+        planner_llm = AsyncMock()
+        planner_llm.invoke = capturing_invoke
+
+        graph = build_main_graph(
+            planner_llm=planner_llm,
+            react_graph=_make_mock_react_graph(),
+            json_parser=mock_json_parser,
+            summary_llm=planner_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-summary",
+        )
+
+        await graph.ainvoke({
+            "message": "继续上次的工作",
+            "language": "zh",
+            "attachments": [],
+            "plan": None,
+            "current_step": None,
+            "messages": [],
+            "execution_summary": "",
+            "events": [],
+            "flow_status": "idle",
+            "session_id": "sess-summary",
+            "should_interrupt": False,
+            "is_resuming": False,
+            "original_request": "",
+            "skill_context": "",
+            "conversation_summaries": ["### 第1轮\n- 用户需求：查天气\n- 执行结果：成功获取北京天气"],
+        })
+
+        assert len(captured_system_content) >= 1
+        assert "历史对话摘要" in captured_system_content[0]
+        assert "查天气" in captured_system_content[0]

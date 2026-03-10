@@ -67,9 +67,16 @@ def build_main_graph(
             message=state["message"],
             attachments=", ".join(attachments) if attachments else "无",
         )
+
+        # Build system prompt with optional conversation summaries
+        system_content = PLANNER_SYSTEM_PROMPT
+        conversation_summaries = state.get("conversation_summaries") or []
+        if conversation_summaries:
+            system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(conversation_summaries)
+
         response = await planner_llm.invoke(
             messages=[
-                {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+                {"role": "system", "content": system_content},
                 {"role": "user", "content": prompt},
             ],
             response_format={"type": "json_object"},
