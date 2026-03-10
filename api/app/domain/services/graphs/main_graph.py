@@ -272,13 +272,40 @@ def build_main_graph(
         }
 
     async def summarizer_node(state: MainGraphState) -> dict:
-        """Generate final summary."""
+        """Generate final summary and emit completion events."""
+        from app.domain.services.prompts.react import SUMMARIZE_PROMPT
+
         plan = state["plan"]
         events = []
 
         if plan:
             plan.status = ExecutionStatus.COMPLETED
             events.append(PlanEvent(plan=plan, status=PlanEventStatus.COMPLETED))
+
+        # Call LLM to generate a user-facing summary
+        react_messages = state.get("messages", [])
+        if react_messages:
+            try:
+                response = await summary_llm.invoke(
+                    messages=react_messages + [
+                        {"role": "user", "content": SUMMARIZE_PROMPT},
+                    ],
+                )
+                summary_content = response.get("content", "")
+                if summary_content:
+                    try:
+                        parsed = json.loads(summary_content)
+                        if isinstance(parsed, dict) and parsed.get("message"):
+                            events.append(MessageEvent(
+                                role="assistant",
+                                message=parsed["message"],
+                            ))
+                        else:
+                            events.append(MessageEvent(role="assistant", message=summary_content))
+                    except (json.JSONDecodeError, TypeError):
+                        events.append(MessageEvent(role="assistant", message=summary_content))
+            except Exception as exc:
+                logger.warning(f"Summarizer LLM call failed: {exc}")
 
         events.append(DoneEvent())
 

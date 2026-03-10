@@ -257,6 +257,63 @@ class TestMainGraphFlow:
         assert len(completed_steps) >= 1
         assert completed_steps[0].success is False
 
+    async def test_summarizer_emits_message_event(self, mock_json_parser):
+        """Summarizer should call LLM and emit a MessageEvent with the summary."""
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        summary_llm = AsyncMock()
+        async def mock_summary_invoke(**kwargs):
+            return {
+                "content": '{"message": "任务已完成，这是你的总结报告。", "attachments": ["/home/ubuntu/report.md"]}',
+                "role": "assistant",
+            }
+        summary_llm.invoke = mock_summary_invoke
+
+        planner_llm = AsyncMock()
+        planner_llm.invoke = AsyncMock()
+
+        plan = Plan(
+            title="T", goal="G", language="zh",
+            steps=[Step(description="done step", status=ExecutionStatus.COMPLETED)],
+            message="ok", status=ExecutionStatus.RUNNING,
+        )
+
+        graph = build_main_graph(
+            planner_llm=planner_llm,
+            react_graph=_make_mock_react_graph(),
+            json_parser=mock_json_parser,
+            summary_llm=summary_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-sum",
+        )
+
+        result = await graph.ainvoke({
+            "message": "summarize",
+            "language": "zh",
+            "attachments": [],
+            "plan": plan,
+            "current_step": None,
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "do something"},
+                {"role": "assistant", "content": '{"success": true, "result": "done", "attachments": []}'},
+            ],
+            "execution_summary": "",
+            "events": [],
+            "flow_status": "summarizing",
+            "session_id": "sess-sum",
+            "should_interrupt": False,
+            "is_resuming": False,
+            "original_request": "G",
+            "skill_context": "",
+            "conversation_summaries": [],
+        })
+
+        events = result.get("events", [])
+        msg_events = [e for e in events if isinstance(e, MessageEvent)]
+        assert len(msg_events) >= 1
+        assert "总结报告" in msg_events[0].message or "任务已完成" in msg_events[0].message
+
 
 class TestExecutorMessageBranching:
     """Test the three-way branching in executor_node for message handling."""
