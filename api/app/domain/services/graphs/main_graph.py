@@ -82,7 +82,7 @@ def build_main_graph(
             parsed = {
                 "title": "Task",
                 "goal": state["message"],
-                "language": state.get("language", "en"),
+                "language": state.get("language", "zh"),
                 "steps": [{"description": state["message"]}],
                 "message": "I'll help you with that.",
             }
@@ -94,7 +94,7 @@ def build_main_graph(
         plan = Plan(
             title=parsed.get("title", "Task"),
             goal=parsed.get("goal", state["message"]),
-            language=parsed.get("language", state.get("language", "en")),
+            language=parsed.get("language", state.get("language", "zh")),
             steps=steps,
             message=parsed.get("message", ""),
             status=ExecutionStatus.RUNNING,
@@ -140,12 +140,17 @@ def build_main_graph(
 
         # Build initial messages with system prompt + execution prompt
         attachments = state.get("attachments", [])
-        language = state.get("language", "en")
+        language = state.get("language", "zh")
         skill_context = state.get("skill_context", "")
 
         system_content = REACT_SYSTEM_PROMPT
         if skill_context:
             system_content += f"\n\n{skill_context}"
+
+        # 注入历史对话摘要
+        conversation_summaries = state.get("conversation_summaries") or []
+        if conversation_summaries:
+            system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(conversation_summaries)
 
         # 如果有上次中断保存的消息历史，恢复上下文而非从零开始
         saved_messages = state.get("messages") or []

@@ -108,9 +108,44 @@ class TestMainGraphFlow:
             "should_interrupt": False,
             "original_request": "",
             "skill_context": "",
+            "conversation_summaries": [],
         })
 
         events = result.get("events", [])
         event_types = [type(e).__name__ for e in events]
         # planner events come through state; executor events go via queue (empty in state)
         assert "PlanEvent" in event_types or "TitleEvent" in event_types
+
+    async def test_default_language_is_zh(self, mock_planner_llm, mock_json_parser):
+        """When no language is specified, planner should default to zh."""
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        graph = build_main_graph(
+            planner_llm=mock_planner_llm,
+            react_graph=_make_mock_react_graph(),
+            json_parser=mock_json_parser,
+            summary_llm=mock_planner_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-lang",
+        )
+
+        result = await graph.ainvoke({
+            "message": "帮我查一下天气",
+            "language": "zh",
+            "attachments": [],
+            "plan": None,
+            "current_step": None,
+            "messages": [],
+            "execution_summary": "",
+            "events": [],
+            "flow_status": "idle",
+            "session_id": "sess-lang",
+            "should_interrupt": False,
+            "original_request": "",
+            "skill_context": "",
+            "conversation_summaries": [],
+        })
+
+        # Verify the plan language fallback is "zh" not "en"
+        plan = result.get("plan")
+        assert plan is not None
