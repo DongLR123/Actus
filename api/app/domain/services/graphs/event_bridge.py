@@ -44,6 +44,9 @@ class GraphEventBridge:
            their events picked up here from the ``astream`` output.
         """
         queue: asyncio.Queue[BaseEvent | None] = asyncio.Queue()
+        # 用 input_state 初始化 _final_state，确保节点未返回的字段保留输入值
+        # （例如 executor_node 跳过时不会丢失 messages）
+        self._final_state = dict(input_state)
 
         async def _drive_graph() -> None:
             """Run the graph and forward state-path events to the queue."""

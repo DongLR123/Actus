@@ -12,11 +12,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import RetryPolicy
 
+from app.application.errors.exceptions import ServerRequestsError
 from app.domain.external.json_parser import JSONParser
 from app.domain.external.llm import LLM
 from app.domain.models.event import (
@@ -31,7 +34,9 @@ from app.domain.models.event import (
 )
 from app.domain.models.plan import ExecutionStatus, Plan, Step
 from app.domain.repositories.uow import IUnitOfWork
+from app.domain.services.flows.base import FlowStatus
 
+from .message_utils import messages_to_dicts
 from .state import MainGraphState
 
 logger = logging.getLogger(__name__)
@@ -70,12 +75,22 @@ def build_main_graph(
             attachments=", ".join(attachments) if attachments else "无",
         )
 
-        # Build system prompt with optional conversation summaries
+        # Build system prompt with optional tool summary and conversation summaries
         system_content = PLANNER_SYSTEM_PROMPT
+
+        # Inject available tool summary so planner knows about dedicated tools
+        # (e.g. brainstorm_skill, generate_skill) and can plan accordingly
+        skill_context = state.get("skill_context") or ""
+        tool_summary_marker = "## Available Tool Summary"
+        if tool_summary_marker in skill_context:
+            tool_summary = skill_context[skill_context.index(tool_summary_marker):]
+            system_content += f"\n\n{tool_summary}"
+
         conversation_summaries = state.get("conversation_summaries") or []
         if conversation_summaries:
             system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(conversation_summaries)
 
+        # planner_llm is the raw Actus LLM (not LangChain adapter) — uses dict messages
         response = await planner_llm.invoke(
             messages=[
                 {"role": "system", "content": system_content},
@@ -83,6 +98,7 @@ def build_main_graph(
             ],
             response_format={"type": "json_object"},
         )
+
         content = response.get("content", "")
         parsed = await json_parser.invoke(content)
 
@@ -118,7 +134,7 @@ def build_main_graph(
         return {
             "plan": plan,
             "current_step": plan.get_next_step(),
-            "flow_status": "executing",
+            "flow_status": FlowStatus.EXECUTING.value,
             "original_request": plan.goal,
             "events": events,
         }
@@ -142,7 +158,11 @@ def build_main_graph(
 
         step = state["current_step"]
         if not step:
-            return {"flow_status": "summarizing", "events": []}
+            return {
+                "flow_status": FlowStatus.SUMMARIZING.value,
+                "events": [],
+                "messages": state.get("messages", []),
+            }
 
         # Emit StepEvent(STARTED) immediately
         await _emit(StepEvent(step=step, status=StepEventStatus.STARTED))
@@ -161,39 +181,39 @@ def build_main_graph(
         if conversation_summaries:
             system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(conversation_summaries)
 
-        # 三分支 messages 构建逻辑
+        # 三分支 messages 构建逻辑（使用 LangChain 消息类型）
         is_resuming = state.get("is_resuming", False)
-        saved_messages = state.get("messages") or []
+        saved_messages: list[BaseMessage] = state.get("messages") or []
 
         if is_resuming and saved_messages:
             # 中断恢复：保留消息 + 追加恢复提示
             initial_messages = saved_messages + [
-                {"role": "user", "content": f"用户已完成接管并交还控制。请继续执行当前步骤：{step.description}\n用户消息：{state['message']}"},
+                HumanMessage(content=f"用户已完成接管并交还控制。请继续执行当前步骤：{step.description}\n用户消息：{state['message']}"),
             ]
         elif saved_messages:
             # 非首步/有历史：更新 system prompt 为最新版本，追加新 execution prompt
-            # 注意：不能原地修改 saved_messages[0]，否则会破坏 LangGraph 状态不可变性
+            first = saved_messages[0]
+            updated_first = SystemMessage(content=system_content) if isinstance(first, SystemMessage) else first
             initial_messages = [
-                {**saved_messages[0], "content": system_content},
+                updated_first,
                 *saved_messages[1:],
-            ] + [
-                {"role": "user", "content": EXECUTION_PROMPT.format(
+                HumanMessage(content=EXECUTION_PROMPT.format(
                     message=state["message"],
                     attachments=", ".join(attachments) if attachments else "无",
                     language=language,
                     step=step.description,
-                )},
+                )),
             ]
         else:
             # 首步/无历史：干净的 system + execution prompt
             initial_messages = [
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": EXECUTION_PROMPT.format(
+                SystemMessage(content=system_content),
+                HumanMessage(content=EXECUTION_PROMPT.format(
                     message=state["message"],
                     attachments=", ".join(attachments) if attachments else "无",
                     language=language,
                     step=step.description,
-                )},
+                )),
             ]
 
         # Build react_graph input
@@ -226,22 +246,26 @@ def build_main_graph(
         if seen_interrupt:
             react_final["should_interrupt"] = True
 
-        # Extract execution summary and detect step success from LLM response JSON
-        react_messages = react_final.get("messages", [])
+        # Extract execution summary and detect step success from LLM response
+        react_messages: list = react_final.get("messages", [])
         step_success = True
         summary = ""
         for msg in reversed(react_messages):
-            if msg.get("role") == "assistant" and msg.get("content"):
-                summary = msg["content"][:500]
+            if isinstance(msg, AIMessage) and msg.content:
+                summary = msg.content[:500]
                 try:
-                    result_json = json.loads(msg["content"])
+                    result_json = json.loads(msg.content)
                     step_success = result_json.get("success", True)
                 except (json.JSONDecodeError, TypeError):
                     pass  # Non-JSON response treated as success
                 break
 
-        step.status = ExecutionStatus.COMPLETED
-        step.success = step_success
+        # 通过 model_copy 创建新对象避免直接变异 state 对象
+        # （LangGraph 要求节点返回 partial update dict，不可直接修改 state）
+        step = step.model_copy(update={
+            "status": ExecutionStatus.COMPLETED,
+            "success": step_success,
+        })
         await _emit(StepEvent(step=step, status=StepEventStatus.COMPLETED))
 
         # Check for interrupt (user takeover request)
@@ -250,14 +274,16 @@ def build_main_graph(
             await _emit(WaitEvent())
             return {
                 "messages": react_final.get("messages", state["messages"]),
+                "current_step": step,
                 "should_interrupt": True,
-                "events": [WaitEvent()],
+                "events": [],  # WaitEvent 已通过 _emit 发送，避免重复
             }
 
         return {
             "messages": react_final.get("messages", state["messages"]),
+            "current_step": step,
             "execution_summary": summary,
-            "flow_status": "updating",
+            "flow_status": FlowStatus.UPDATING.value,
             "events": [],  # already emitted via queue
         }
 
@@ -265,20 +291,33 @@ def build_main_graph(
         """Update the plan after step execution — mark step done, get next."""
         plan = state["plan"]
         if not plan:
-            return {"flow_status": "summarizing", "events": []}
+            return {"flow_status": FlowStatus.SUMMARIZING.value, "events": []}
+
+        # Sync completed step back into plan.steps.
+        # executor_node uses model_copy() to create a new Step with updated status,
+        # but plan.steps still holds the original pending Step. We must replace it.
+        completed_step = state.get("current_step")
+        if completed_step and completed_step.done:
+            updated_steps = [
+                completed_step if s.id == completed_step.id else s
+                for s in plan.steps
+            ]
+            plan = plan.model_copy(update={"steps": updated_steps})
 
         # Find next step
         next_step = plan.get_next_step()
         if not next_step:
             return {
+                "plan": plan,
                 "current_step": None,
-                "flow_status": "summarizing",
+                "flow_status": FlowStatus.SUMMARIZING.value,
                 "events": [],
             }
 
         return {
+            "plan": plan,
             "current_step": next_step,
-            "flow_status": "executing",
+            "flow_status": FlowStatus.EXECUTING.value,
             "events": [],
         }
 
@@ -290,15 +329,18 @@ def build_main_graph(
         events = []
 
         if plan:
-            plan.status = ExecutionStatus.COMPLETED
+            # 通过 model_copy 避免直接变异 state 对象
+            plan = plan.model_copy(update={"status": ExecutionStatus.COMPLETED})
             events.append(PlanEvent(plan=plan, status=PlanEventStatus.COMPLETED))
 
         # Call LLM to generate a user-facing summary
-        react_messages = state.get("messages", [])
+        # summary_llm is raw Actus LLM — needs dict messages
+        react_messages: list = state.get("messages", [])
         if react_messages:
             try:
+                dict_messages = messages_to_dicts(react_messages) if react_messages else []
                 response = await summary_llm.invoke(
-                    messages=react_messages + [
+                    messages=dict_messages + [
                         {"role": "user", "content": SUMMARIZE_PROMPT},
                     ],
                 )
@@ -320,25 +362,28 @@ def build_main_graph(
 
         events.append(DoneEvent())
 
-        return {
-            "flow_status": "completed",
+        result: dict = {
+            "flow_status": FlowStatus.COMPLETED.value,
             "events": events,
         }
+        if plan:
+            result["plan"] = plan
+        return result
 
     # ---- Routing ------------------------------------------------------- #
 
-    def route_entry(state: MainGraphState) -> str:
+    def route_entry(state: MainGraphState) -> Literal[
+        "planner_node", "executor_node", "updater_node", "summarizer_node",
+    ]:
         """Route from START based on flow_status."""
-        status = state.get("flow_status", "idle")
+        status = state.get("flow_status", FlowStatus.IDLE.value)
 
-        if status in ("idle", "planning"):
+        if status in (FlowStatus.IDLE.value, FlowStatus.PLANNING.value):
             return "planner_node"
-        if status == "executing":
+        if status == FlowStatus.EXECUTING.value:
             return "executor_node"
-        if status == "updating":
+        if status == FlowStatus.UPDATING.value:
             return "updater_node"
-        if status == "summarizing":
-            return "summarizer_node"
         return "summarizer_node"
 
     def route_after_executor(state: MainGraphState) -> str:
@@ -346,18 +391,18 @@ def build_main_graph(
         if state.get("should_interrupt"):
             return END
         status = state.get("flow_status", "")
-        if status == "updating":
+        if status == FlowStatus.UPDATING.value:
             return "updater_node"
-        if status == "summarizing":
+        if status == FlowStatus.SUMMARIZING.value:
             return "summarizer_node"
         return END
 
     def route_after_updater(state: MainGraphState) -> str:
         """Route after plan update."""
         status = state.get("flow_status", "")
-        if status == "executing":
+        if status == FlowStatus.EXECUTING.value:
             return "executor_node"
-        if status == "summarizing":
+        if status == FlowStatus.SUMMARIZING.value:
             return "summarizer_node"
         return END
 
@@ -365,7 +410,15 @@ def build_main_graph(
 
     g: StateGraph = StateGraph(MainGraphState)
 
-    g.add_node("planner_node", planner_node)
+    # RetryPolicy for transient planner LLM errors
+    planner_retry = RetryPolicy(
+        max_attempts=3,
+        initial_interval=2.0,
+        backoff_factor=2.0,
+        retry_on=ServerRequestsError,
+    )
+
+    g.add_node("planner_node", planner_node, retry_policy=planner_retry)
     g.add_node("executor_node", executor_node)
     g.add_node("updater_node", updater_node)
     g.add_node("summarizer_node", summarizer_node)

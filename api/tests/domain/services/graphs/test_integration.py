@@ -80,10 +80,12 @@ def mock_uow():
     uow.__aexit__ = AsyncMock(return_value=False)
     uow.session = AsyncMock()
     uow.session.get_skill_graph_state = AsyncMock(return_value=None)
+    uow.session.get_interrupt_state = AsyncMock(return_value=None)
     uow.session.get_memory = AsyncMock(return_value=Memory())
     uow.session.get_summary = AsyncMock(return_value=[])
     uow.session.save_memory = AsyncMock()
     uow.session.save_summary = AsyncMock()
+    uow.session.clear_interrupt_state = AsyncMock()
     return uow
 
 
@@ -102,7 +104,7 @@ class TestFullFlowIntegration:
             sandbox=AsyncMock(),
             search_engine=AsyncMock(),
             mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
-            a2a_tool=MagicMock(),
+            a2a_tool=MagicMock(manager=None),
             skill_tool=MagicMock(),
         )
 
@@ -142,7 +144,7 @@ class TestFullFlowIntegration:
             sandbox=AsyncMock(),
             search_engine=AsyncMock(),
             mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
-            a2a_tool=MagicMock(),
+            a2a_tool=MagicMock(manager=None),
             skill_tool=MagicMock(),
         )
 
@@ -172,7 +174,7 @@ class TestFullFlowIntegration:
             sandbox=AsyncMock(),
             search_engine=AsyncMock(),
             mcp_tool=MagicMock(get_tools=MagicMock(return_value=[])),
-            a2a_tool=MagicMock(),
+            a2a_tool=MagicMock(manager=None),
             skill_tool=MagicMock(),
         )
 

@@ -13,9 +13,11 @@ import json
 import logging
 from typing import Any
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import RetryPolicy
 
+from app.application.errors.exceptions import ServerRequestsError
 from app.domain.models.event import (
     MessageEvent,
     ToolEvent,
@@ -51,30 +53,13 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
     async def llm_node(state: ReactGraphState) -> dict:
         """Call the LLM with current messages."""
         messages = state["messages"]
+
         response: AIMessage = await llm_with_tools.ainvoke(messages)
 
         new_events = []
 
-        # Convert response to dict message for storage
-        msg_dict: dict[str, Any] = {
-            "role": "assistant",
-            "content": response.content or "",
-        }
+        # Emit ToolEvent(CALLING) for each tool call
         if response.tool_calls:
-            msg_dict["tool_calls"] = [
-                {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tc["name"],
-                        "arguments": json.dumps(tc["args"])
-                        if isinstance(tc["args"], dict)
-                        else tc["args"],
-                    },
-                }
-                for tc in response.tool_calls
-            ]
-            # Emit ToolEvent(CALLING) for each tool call
             for tc in response.tool_calls:
                 new_events.append(
                     ToolEvent(
@@ -93,7 +78,7 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
             )
 
         return {
-            "messages": state["messages"] + [msg_dict],
+            "messages": state["messages"] + [response],
             "events": new_events,
         }
 
@@ -109,14 +94,16 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
         """
         messages = state["messages"]
         last_msg = messages[-1]
-        tool_calls = last_msg.get("tool_calls") or []
+
+        # AIMessage.tool_calls is a list of dicts with id/name/args
+        tool_calls = last_msg.tool_calls if isinstance(last_msg, AIMessage) else []
 
         # Check if there was already a SOFT_HINT in this step's history
         has_prior_soft_hint = any(
-            m.get("content") == "SOFT_HINT"
-            and m.get("function_name") == "message_ask_user"
+            isinstance(m, ToolMessage)
+            and m.content == "SOFT_HINT"
+            and m.name == "message_ask_user"
             for m in messages
-            if isinstance(m, dict) and m.get("role") == "tool"
         )
 
         new_messages = []
@@ -124,11 +111,9 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
         should_interrupt = False
 
         for tc in tool_calls:
-            fn = tc.get("function", {})
-            tool_name = fn.get("name", "")
-            args_raw = fn.get("arguments", "{}")
-            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
-            call_id = tc.get("id", "")
+            tool_name = tc["name"]
+            args = tc["args"] if isinstance(tc["args"], dict) else json.loads(tc["args"])
+            call_id = tc["id"]
 
             # ---- message_ask_user: SOFT_HINT gating ---- #
             tool_success = True  # default; overridden in normal-tool branch on failure
@@ -167,12 +152,11 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
             # Prefix error messages so the LLM can clearly identify failures
             content = f"[TOOL_ERROR] {result_str}" if not tool_success else result_str
 
-            new_messages.append({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": content,
-                "function_name": tool_name,
-            })
+            new_messages.append(ToolMessage(
+                content=content,
+                tool_call_id=call_id,
+                name=tool_name,
+            ))
 
             # Emit ToolEvent(CALLED) with correct success status
             new_events.append(
@@ -220,7 +204,7 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
             return END
 
         last_msg = messages[-1]
-        if last_msg.get("role") == "assistant" and last_msg.get("tool_calls"):
+        if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
             return "confirmation_check"
 
         return END
@@ -243,7 +227,15 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
 
     g: StateGraph = StateGraph(ReactGraphState)
 
-    g.add_node("llm_node", llm_node)
+    # RetryPolicy for transient LLM errors (ServerRequestsError → RuntimeError)
+    llm_retry = RetryPolicy(
+        max_attempts=3,
+        initial_interval=2.0,
+        backoff_factor=2.0,
+        retry_on=ServerRequestsError,
+    )
+
+    g.add_node("llm_node", llm_node, retry_policy=llm_retry)
     g.add_node("tool_node", tool_node)
     g.add_node("confirmation_check", confirmation_check)
 

@@ -18,7 +18,9 @@ EXECUTION_PROMPT = """
 - **是你来执行这个任务，而不是用户。**不要告诉用户“如何做”，而是直接通过工具“去做”。
 - **必须使用用户消息中使用的语言（Working Language）来执行任务和回复。**
 - 你必须以系统上下文中的 `Available Tool Summary` 为当前可用工具权威来源，不要调用清单外工具。
-- 涉及终端操作时优先使用 `shell_*` 工具；涉及网页/页面操作时优先使用 `browser_*` 工具。
+- 如果 `Available Tool Summary` 中包含 `mcp tools`，说明已接入对应的 MCP 服务。**当任务涉及这些服务时，必须优先使用对应的 MCP 工具（而非浏览器或终端），因为 MCP 工具通过 API 直接操作，比浏览器更可靠高效。**
+- 如果 `Available Tool Summary` 中包含 `a2a tools`，可通过 `get_remote_agent_cards` 发现远程 Agent 并通过 `call_remote_agent` 调用它们。
+- 涉及终端操作时优先使用 `shell_*` 工具；涉及网页/页面操作（且无对应 MCP 工具可用时）优先使用 `browser_*` 工具。
 - 必须使用 `message_notify_user` 工具向用户通报进度，内容限制在一句话以内：
     - 你打算使用什么工具，以及用它做什么；
     - 或者你通过工具完成了什么；

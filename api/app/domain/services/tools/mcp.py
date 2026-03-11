@@ -452,8 +452,16 @@ class MCPTool(BaseTool):
     async def initialize(self, mcp_config: Optional[MCPConfig] = None) -> None:
         """初始化MCP工具包"""
         # 1.判断是否初始化，如果未初始化则进行初始化
-        if not self._initialized:
+        if self._initialized:
+            logger.info("[MCPTool] 已初始化，跳过 (tools=%d)", len(self._tools))
+            return
+        if True:
             filtered_config = _filter_enabled_mcp_config(mcp_config)
+            logger.info(
+                "[MCPTool] 开始初始化, 原始servers=%s, 过滤后servers=%s",
+                list((mcp_config.mcpServers or {}).keys()) if mcp_config and mcp_config.mcpServers else [],
+                list(filtered_config.mcpServers.keys()),
+            )
             if not filtered_config.mcpServers:
                 logger.info("当前无启用的MCP服务，跳过初始化")
                 self._tools = []

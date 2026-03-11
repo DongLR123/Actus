@@ -10,6 +10,7 @@ from app.domain.models.session import Session, SessionStatus
 
 if TYPE_CHECKING:
     from app.domain.models.conversation_summary import ConversationSummary
+    from app.domain.models.interrupt_state import InterruptState
     from app.domain.models.skill_creation_state import SkillCreationState
     from app.domain.models.skill_graph_state import SkillGraphState
 
@@ -133,4 +134,20 @@ class SessionRepository(Protocol):
 
     async def clear_skill_graph_state(self, session_id: str) -> None:
         """清理 Skill 创建子图的持久化状态"""
+        ...
+
+    async def get_interrupt_state(
+        self, session_id: str
+    ) -> InterruptState | None:
+        """获取会话的中断恢复状态"""
+        ...
+
+    async def save_interrupt_state(
+        self, session_id: str, state: InterruptState
+    ) -> None:
+        """保存会话的中断恢复状态"""
+        ...
+
+    async def clear_interrupt_state(self, session_id: str) -> None:
+        """清理会话的中断恢复状态（恢复后消费）"""
         ...

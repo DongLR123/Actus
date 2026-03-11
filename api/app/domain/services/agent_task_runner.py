@@ -774,6 +774,59 @@ class AgentTaskRunner(TaskRunner):
                 + ", ".join(creator_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
             )
 
+        # MCP 工具
+        mcp_tools: list[str] = []
+        try:
+            raw_mcp = self._mcp_tool.get_tools()
+            logger.info(
+                "[ToolSummary] MCP get_tools() 返回 %d 项, initialized=%s, manager=%s",
+                len(raw_mcp),
+                getattr(self._mcp_tool, "_initialized", "?"),
+                self._mcp_tool._manager is not None if hasattr(self._mcp_tool, "_manager") else "?",
+            )
+            for schema in raw_mcp:
+                if not isinstance(schema, dict):
+                    logger.debug("[ToolSummary] MCP schema 非dict: %s", type(schema))
+                    continue
+                function_info = schema.get("function")
+                if not isinstance(function_info, dict):
+                    logger.debug("[ToolSummary] MCP function 非dict: %s", type(function_info))
+                    continue
+                tool_name = function_info.get("name")
+                if isinstance(tool_name, str) and tool_name:
+                    mcp_tools.append(tool_name)
+        except Exception as exc:
+            logger.warning("读取MCP工具摘要失败，降级为空: %s", exc, exc_info=True)
+            mcp_tools = []
+        logger.info("[ToolSummary] 最终 mcp_tools=%s", mcp_tools)
+        if mcp_tools:
+            lines.append(
+                "- mcp tools: "
+                + ", ".join(mcp_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
+            )
+
+        # A2A 工具（仅在 manager 存在时才有 LangChain 工具绑定到 LLM）
+        a2a_tools: list[str] = []
+        if getattr(self._a2a_tool, "manager", None) is not None:
+            try:
+                for schema in self._a2a_tool.get_tools():
+                    if not isinstance(schema, dict):
+                        continue
+                    function_info = schema.get("function")
+                    if not isinstance(function_info, dict):
+                        continue
+                    tool_name = function_info.get("name")
+                    if isinstance(tool_name, str) and tool_name:
+                        a2a_tools.append(tool_name)
+            except Exception as exc:
+                logger.debug("读取A2A工具摘要失败，降级为空: %s", exc)
+                a2a_tools = []
+        if a2a_tools:
+            lines.append(
+                "- a2a tools: "
+                + ", ".join(a2a_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
+            )
+
         summary = "\n".join(lines).strip()
         if len(summary) > char_budget:
             summary = summary[:char_budget].rstrip() + "\n...(truncated)"

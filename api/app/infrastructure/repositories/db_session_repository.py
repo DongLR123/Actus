@@ -7,6 +7,7 @@ from app.domain.models.event import BaseEvent
 from app.domain.models.file import File
 from app.domain.models.memory import Memory
 from app.domain.models.session import Session, SessionStatus
+from app.domain.models.interrupt_state import InterruptState
 from app.domain.models.skill_creation_state import SkillCreationState
 from app.domain.models.skill_graph_state import SkillGraphState
 from app.domain.repositories.session_repository import SessionRepository
@@ -32,6 +33,7 @@ def _strip_null_bytes(data: Any) -> Any:
 _SKILL_CREATION_STATE_KEY = "__skill_creation_state_v1"
 _SKILL_CREATION_STATE_LEGACY_KEY = "_skill_creator"
 _SKILL_GRAPH_STATE_KEY = "_skill_graph"
+_INTERRUPT_STATE_KEY = "_interrupt_state"
 
 
 class DBSessionRepository(SessionRepository):
@@ -492,6 +494,63 @@ class DBSessionRepository(SessionRepository):
             .values(
                 memories=func.coalesce(SessionModel.memories, cast({}, JSONB))
                 .op("-")(_SKILL_GRAPH_STATE_KEY)
+            )
+        )
+        result = await self.db_session.execute(stmt)
+
+        if result.rowcount == 0:
+            raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
+
+    # -- 中断恢复状态 -------------------------------------------------------- #
+
+    async def get_interrupt_state(
+        self, session_id: str
+    ) -> InterruptState | None:
+        """获取会话的中断恢复状态"""
+        stmt = select(
+            SessionModel.memories[_INTERRUPT_STATE_KEY],
+        ).where(SessionModel.id == session_id)
+        result = await self.db_session.execute(stmt)
+        row = result.one_or_none()
+        if not row or not row[0]:
+            return None
+
+        try:
+            return InterruptState.model_validate(row[0])
+        except ValidationError as exc:
+            logger.warning(
+                "中断恢复状态结构非法，忽略: session_id=%s error=%s",
+                session_id,
+                exc,
+            )
+            return None
+
+    async def save_interrupt_state(
+        self, session_id: str, state: InterruptState
+    ) -> None:
+        """保存会话的中断恢复状态"""
+        patch_data = {_INTERRUPT_STATE_KEY: state.model_dump(mode="json")}
+        stmt = (
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .values(
+                memories=func.coalesce(SessionModel.memories, cast({}, JSONB))
+                + cast(patch_data, JSONB),
+            )
+        )
+        result = await self.db_session.execute(stmt)
+
+        if result.rowcount == 0:
+            raise ValueError(f"会话[{session_id}]不存在，请核实后重试")
+
+    async def clear_interrupt_state(self, session_id: str) -> None:
+        """清理会话的中断恢复状态（恢复后消费）"""
+        stmt = (
+            update(SessionModel)
+            .where(SessionModel.id == session_id)
+            .values(
+                memories=func.coalesce(SessionModel.memories, cast({}, JSONB))
+                .op("-")(_INTERRUPT_STATE_KEY)
             )
         )
         result = await self.db_session.execute(stmt)

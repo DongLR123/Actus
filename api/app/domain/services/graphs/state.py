@@ -8,10 +8,16 @@ from typing import Annotated, Any
 from typing_extensions import TypedDict
 
 from app.domain.models.plan import Plan, Step
+from app.domain.services.flows.base import FlowStatus
 
 
 class MainGraphState(TypedDict):
-    """State for the outer orchestration graph (planner → executor → updater → summarizer)."""
+    """State for the outer orchestration graph (planner → executor → updater → summarizer).
+
+    ``messages`` stores LangChain BaseMessage objects (overwrite semantics — each
+    executor_node returns the full conversation so far). The type annotation is
+    ``list`` to avoid import-time dependency on langchain_core.
+    """
 
     # Input
     message: str
@@ -22,15 +28,15 @@ class MainGraphState(TypedDict):
     plan: Plan | None
     current_step: Step | None
 
-    # Execution
-    messages: list[dict[str, Any]]  # LLM conversation history
+    # Execution — LangChain BaseMessage list (overwrite, not append)
+    messages: list
     execution_summary: str
 
     # Events produced by nodes (accumulated across nodes)
     events: Annotated[list, operator.add]
 
     # Control
-    flow_status: str  # idle | planning | executing | updating | summarizing | completed
+    flow_status: str  # FlowStatus.value — typed routing via FlowStatus enum
     session_id: str
     should_interrupt: bool
     is_resuming: bool
@@ -42,10 +48,14 @@ class MainGraphState(TypedDict):
 
 
 class ReactGraphState(TypedDict):
-    """State for the inner ReAct loop graph (LLM → tool → LLM → ...)."""
+    """State for the inner ReAct loop graph (LLM → tool → LLM → ...).
 
-    # Conversation
-    messages: list[dict[str, Any]]
+    ``messages`` stores LangChain BaseMessage objects (overwrite semantics —
+    each node returns the full list including new messages).
+    """
+
+    # Conversation — LangChain BaseMessage list
+    messages: list
 
     # Step context
     step_description: str

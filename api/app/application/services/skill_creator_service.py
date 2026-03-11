@@ -283,15 +283,31 @@ class SkillCreatorService:
         )
 
     async def _analyze_requirement(self, description: str) -> SkillBlueprint:
-        response = await self._llm.invoke(
-            messages=[
-                {"role": "system", "content": ANALYZE_SYSTEM_PROMPT},
-                {"role": "user", "content": description},
-            ],
-            response_format={"type": "json_object"},
-        )
-        payload = self._parse_llm_json(response)
-        return SkillBlueprint.model_validate(payload)
+        import asyncio
+        from app.application.errors.exceptions import ServerRequestsError
+
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = await self._llm.invoke(
+                    messages=[
+                        {"role": "system", "content": ANALYZE_SYSTEM_PROMPT},
+                        {"role": "user", "content": description},
+                    ],
+                    response_format={"type": "json_object"},
+                )
+                payload = self._parse_llm_json(response)
+                return SkillBlueprint.model_validate(payload)
+            except (ServerRequestsError, json.JSONDecodeError) as exc:
+                last_exc = exc
+                if attempt < 2:
+                    delay = 2 * (2 ** attempt)
+                    logger.warning(
+                        "蓝图分析 LLM 调用失败 (attempt %d/3), %ds 后重试: %s",
+                        attempt + 1, delay, exc,
+                    )
+                    await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
     async def _research(self, blueprint: SkillBlueprint) -> list[GitHubRepoInfo]:
         try:
