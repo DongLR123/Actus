@@ -114,17 +114,22 @@ class SessionModel(Base):
         return Session.model_validate(self, from_attributes=True)
 
     def update_from_domain(self, session: Session) -> None:
-        """从传递的领域模型更新ORM数据"""
+        """从传递的领域模型更新ORM数据。
+
+        注意：memories 列通过 save_memory / save_skill_graph_state 等
+        专用 JSONB patch 方法更新，此处不覆写，避免丢失
+        _skill_graph / _summary 等非 Memory 类型的子键。
+        """
         # 1.基础字段: Python模式
         base_data = session.model_dump(
             mode="python",
             exclude={"memories", "files", "events", "updated_at", "created_at"},
         )
 
-        # 2.复杂字段: JSON模式
+        # 2.复杂字段: JSON模式（排除 memories，由专用方法管理）
         json_data = session.model_dump(
             mode="json",
-            include={"memories", "files", "events"},
+            include={"files", "events"},
         )
 
         # 3.合并更新

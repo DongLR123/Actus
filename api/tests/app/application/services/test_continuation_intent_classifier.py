@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 
 import pytest
 from app.application.services.continuation_intent_classifier import (
@@ -17,38 +16,29 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
+class _FakeMessage:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+
 class _FakeLLM:
     def __init__(self, content: str, delay_seconds: float = 0.0) -> None:
         self._content = content
         self._delay_seconds = delay_seconds
 
-    async def invoke(self, **kwargs):  # noqa: ANN003
+    async def ainvoke(self, messages, **kwargs):  # noqa: ANN001, ANN003
         if self._delay_seconds > 0:
             await asyncio.sleep(self._delay_seconds)
-        return {"role": "assistant", "content": self._content}
-
-
-class _FakeParser:
-    async def invoke(self, text: str, default_value=None):  # noqa: ANN001
-        if not text.strip():
-            return default_value
-        return json.loads(text)
-
-
-class _FailingParser:
-    async def invoke(self, text: str, default_value=None):  # noqa: ANN001
-        raise ValueError("invalid json")
+        return _FakeMessage(self._content)
 
 
 async def test_classifier_parses_true_false_payload() -> None:
     classifier_true = ContinuationIntentClassifier(
         llm=_FakeLLM('{"is_continuation": true}'),
-        json_parser=_FakeParser(),
         timeout_seconds=1.0,
     )
     classifier_false = ContinuationIntentClassifier(
         llm=_FakeLLM('{"is_continuation": false}'),
-        json_parser=_FakeParser(),
         timeout_seconds=1.0,
     )
 
@@ -71,7 +61,6 @@ async def test_classifier_parses_true_false_payload() -> None:
 async def test_classifier_returns_false_when_json_invalid() -> None:
     classifier = ContinuationIntentClassifier(
         llm=_FakeLLM("not-json"),
-        json_parser=_FailingParser(),
         timeout_seconds=1.0,
     )
 
@@ -87,7 +76,6 @@ async def test_classifier_returns_false_when_json_invalid() -> None:
 async def test_classifier_returns_false_when_timeout() -> None:
     classifier = ContinuationIntentClassifier(
         llm=_FakeLLM('{"is_continuation": true}', delay_seconds=0.2),
-        json_parser=_FakeParser(),
         timeout_seconds=0.05,
     )
 

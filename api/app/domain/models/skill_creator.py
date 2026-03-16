@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 
 class ToolParamDef(BaseModel):
@@ -174,17 +174,85 @@ class SkillBlueprint(BaseModel):
 class ScriptFile(BaseModel):
     """生成的脚本文件。"""
 
-    path: str
-    content: str
+    path: str = Field(
+        description='脚本路径，必须以 "bundle/" 开头，如 "bundle/my_tool.py"',
+    )
+    content: str = Field(
+        description="完整的 Python 脚本代码。脚本必须：1) 接受 sys.argv[1] 作为 JSON 输入；"
+        "2) 输出 JSON 到 stdout；3) 支持 --help 参数",
+    )
 
 
 class SkillGeneratedFiles(BaseModel):
     """生成阶段输出的 Skill 文件集合。"""
 
-    skill_md: str
-    manifest: dict[str, Any]
-    scripts: list[ScriptFile] = Field(default_factory=list)
-    dependencies: list[str] = Field(default_factory=list)
+    model_config = ConfigDict(extra="ignore")
+
+    skill_md: str = Field(
+        default="",
+        description="完整的 SKILL.md 内容，必须包含 YAML frontmatter（--- 分隔）"
+        "和 Markdown 使用说明",
+    )
+    manifest: dict[str, Any] = Field(
+        default_factory=dict,
+        description='manifest.json 对象，必须包含 name, runtime_type("native"), '
+        "tools 数组。每个 tool 必须有 name, description, parameters(object 格式), "
+        'required, entry(含 command: "python bundle/<name>.py")',
+    )
+    scripts: list[ScriptFile] = Field(
+        default_factory=list,
+        description="可执行 Python 脚本列表，每个脚本的 path 必须以 bundle/ 开头",
+    )
+    dependencies: list[str] = Field(
+        default_factory=list,
+        description="pip 包名列表（如 requests, beautifulsoup4），不要写中文描述",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_generated_files(cls, data: Any) -> Any:
+        """容错处理 LLM 常见的输出偏差。
+
+        - 解包嵌套：{"result": {...}}, {"generated_files": {...}}
+        - manifest 缺失时尝试从 skill_md 中解析 YAML frontmatter
+        """
+        if not isinstance(data, dict):
+            return data
+
+        # 解包嵌套
+        unwrap_keys = ("result", "generated_files", "data", "output")
+        for key in unwrap_keys:
+            if key in data and isinstance(data[key], dict):
+                inner = data[key]
+                if "skill_md" in inner or "manifest" in inner or "scripts" in inner:
+                    data = inner
+                    break
+
+        data = dict(data)
+
+        # manifest 缺失时尝试从 skill_md 解析
+        if not data.get("manifest") and data.get("skill_md"):
+            data["manifest"] = _extract_manifest_from_skill_md(data["skill_md"])
+
+        return data
+
+
+def _extract_manifest_from_skill_md(skill_md: str) -> dict[str, Any]:
+    """从 SKILL.md 的 YAML frontmatter 中提取 manifest。
+
+    SKILL.md 格式: ---\\n<yaml>\\n---\\n<markdown>
+    """
+    import re
+    import yaml  # type: ignore[import-untyped]
+
+    match = re.match(r"^---\s*\n(.*?)\n---", skill_md, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        parsed = yaml.safe_load(match.group(1))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
 
 
 class GitHubRepoInfo(BaseModel):

@@ -562,7 +562,27 @@ export const useSessionStore = create<SessionStore>()(
           if (event.type !== "sessions") {
             return;
           }
-          set({ sessions: event.data.sessions });
+          const remote = event.data.sessions;
+          set((state) => {
+            // 用远端列表为基础，但保留本地已通过 SSE chat 事件
+            // 推进到 completed/waiting 的状态，避免竞态回退
+            const localStatusMap = new Map(
+              state.sessions.map((s) => [s.session_id, s.status])
+            );
+            const merged = remote.map((item) => {
+              const localStatus = localStatusMap.get(item.session_id);
+              if (
+                localStatus &&
+                localStatus !== item.status &&
+                (localStatus === "completed" || localStatus === "waiting") &&
+                item.status === "running"
+              ) {
+                return { ...item, status: localStatus };
+              }
+              return item;
+            });
+            return { sessions: merged };
+          });
         },
         (error) => {
           showMessage("error", error.message || "会话流连接异常");

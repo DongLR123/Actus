@@ -27,12 +27,20 @@ class MinioStore:
             return
 
         try:
+            http_client = None
+            if self._settings.minio_secure:
+                import urllib3
+                http_client = urllib3.PoolManager(
+                    cert_reqs="CERT_NONE",
+                )
+
             self._client = Minio(
                 endpoint=self._settings.minio_endpoint,  # 例如: "s3.example.com"
                 access_key=self._settings.minio_access_key,
                 secret_key=self._settings.minio_secret_key,
                 secure=self._settings.minio_secure,  # True/False
                 region=getattr(self._settings, "minio_region", None),
+                http_client=http_client,
             )
             logger.info("MinIO 对象存储初始化成功")
         except Exception as e:

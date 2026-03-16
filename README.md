@@ -84,6 +84,7 @@ cp .env.example .env
 # MINIO_SECRET_KEY
 # MINIO_BUCKET_NAME
 # NEXT_PUBLIC_API_BASE_URL
+# 可选：如需覆盖默认 Python 包镜像，设置 PYTHON_PACKAGE_INDEX_URL
 
 docker compose --env-file .env up -d --build
 

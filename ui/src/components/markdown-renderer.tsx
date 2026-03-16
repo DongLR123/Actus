@@ -103,6 +103,10 @@ export function MarkdownRenderer({ content, className }: Readonly<MarkdownRender
         "[&_code]:rounded [&_code]:bg-muted [&_code]:px-1 [&_code]:py-0.5 [&_code]:font-mono [&_code]:text-[13px]",
         "[&_pre]:my-2 [&_pre]:overflow-x-auto [&_pre]:rounded-lg [&_pre]:bg-[oklch(0.16_0_0)] [&_pre]:p-3 [&_pre]:text-[oklch(0.92_0_0)]",
         "[&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-[13px]",
+        "[&_table]:my-3 [&_table]:w-full [&_table]:border-collapse [&_table]:text-sm",
+        "[&_th]:border [&_th]:border-border [&_th]:bg-muted [&_th]:px-3 [&_th]:py-1.5 [&_th]:text-left [&_th]:font-semibold",
+        "[&_td]:border [&_td]:border-border [&_td]:px-3 [&_td]:py-1.5",
+        "[&_hr]:my-4 [&_hr]:border-border",
         className
       )}
       dangerouslySetInnerHTML={{ __html: html }}

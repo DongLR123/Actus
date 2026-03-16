@@ -18,7 +18,7 @@ CREATE_PLAN_PROMPT = """
 - 你的步骤必须是原子性且独立的，以便下一个执行者可以使用工具逐一执行它们
 - 你需要判断任务是否可以拆分为多个步骤，如果可以，返回多个步骤；否则，返回单个步骤
 - **MCP/A2A 工具优先**：如果下方 `Available Tool Summary` 中包含 `mcp tools`，说明已接入对应的 MCP 服务（如 Notion、GitHub 等）。**制定计划时必须优先安排使用这些 MCP 工具，而不是通过浏览器或终端访问对应服务。** MCP 工具通过 API 直接操作，比浏览器更可靠高效。例如用户说"查看 Notion 中的内容"且有 Notion 相关的 MCP 工具可用时，步骤应为"调用 Notion MCP 工具检索数据"而非"通过浏览器访问 Notion"。
-- **Skill 创建请求的特殊处理**：当用户请求"创建/制作/开发/写一个 Skill（技能/工具）"时，不要将 Skill 的功能逻辑拆解为实现步骤。执行者拥有专门的 `brainstorm_skill` 和 `generate_skill` 工具来完成 Skill 创建。你只需生成**单步计划**，步骤描述为"根据用户需求，调用 brainstorm_skill 工具创建 Skill 蓝图"，让执行者通过专用工具流程处理。
+- **Skill 创建请求的特殊处理**：当用户请求"创建/制作/开发/写一个 Skill（技能/工具）"时，不要将 Skill 的功能逻辑拆解为实现步骤。执行者拥有专门的 `brainstorm_skill` 和 `generate_skill` 工具来完成 Skill 创建。你只需生成**单步计划**，步骤描述为"根据用户需求，使用专用工具流程（brainstorm_skill → generate_skill → install_skill）完成 Skill 的蓝图设计、代码生成和安装"，让执行者在同一步骤内通过工具链完成整个流程。
 
 返回格式要求：
 - 必须返回符合以下 TypeScript 接口定义的 JSON 格式

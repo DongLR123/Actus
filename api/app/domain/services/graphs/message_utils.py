@@ -59,6 +59,25 @@ def dicts_to_messages(dicts: list[dict[str, Any]]) -> list[BaseMessage]:
     return messages
 
 
+def dedup_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
+    """Deduplicate messages by ID — later message with same ID replaces earlier.
+
+    Replicates langgraph.graph.message.add_messages dedup semantics.
+    Messages without an id (or id=None) are always appended without dedup.
+    """
+    seen: dict[str, int] = {}  # id -> index in result
+    result: list[BaseMessage] = []
+    for msg in messages:
+        msg_id = getattr(msg, "id", None)
+        if msg_id and msg_id in seen:
+            result[seen[msg_id]] = msg  # replace
+        else:
+            if msg_id:
+                seen[msg_id] = len(result)
+            result.append(msg)
+    return result
+
+
 def messages_to_dicts(messages: list[BaseMessage]) -> list[dict[str, Any]]:
     """Convert LangChain BaseMessage list to Actus dict format (for Memory/raw-LLM)."""
     dicts: list[dict[str, Any]] = []

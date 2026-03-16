@@ -91,3 +91,96 @@ class TestGraphEventBridge:
 
         assert len(events) == 1
         assert events[0].message == "from queue"
+
+    async def test_wait_event_with_interrupt_no_cleanup_exception(self):
+        """When WaitEvent is consumed and generator is closed, cleanup exception
+        from _drive_graph should be suppressed (not propagate to caller).
+
+        This prevents WAITING → COMPLETED overwrite in agent_task_runner.
+        """
+        import asyncio
+        from app.domain.services.graphs.event_bridge import GraphEventBridge
+        from app.domain.models.event import WaitEvent
+
+        wait_event = WaitEvent()
+
+        class InterruptGraph:
+            async def astream(self, input_state, config=None):
+                # executor_node pushes WaitEvent and returns should_interrupt
+                queue = config["configurable"]["event_queue"]
+                await queue.put(wait_event)
+                yield {"executor_node": {
+                    "events": [],
+                    "should_interrupt": True,
+                    "flow_status": "executing",
+                }}
+                # Simulate interrupt_node failing (e.g. no checkpointer)
+                raise RuntimeError("interrupt() failed: no checkpointer")
+
+        bridge = GraphEventBridge()
+        events = []
+        # Simulate agent_task_runner: consume until WaitEvent, then close
+        gen = bridge.run(InterruptGraph(), {})
+        try:
+            async for event in gen:
+                events.append(event)
+                if isinstance(event, WaitEvent):
+                    break  # agent_task_runner would `return` here
+        finally:
+            await gen.aclose()
+
+        # WaitEvent should have been received
+        assert len(events) == 1
+        assert isinstance(events[0], WaitEvent)
+
+        # Should NOT raise — cleanup suppressed the RuntimeError
+        # (If it raised, agent_task_runner's except handler would overwrite WAITING)
+
+    async def test_normal_exit_propagates_drive_graph_error(self):
+        """In normal (non-cleanup) path, _drive_graph errors should propagate."""
+        from app.domain.services.graphs.event_bridge import GraphEventBridge
+
+        class ErrorGraph:
+            async def astream(self, input_state, config=None):
+                yield {"node": {"events": [], "data": "ok"}}
+                raise RuntimeError("graph execution failed")
+
+        bridge = GraphEventBridge()
+        with pytest.raises(RuntimeError, match="graph execution failed"):
+            async for _ in bridge.run(ErrorGraph(), {}):
+                pass
+
+    async def test_was_interrupted_with_checkpointer(self):
+        """was_interrupted should be True when graph has pending next nodes."""
+        from app.domain.services.graphs.event_bridge import GraphEventBridge
+        from app.domain.models.event import WaitEvent
+        from langgraph.checkpoint.memory import MemorySaver
+        from langgraph.graph import StateGraph, START, END
+        from langgraph.types import interrupt
+        from typing_extensions import TypedDict
+
+        class SimpleState(TypedDict):
+            value: str
+
+        def node_a(state: SimpleState):
+            return {"value": "from_a"}
+
+        def node_b(state: SimpleState):
+            interrupt("need input")
+            return {"value": "from_b"}
+
+        checkpointer = MemorySaver()
+        g = StateGraph(SimpleState)
+        g.add_node("a", node_a)
+        g.add_node("b", node_b)
+        g.add_edge(START, "a")
+        g.add_edge("a", "b")
+        g.add_edge("b", END)
+        graph = g.compile(checkpointer=checkpointer)
+
+        config = {"configurable": {"thread_id": "test-was-interrupted"}}
+        bridge = GraphEventBridge()
+        async for _ in bridge.run(graph, {"value": ""}, config=config):
+            pass
+
+        assert bridge.was_interrupted is True

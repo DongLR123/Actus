@@ -3,8 +3,8 @@ import logging
 from typing import Any, List, Optional
 
 from app.domain.external.browser import Browser as BrowserProtocol
-from app.domain.external.llm import LLM
 from app.domain.models.tool_result import ToolResult
+from langchain_core.language_models import BaseChatModel
 from markdownify import markdownify
 from playwright.async_api import (
     Browser,
@@ -30,12 +30,12 @@ class PlaywrightBrowser(BrowserProtocol):
         self,
         cdp_url: str,  # CDP的连接地址
         llm: Optional[
-            LLM
+            BaseChatModel
         ] = None,  # 可选参数，传递LLM，如果传递了则会使用LLM对页面内容进行整理变成markdown格式
     ) -> None:
         """构造函数，完成Playwright浏览器的初始化"""
         # LLM相关
-        self.llm: Optional[LLM] = llm
+        self.llm: Optional[BaseChatModel] = llm
 
         # 浏览器相关
         self.cdp_url: str = cdp_url
@@ -90,19 +90,14 @@ class PlaywrightBrowser(BrowserProtocol):
         # 4.判断是否传递了llm，如果传递了，还可以使用llm对markdown_content进行整理
         if self.llm:
             # 5.调用llm对markdown_content内容进行二次整理
-            response = await self.llm.invoke(
+            from langchain_core.messages import HumanMessage, SystemMessage
+            response = await self.llm.ainvoke(
                 [
-                    {
-                        "role": "system",
-                        "content": "您是一名专业的网页信息提取助手。请从当前页面内容中提取所有信息并将其转换为markdown格式。",
-                    },
-                    {
-                        "role": "user",
-                        "content": markdown_content[:max_content_length],
-                    },
+                    SystemMessage(content="您是一名专业的网页信息提取助手。请从当前页面内容中提取所有信息并将其转换为markdown格式。"),
+                    HumanMessage(content=markdown_content[:max_content_length]),
                 ]
             )
-            return response.get("content", "")
+            return response.content if hasattr(response, "content") else str(response)
         else:
             return markdown_content[:max_content_length]
 

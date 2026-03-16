@@ -12,9 +12,9 @@ from app.application.errors.exceptions import (
     ForbiddenError,
     NotFoundError,
 )
+from langchain_core.language_models import BaseChatModel
+
 from app.domain.external.file_storage import FileStorage
-from app.domain.external.json_parser import JSONParser
-from app.domain.external.llm import LLM
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 from app.domain.external.task import Task
@@ -60,20 +60,19 @@ class AgentService:
     def __init__(
         self,
         uow_factory: Callable[[], IUnitOfWork],
-        llm: LLM,
+        llm: BaseChatModel,
         agent_config: AgentConfig,
         mcp_config: MCPConfig,
         a2a_config: A2AConfig,
         sandbox_cls: Type[Sandbox],
         task_cls: Type[Task],
-        json_parser: JSONParser,
         search_engine: SearchEngine,
         file_storage: FileStorage,
         skill_risk_policy: SkillRiskPolicy | None = None,
         overflow_config: ContextOverflowConfig | None = None,
         redis_client: object | None = None,
         skill_creator_service=None,
-        summary_llm: LLM | None = None,
+        summary_llm: BaseChatModel | None = None,
         # file_repository: FileRepository,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
@@ -87,7 +86,6 @@ class AgentService:
         self._overflow_config = overflow_config or ContextOverflowConfig()
         self._sandbox_cls = sandbox_cls
         self._task_cls = task_cls
-        self._json_parser = json_parser
         self._search_engine = search_engine
         self._file_storage = file_storage
         self._redis_client = redis_client
@@ -146,7 +144,6 @@ class AgentService:
             # session_repository=self._session_repository,
             file_storage=self._file_storage,
             # file_repository=self._file_repository,
-            json_parser=self._json_parser,
             browser=browser,
             search_engine=self._search_engine,
             sandbox=sandbox,

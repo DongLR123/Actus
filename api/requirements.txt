@@ -239,7 +239,10 @@ langgraph==1.0.10
 langgraph-checkpoint==4.0.1
     # via
     #   langgraph
+    #   langgraph-checkpoint-postgres
     #   langgraph-prebuilt
+langgraph-checkpoint-postgres==3.0.4
+    # via actus (pyproject.toml)
 langgraph-prebuilt==1.0.8
     # via langgraph
 langgraph-sdk==0.3.9
@@ -282,6 +285,7 @@ openai==2.14.0
     #   browser-use
 orjson==3.11.7
     # via
+    #   langgraph-checkpoint-postgres
     #   langgraph-sdk
     #   langsmith
 ormsgpack==1.12.2
@@ -326,6 +330,12 @@ protobuf==6.33.2
     #   proto-plus
 psutil==7.2.1
     # via browser-use
+psycopg==3.3.3
+    # via langgraph-checkpoint-postgres
+psycopg-binary==3.3.3
+    # via psycopg[binary]
+psycopg-pool==3.3.0
+    # via langgraph-checkpoint-postgres
 psycopg2-binary==2.9.11
     # via actus (pyproject.toml)
 pyasn1==0.6.1
@@ -510,6 +520,8 @@ typing-extensions==4.15.0
     #   minio
     #   openai
     #   posthog
+    #   psycopg
+    #   psycopg-pool
     #   pydantic
     #   pydantic-core
     #   pyee

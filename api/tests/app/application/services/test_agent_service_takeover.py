@@ -106,7 +106,6 @@ def _make_service(uow: _Uow) -> AgentService:
         a2a_config=A2AConfig(),
         sandbox_cls=object,
         task_cls=object,
-        json_parser=object(),
         search_engine=object(),
         file_storage=object(),
     )
@@ -717,7 +716,6 @@ async def test_append_control_event_uses_isolated_uow_instance() -> None:
         a2a_config=A2AConfig(),
         sandbox_cls=object,
         task_cls=object,
-        json_parser=object(),
         search_engine=object(),
         file_storage=object(),
     )
@@ -1039,7 +1037,6 @@ async def test_shutdown_cancels_background_tasks() -> None:
         a2a_config=A2AConfig(),
         sandbox_cls=object,
         task_cls=_DummyTaskCls,
-        json_parser=object(),
         search_engine=object(),
         file_storage=object(),
     )

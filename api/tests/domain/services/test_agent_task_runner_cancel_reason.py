@@ -88,7 +88,6 @@ def _build_runner(session_id: str = "session-cancel") -> AgentTaskRunner:
         session_id=session_id,
         user_id="user-1",
         file_storage=object(),
-        json_parser=object(),
         browser=object(),
         search_engine=object(),
         sandbox=_CancelledSandbox(),

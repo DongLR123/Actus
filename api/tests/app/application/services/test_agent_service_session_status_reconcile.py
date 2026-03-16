@@ -86,7 +86,6 @@ def _make_service(uow: _Uow) -> AgentService:
         a2a_config=A2AConfig(),
         sandbox_cls=object,
         task_cls=object,
-        json_parser=object(),
         search_engine=object(),
         file_storage=object(),
     )

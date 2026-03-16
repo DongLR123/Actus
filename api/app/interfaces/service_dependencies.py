@@ -20,12 +20,10 @@ from app.infrastructure.external.health_checker.postgres_health_checker import (
 from app.infrastructure.external.health_checker.redis_health_checker import (
     RedisHealthChecker,
 )
-from app.infrastructure.external.json_parser.repair_json_parser import RepairJSONParser
-from app.domain.external.llm import LLM
 from app.domain.models.app_config import LLMConfig
-from app.infrastructure.external.llm.fallback_llm import FallbackLLM
-from app.infrastructure.external.llm.openai_llm import OpenAILLM
-from app.infrastructure.external.llm.openai_responses_llm import OpenAIResponsesLLM
+from app.infrastructure.external.llm.actus_chat_model import ActusChatModel
+from app.infrastructure.external.llm.actus_responses_model import ActusResponsesModel
+from langchain_core.language_models import BaseChatModel
 from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
 from app.infrastructure.external.github_search_client import GitHubSearchClient
 from app.infrastructure.external.search.bing_search import BingSearchEngine
@@ -116,21 +114,41 @@ def _load_app_config():
     return app_config_repository.load()
 
 
-def _build_llm(llm_config: LLMConfig) -> LLM:
+def _build_llm(llm_config: LLMConfig) -> BaseChatModel:
     """根据 api_type 配置构建 LLM 实例。
 
     - chat_completions: 仅用 Chat Completions API
     - responses: 仅用 Responses API
     - auto: 先走 Chat Completions，遇到兼容性错误自动回退到 Responses API
+
+    NOTE: 不使用 with_fallbacks()，因为 RunnableWithFallbacks.__getattr__ 会调用
+    typing.get_type_hints() 解析 BaseChatModel.with_structured_output 的类型注解，
+    而 langchain-core 在 TYPE_CHECKING 块中 import builtins，运行时不可用，
+    导致 NameError: name 'builtins' is not defined。
+    改用 ActusFallbackChatModel 在 BaseChatModel 层面内部处理回退逻辑。
     """
+    from app.infrastructure.external.llm.actus_fallback_chat_model import ActusFallbackChatModel
+
+    chat = ActusChatModel(
+        base_url=str(llm_config.base_url),
+        api_key=llm_config.api_key,
+        model_name=llm_config.model_name,
+        temperature=llm_config.temperature,
+        max_tokens=llm_config.max_tokens,
+        supports_response_format=getattr(llm_config, 'supports_response_format', True),
+    )
+    responses = ActusResponsesModel(
+        base_url=str(llm_config.base_url),
+        api_key=llm_config.api_key,
+        model_name=llm_config.model_name,
+        temperature=llm_config.temperature,
+        max_tokens=llm_config.max_tokens,
+    )
     if llm_config.api_type == "responses":
-        return OpenAIResponsesLLM(llm_config)
+        return responses
     if llm_config.api_type == "auto":
-        return FallbackLLM(
-            primary=OpenAILLM(llm_config),
-            fallback=OpenAIResponsesLLM(llm_config),
-        )
-    return OpenAILLM(llm_config)
+        return ActusFallbackChatModel(primary=chat, fallback=responses)
+    return chat
 
 
 def _build_skill_service() -> SkillService:
@@ -189,7 +207,6 @@ def get_agent_service(
         skill_risk_policy=app_config.skill_risk_policy,
         sandbox_cls=DockerSandbox,
         task_cls=RedisStreamTask,
-        json_parser=RepairJSONParser(),
         search_engine=BingSearchEngine(),
         file_storage=file_storage,
         redis_client=redis_client,

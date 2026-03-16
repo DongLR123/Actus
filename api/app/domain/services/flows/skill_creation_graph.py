@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import operator
 from datetime import datetime
-from typing import Annotated, Any, AsyncGenerator, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
@@ -301,13 +301,52 @@ class SkillCreationGraph:
 
     async def _generate_node(self, state: _InternalState) -> dict:
         """generate_node: 调用 generate_skill 生成代码。"""
+        # 防御性校验：状态持久化可能因断连/CancelledError 丢失关键字段
+        description = state["original_request"]
+        blueprint = state["blueprint"]
+        blueprint_json = state["blueprint_json"]
+
+        # 尝试从 saved_tool_result_json 恢复丢失的 blueprint
+        if not blueprint and not blueprint_json and state["saved_tool_result_json"]:
+            try:
+                import json as _json
+                saved = _json.loads(state["saved_tool_result_json"])
+                saved_data = saved.get("data") or {}
+                blueprint = saved_data.get("blueprint")
+                blueprint_json = saved_data.get("blueprint_json", "")
+                if not description:
+                    description = saved_data.get("skill_name", "")
+                logger.info("generate_node: 从 saved_tool_result_json 恢复 blueprint")
+            except Exception as exc:
+                logger.warning("generate_node: 恢复 blueprint 失败: %s", exc)
+
+        if not description and not blueprint and not blueprint_json:
+            logger.error(
+                "generate_node: 缺少必要数据 (original_request/blueprint 均为空)，"
+                "无法调用 LLM，可能是状态持久化失败"
+            )
+            return {
+                "status": "error",
+                "last_error": "状态数据丢失，请重新创建 Skill（原因：蓝图确认后状态未能正确恢复）",
+                "pending_action": "",
+                "events": [
+                    MessageEvent(
+                        role="assistant",
+                        message=(
+                            "Skill 生成失败：确认蓝图后状态数据丢失，无法继续生成。\n"
+                            "请重新发起 Skill 创建请求。"
+                        ),
+                    ),
+                ],
+            }
+
         kwargs: dict[str, Any] = {
-            "description": state["original_request"],
+            "description": description,
         }
-        if state["blueprint"]:
-            kwargs["blueprint"] = state["blueprint"]
-        elif state["blueprint_json"]:
-            kwargs["blueprint_json"] = state["blueprint_json"]
+        if blueprint:
+            kwargs["blueprint"] = blueprint
+        elif blueprint_json:
+            kwargs["blueprint_json"] = blueprint_json
 
         result: ToolResult = await self._create_skill_tool.generate_skill(**kwargs)
 
@@ -451,14 +490,22 @@ class SkillCreationGraph:
         state: SkillGraphState | None,
         action: SkillConfirmationAction | None,
         original_request: str = "",
-    ) -> AsyncGenerator[BaseEvent, None]:
-        """驱动子图前进一步，返回产出的事件流。
+    ) -> tuple[SkillGraphState, list[BaseEvent]]:
+        """驱动子图前进一步，返回 (新状态, 事件列表)。
+
+        注意：此方法是普通 async 函数，不再是 async generator。
+        这确保调用方可以在 yield 事件之前先持久化状态，
+        避免 WaitEvent 触发 GeneratorExit/CancelledError 导致状态丢失。
 
         Parameters
         ----------
         state : 当前持久化的 SkillGraphState（首次为 None）。
         action : 用户的结构化确认动作。
         original_request : 用户原始需求（仅首次需要）。
+
+        Returns
+        -------
+        tuple[SkillGraphState, list[BaseEvent]] : (更新后的状态, 产出的事件列表)
         """
         action_str = (action or "").strip().lower()
         internal = self._to_internal(state, action_str, original_request)
@@ -467,5 +514,5 @@ class SkillCreationGraph:
 
         self._state = self._to_external(result)
 
-        for event in result.get("events", []):
-            yield event
+        events = list(result.get("events", []))
+        return self._state, events

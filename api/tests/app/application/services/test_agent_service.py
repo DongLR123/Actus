@@ -120,7 +120,6 @@ async def test_chat_polling_does_not_block_when_no_output_event(monkeypatch) -> 
         a2a_config=A2AConfig(),
         sandbox_cls=object,
         task_cls=_DummyTaskClass,
-        json_parser=object(),
         search_engine=object(),
         file_storage=object(),
     )
@@ -177,7 +176,6 @@ async def test_chat_with_message_yields_user_message_event_immediately(monkeypat
         a2a_config=A2AConfig(),
         sandbox_cls=object,
         task_cls=_DummyTaskClass,
-        json_parser=object(),
         search_engine=object(),
         file_storage=object(),
     )
@@ -231,7 +229,6 @@ async def test_chat_with_message_forbidden_in_takeover_states(
         a2a_config=A2AConfig(),
         sandbox_cls=object,
         task_cls=_DummyTaskClass,
-        json_parser=object(),
         search_engine=object(),
         file_storage=object(),
     )

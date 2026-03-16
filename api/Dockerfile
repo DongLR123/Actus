@@ -4,9 +4,15 @@ FROM python:3.12-slim
 # 2.配置容器工作空间
 WORKDIR /app
 
+# 额外的 Python 包索引，默认使用国内镜像以降低构建阶段超时概率
+ARG PYTHON_PACKAGE_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV UV_DEFAULT_INDEX=${PYTHON_PACKAGE_INDEX_URL}
+ENV PIP_INDEX_URL=${PYTHON_PACKAGE_INDEX_URL}
+
 # 3.安装curl + docker-cli
-# docker-cli用于运行stdio类MCP服务（例如command=docker的notion服务）
-RUN apt-get update && apt-get install -y curl docker.io
+# 仅保留 Docker CLI，避免把 daemon/containerd 一并装进镜像导致内存占用过高
+RUN apt-get update && apt-get install -y --no-install-recommends curl docker-cli && \
+    rm -rf /var/lib/apt/lists/*
 
 # 4.安装v22版本的node.js
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \

@@ -5,12 +5,15 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import re
 import shlex
 import tempfile
 from pathlib import Path
 from typing import AsyncGenerator
 
-from app.domain.external.llm import LLM
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from app.domain.external.sandbox import Sandbox
 from app.domain.models.skill import SkillSourceType
 from app.domain.models.skill_creator import (
@@ -28,12 +31,16 @@ logger = logging.getLogger(__name__)
 MAX_FIX_RETRIES = 2
 
 ANALYZE_SYSTEM_PROMPT = """\
-你是 Skill 架构师。请将用户自然语言需求解析为严格 JSON。
+你是 Skill 架构师。你的任务是：将用户的"创建 Skill"需求解析为结构化 JSON 蓝图。
+
+⚠️ 重要区分：你在**设计 Skill 的架构蓝图**，而不是执行 Skill 描述的功能。
+例如用户说"创建一个翻译工具 Skill"，你应该输出翻译工具的架构蓝图（包含工具名、参数定义等），
+而不是执行翻译操作。用户消息中的示例数据（如 URL、文本）仅用于理解需求，不要把它们当作实际输入。
 
 必须严格遵循以下 JSON 结构（注意字段名必须完全一致）：
 {
-  "skill_name": "Skill 名称",
-  "description": "功能描述",
+  "skill_name": "english-kebab-case-name",
+  "description": "该 Skill 的功能描述",
   "tools": [
     {
       "name": "tool_function_name",
@@ -48,9 +55,9 @@ ANALYZE_SYSTEM_PROMPT = """\
 }
 
 关键约束：
-- 顶层字段必须是 skill_name（不是 name/skill/title）
+- 顶层字段必须是 skill_name（不是 name/skill/title），使用英文 kebab-case
 - 直接返回 JSON 对象，不要嵌套在其他键下
-- 仅返回 JSON，不要返回其他文本"""
+- 仅返回上述结构的 JSON，不要返回其他文本或执行实际操作"""
 
 GENERATE_SYSTEM_PROMPT = """\
 你是 Skill 代码生成器。请根据需求蓝图和 GitHub 调研结果，生成可安装的 Native Skill。
@@ -132,12 +139,144 @@ policy:
 只返回 JSON，不要返回其他文字。"""
 
 
+def _parse_llm_json(text: str) -> dict:
+    """从 LLM 文本响应中提取 JSON 对象。
+
+    处理常见格式：
+    - 纯 JSON
+    - ```json ... ``` markdown 代码块
+    - 混合文本中的 JSON 对象
+    """
+    text = text.strip()
+
+    # 1. 尝试直接解析
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. 提取 markdown 代码块中的 JSON
+    md_match = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
+    if md_match:
+        try:
+            return json.loads(md_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    # 3. 找到第一个 { 到最后一个 } 之间的内容
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace != -1 and last_brace > first_brace:
+        try:
+            return json.loads(text[first_brace : last_brace + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # 4. 使用 json_repair 库兜底
+    try:
+        from json_repair import repair_json
+        repaired = repair_json(text, return_objects=True)
+        if isinstance(repaired, dict):
+            return repaired
+    except Exception:
+        pass
+
+    raise ValueError(f"无法从 LLM 响应中提取 JSON（前 200 字符）: {text[:200]}")
+
+
+def _validate_generated_files(files: SkillGeneratedFiles) -> None:
+    """校验 LLM 生成结果的结构完整性。
+
+    检查 LLM 是否真正生成了可执行的 Skill 文件，而不是仅返回文档或 JSON 描述符。
+    """
+    errors: list[str] = []
+
+    # 1. manifest 不能是空壳（LLM 未生成 manifest 时会 fallback 为 {}）
+    if not files.manifest or not any(
+        k in files.manifest for k in ("name", "tools", "runtime_type")
+    ):
+        errors.append("manifest 为空或缺少关键字段（name/tools/runtime_type）")
+
+    # 2. 必须有 bundle/ 下的 Python 脚本
+    py_scripts = [s for s in files.scripts if s.path.endswith(".py")]
+    bundle_scripts = [s for s in py_scripts if s.path.startswith("bundle/")]
+    if not bundle_scripts:
+        errors.append(
+            f"缺少 bundle/*.py 可执行脚本（当前 scripts: "
+            f"{[s.path for s in files.scripts] or '无'}）"
+        )
+
+    # 3. dependencies 应为 pip 包名，不应为中文描述
+    non_pip_deps = [
+        d for d in files.dependencies
+        if any('\u4e00' <= c <= '\u9fff' for c in d)
+    ]
+    if non_pip_deps:
+        errors.append(
+            f"dependencies 应为 pip 包名，不应为中文描述: {non_pip_deps[:3]}"
+        )
+
+    # 4. skill_md 不应为空
+    if not files.skill_md.strip():
+        errors.append("skill_md 为空")
+
+    if errors:
+        raise ValueError(
+            f"LLM 生成结果不符合 Skill 结构要求（{len(errors)} 个问题）：\n"
+            + "\n".join(f"- {e}" for e in errors)
+        )
+
+
+_SAMPLE_VALUES = {
+    "string": "test",
+    "str": "test",
+    "number": 1,
+    "integer": 1,
+    "int": 1,
+    "float": 1.0,
+    "boolean": True,
+    "bool": True,
+    "array": [],
+    "list": [],
+    "object": {},
+    "dict": {},
+}
+
+
+def _build_sample_input(tool_def: dict) -> dict:
+    """根据 manifest tool 定义构造最小测试 JSON 输入。"""
+    params_raw = tool_def.get("parameters", {})
+    required_raw = tool_def.get("required", [])
+    required_names = set(required_raw) if isinstance(required_raw, list) else set()
+
+    sample: dict = {}
+
+    # parameters 可能是 {"param": {type, desc}} 或 [{name, type, desc, required}]
+    if isinstance(params_raw, dict):
+        for name, spec in params_raw.items():
+            if not isinstance(spec, dict):
+                continue
+            param_type = str(spec.get("type", "string")).lower()
+            sample[name] = _SAMPLE_VALUES.get(param_type, "test")
+    elif isinstance(params_raw, list):
+        for spec in params_raw:
+            if not isinstance(spec, dict):
+                continue
+            name = spec.get("name", "")
+            if not name:
+                continue
+            param_type = str(spec.get("type", "string")).lower()
+            sample[name] = _SAMPLE_VALUES.get(param_type, "test")
+
+    return sample
+
+
 class SkillCreatorService:
     """五步流水线：分析、调研、生成、验证、安装。"""
 
     def __init__(
         self,
-        llm: LLM,
+        llm: BaseChatModel,
         github_client: GitHubSearchClient,
         skill_service,
     ) -> None:
@@ -300,27 +439,23 @@ class SkillCreatorService:
 
     async def _analyze_requirement(self, description: str) -> SkillBlueprint:
         import asyncio
-        from pydantic import ValidationError
-        from app.application.errors.exceptions import ServerRequestsError
+
+        messages = [
+            SystemMessage(content=ANALYZE_SYSTEM_PROMPT),
+            HumanMessage(content=description),
+        ]
+        structured = self._llm.with_structured_output(SkillBlueprint)
 
         last_exc: Exception | None = None
         for attempt in range(3):
             try:
-                response = await self._llm.invoke(
-                    messages=[
-                        {"role": "system", "content": ANALYZE_SYSTEM_PROMPT},
-                        {"role": "user", "content": description},
-                    ],
-                    response_format={"type": "json_object"},
-                )
-                payload = self._parse_llm_json(response)
-                return SkillBlueprint.model_validate(payload)
-            except (ServerRequestsError, json.JSONDecodeError, ValidationError) as exc:
+                return await structured.ainvoke(messages)
+            except Exception as exc:
                 last_exc = exc
                 if attempt < 2:
                     delay = 2 * (2 ** attempt)
                     logger.warning(
-                        "蓝图分析 LLM 调用失败 (attempt %d/3), %ds 后重试: %s",
+                        "蓝图分析失败 (attempt %d/3), %ds 后重试: %s",
                         attempt + 1, delay, exc,
                     )
                     await asyncio.sleep(delay)
@@ -338,6 +473,16 @@ class SkillCreatorService:
         blueprint: SkillBlueprint,
         research_report: str,
     ) -> SkillGeneratedFiles:
+        """调用 LLM 生成 Skill 文件集合。
+
+        使用双路策略确保 LLM 同时遵循结构约束和内容约束：
+        1. with_structured_output(SkillGeneratedFiles) 保证返回 JSON 结构
+           （Field descriptions 携带 manifest/bundle/pip 等格式要求）
+        2. GENERATE_SYSTEM_PROMPT 提供详细的格式说明和代码示例
+        3. _validate_generated_files 做结构校验，不通过则重试
+        """
+        import asyncio
+
         tool_payload = [tool.model_dump() for tool in blueprint.tools]
         prompt = (
             "## 需求蓝图\n"
@@ -347,33 +492,64 @@ class SkillCreatorService:
             f"- 依赖: {json.dumps(blueprint.estimated_deps, ensure_ascii=False)}\n\n"
             f"{research_report}"
         )
-        response = await self._llm.invoke(
-            messages=[
-                {"role": "system", "content": GENERATE_SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-        )
-        payload = self._parse_llm_json(response)
-        return SkillGeneratedFiles(
-            skill_md=str(payload.get("skill_md") or ""),
-            manifest=dict(payload.get("manifest") or {}),
-            scripts=[ScriptFile.model_validate(item) for item in payload.get("scripts", [])],
-            dependencies=[
-                str(dep).strip()
-                for dep in payload.get("dependencies", [])
-                if str(dep).strip()
-            ],
-        )
+        messages = [
+            SystemMessage(content=GENERATE_SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ]
+
+        # 优先 with_structured_output（强制 JSON），失败时回退 ainvoke + JSON 解析
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                if attempt < 2:
+                    # 前两次用 with_structured_output（tool call 强制 JSON）
+                    structured = self._llm.with_structured_output(SkillGeneratedFiles)
+                    files: SkillGeneratedFiles = await structured.ainvoke(messages)
+                else:
+                    # 最后一次回退：直接 ainvoke + JSON 解析
+                    response = await self._llm.ainvoke(
+                        messages,
+                        response_format={"type": "json_object"},
+                    )
+                    text = response.content if hasattr(response, "content") else str(response)
+                    parsed = _parse_llm_json(text)
+                    files = SkillGeneratedFiles.model_validate(parsed)
+
+                # 结构化校验：LLM 必须生成有效的可执行 Skill
+                _validate_generated_files(files)
+
+                return files
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    delay = 2 * (2 ** attempt)
+                    logger.warning(
+                        "Skill 文件生成失败 (attempt %d/3), %ds 后重试: %s",
+                        attempt + 1, delay, exc,
+                    )
+                    await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
     async def _validate_in_sandbox(
         self,
         files: SkillGeneratedFiles,
         sandbox: Sandbox,
     ) -> list[str]:
+        """沙箱端到端验证：语法 → 部署 → 依赖安装 → --help → 烟雾测试。
+
+        烟雾测试会用 manifest 中每个工具的参数构造最小 JSON 输入，
+        实际执行脚本并检查是否能跑通（输出 JSON / 不崩溃）。
+        """
         errors: list[str] = []
 
+        # ---- 1. 语法检查 ---- #
         for script in files.scripts:
+            if not script.path.endswith(".py"):
+                errors.append(
+                    f"脚本 {script.path} 不是 Python 文件，"
+                    "entry.command 要求 bundle/*.py 格式"
+                )
+                continue
             try:
                 ast.parse(script.content)
             except SyntaxError as exc:
@@ -381,13 +557,14 @@ class SkillCreatorService:
         if errors:
             return errors
 
+        # ---- 2. 部署到沙箱 ---- #
         session_id = "skill_creator_validate"
         skill_root = "/tmp/skill_creator_validate"
 
         mkdir_result = await sandbox.exec_command(
             session_id=session_id,
             exec_dir="/tmp",
-            command=f"mkdir -p {skill_root}/bundle",
+            command=f"rm -rf {skill_root} && mkdir -p {skill_root}/bundle",
         )
         if not mkdir_result.success:
             errors.append(f"创建验证目录失败: {mkdir_result.message or ''}".strip())
@@ -404,6 +581,7 @@ class SkillCreatorService:
                 )
                 return errors
 
+        # ---- 3. 依赖安装 ---- #
         if files.dependencies:
             deps_str = " ".join(shlex.quote(dep) for dep in files.dependencies)
             install_result = await sandbox.exec_command(
@@ -415,6 +593,7 @@ class SkillCreatorService:
                 errors.append(f"依赖安装失败: {install_result.message or ''}".strip())
                 return errors
 
+        # ---- 4. --help 测试 ---- #
         for script in files.scripts:
             run_result = await sandbox.exec_command(
                 session_id=session_id,
@@ -422,8 +601,85 @@ class SkillCreatorService:
                 command=f"python {shlex.quote(script.path)} --help",
             )
             if not run_result.success:
-                errors.append(f"脚本运行失败 ({script.path}): {run_result.message or ''}".strip())
+                errors.append(f"脚本 --help 失败 ({script.path}): {run_result.message or ''}".strip())
                 return errors
+
+        # ---- 5. 烟雾测试：用最小输入实际运行每个工具 ---- #
+        smoke_errors = await self._smoke_test_tools(files, sandbox, session_id, skill_root)
+        errors.extend(smoke_errors)
+
+        return errors
+
+    async def _smoke_test_tools(
+        self,
+        files: SkillGeneratedFiles,
+        sandbox: Sandbox,
+        session_id: str,
+        skill_root: str,
+    ) -> list[str]:
+        """对 manifest 中每个 tool 做实际运行烟雾测试。
+
+        根据 tool 的 parameters 构造最小 JSON 输入，执行 entry.command，
+        验证脚本能正常启动、处理输入并输出 JSON。
+        """
+        errors: list[str] = []
+        manifest_tools = files.manifest.get("tools", [])
+        if not manifest_tools:
+            return errors
+
+        for tool_def in manifest_tools:
+            if not isinstance(tool_def, dict):
+                continue
+            tool_name = tool_def.get("name", "unknown")
+            entry = tool_def.get("entry", {})
+            command = entry.get("command", "") if isinstance(entry, dict) else ""
+            if not command:
+                continue
+
+            # 构造最小测试输入
+            sample_input = _build_sample_input(tool_def)
+            sample_json = json.dumps(sample_input, ensure_ascii=False)
+
+            # 执行: python bundle/tool.py '{"param": "test"}'
+            full_cmd = f"{command} {shlex.quote(sample_json)}"
+            run_result = await sandbox.exec_command(
+                session_id=session_id,
+                exec_dir=skill_root,
+                command=full_cmd,
+            )
+
+            output = (run_result.message or "").strip()
+
+            if not run_result.success:
+                errors.append(
+                    f"工具 {tool_name} 烟雾测试失败 "
+                    f"(cmd: {command}):\n{output[:500]}"
+                )
+                continue
+
+            # 检查 stdout 是否包含 JSON 输出
+            if not output:
+                errors.append(
+                    f"工具 {tool_name} 烟雾测试无输出 "
+                    f"(预期输出 JSON 到 stdout)"
+                )
+                continue
+
+            # 尝试解析 JSON（允许输出中有前缀日志，取最后一行）
+            json_found = False
+            for line in reversed(output.splitlines()):
+                line = line.strip()
+                if line.startswith(("{", "[")):
+                    try:
+                        json.loads(line)
+                        json_found = True
+                        break
+                    except json.JSONDecodeError:
+                        pass
+            if not json_found:
+                errors.append(
+                    f"工具 {tool_name} 烟雾测试输出非 JSON:\n{output[:300]}"
+                )
 
         return errors
 
@@ -465,65 +721,3 @@ class SkillCreatorService:
                 installed_by=installed_by,
             )
 
-    @staticmethod
-    def _parse_llm_json(response: dict) -> dict:
-        content = response.get("content", "{}")
-        if isinstance(content, dict):
-            return content
-        text = str(content or "{}").strip()
-
-        # 剥离 markdown 代码块（支持 ```json 或 ```）
-        if "```" in text:
-            import re
-            m = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
-            if m:
-                text = m.group(1).strip()
-
-        # 快速尝试：直接解析
-        try:
-            return json.loads(text or "{}")
-        except json.JSONDecodeError:
-            pass
-
-        # 从混合文本中提取第一个完整的 JSON 对象
-        brace_start = text.find("{")
-        if brace_start != -1:
-            depth = 0
-            in_string = False
-            escape_next = False
-            for i in range(brace_start, len(text)):
-                ch = text[i]
-                if escape_next:
-                    escape_next = False
-                    continue
-                if ch == "\\":
-                    escape_next = True
-                    continue
-                if ch == '"' and not escape_next:
-                    in_string = not in_string
-                    continue
-                if in_string:
-                    continue
-                if ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        candidate = text[brace_start:i + 1]
-                        try:
-                            return json.loads(candidate)
-                        except json.JSONDecodeError:
-                            break
-
-        # 最终降级：使用 json_repair 尝试修复
-        import json_repair
-        logger.warning("LLM 返回内容无法直接解析为 JSON，尝试 json_repair: %s", text[:200])
-        result = json_repair.repair_json(text, ensure_ascii=False, return_objects=True)
-        if isinstance(result, dict):
-            return result
-
-        raise json.JSONDecodeError(
-            f"无法从 LLM 响应中提取有效 JSON（内容前 200 字符: {text[:200]}）",
-            text or "",
-            0,
-        )

@@ -101,10 +101,9 @@ class MockCreateSkillTool:
 # --------------------------------------------------------------------------- #
 
 
-async def collect_events(gen) -> list[BaseEvent]:
-    events = []
-    async for event in gen:
-        events.append(event)
+async def collect_events(coro) -> list[BaseEvent]:
+    """run() 现在返回 (SkillGraphState, list[BaseEvent])，提取事件列表。"""
+    _state, events = await coro
     return events
 
 

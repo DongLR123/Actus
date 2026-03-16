@@ -10,7 +10,7 @@ GENERATE_SUMMARY_PROMPT = """
 要求：
 - 使用与用户相同的语言
 - 摘要必须简洁，每个字段不超过一句话
-- execution_results 应列出关键执行结果（最多5条）
+- execution_results 应列出关键执行结果（最多5条），**必须包含生成的文件路径**（如 /home/ubuntu/report.md）
 - decisions 应列出重要的决策点
 - unresolved 应列出未解决的问题（如无则留空数组）
 
@@ -37,7 +37,7 @@ JSON 输出示例：
 {{
   "user_intent": "分析CSV文件的销售趋势",
   "plan_summary": "读取文件并生成按月汇总的折线图",
-  "execution_results": ["成功读取sales.csv", "生成了月度折线图"],
+  "execution_results": ["成功读取sales.csv", "生成了月度折线图 /home/ubuntu/chart.png"],
   "decisions": ["选择按月聚合而非按周"],
   "unresolved": []
 }}

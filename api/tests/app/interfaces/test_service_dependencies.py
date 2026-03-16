@@ -19,8 +19,13 @@ class _FakeAppConfigRepository:
 
 
 class _FakeLLM:
-    def __init__(self, llm_config: LLMConfig) -> None:
-        self.llm_config = llm_config
+    """Fake LLM that captures the keyword arguments passed to ActusChatModel."""
+
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = kwargs
+
+    def with_fallbacks(self, fallbacks):
+        return self
 
 
 class _FakeFileStorage:
@@ -67,7 +72,8 @@ def test_get_agent_service_builds_context_overflow_config_from_llm(monkeypatch) 
         "FileAppConfigRepository",
         lambda *args, **kwargs: _FakeAppConfigRepository(app_config),
     )
-    monkeypatch.setattr(service_dependencies, "OpenAILLM", _FakeLLM)
+    monkeypatch.setattr(service_dependencies, "ActusChatModel", _FakeLLM)
+    monkeypatch.setattr(service_dependencies, "ActusResponsesModel", _FakeLLM)
     monkeypatch.setattr(service_dependencies, "MinioFileStorage", _FakeFileStorage)
     monkeypatch.setattr(service_dependencies, "AgentService", _CapturedAgentService)
 
@@ -109,7 +115,8 @@ def test_get_agent_service_builds_dedicated_summary_llm(monkeypatch) -> None:
         "FileAppConfigRepository",
         lambda *args, **kwargs: _FakeAppConfigRepository(app_config),
     )
-    monkeypatch.setattr(service_dependencies, "OpenAILLM", _FakeLLM)
+    monkeypatch.setattr(service_dependencies, "ActusChatModel", _FakeLLM)
+    monkeypatch.setattr(service_dependencies, "ActusResponsesModel", _FakeLLM)
     monkeypatch.setattr(service_dependencies, "MinioFileStorage", _FakeFileStorage)
     monkeypatch.setattr(service_dependencies, "AgentService", _CapturedAgentService)
 
@@ -117,4 +124,4 @@ def test_get_agent_service_builds_dedicated_summary_llm(monkeypatch) -> None:
     summary_llm = service.kwargs["summary_llm"]
 
     assert isinstance(summary_llm, _FakeLLM)
-    assert summary_llm.llm_config.model_name == "gpt-4o-mini"
+    assert summary_llm.kwargs["model_name"] == "gpt-4o-mini"

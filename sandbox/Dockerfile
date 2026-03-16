@@ -57,6 +57,10 @@ ENV LANG=zh_CN.UTF-8 \
 # 11.设置工作空间
 WORKDIR /sandbox
 
+# 额外的 Python 包索引，默认使用国内镜像以降低构建阶段超时概率
+ARG PYTHON_PACKAGE_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV PIP_INDEX_URL=${PYTHON_PACKAGE_INDEX_URL}
+
 # 12.拷贝项目依赖文件到工作空间并安装依赖
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt

@@ -73,7 +73,7 @@ class Settings(BaseSettings):
     feature_takeover_lease_guard_interval_seconds: int = 15
 
     # Skill 创建子图灰度配置
-    skill_graph_canary_percent: int = 0  # 0-100，按 user_id 哈希分桶
+    skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶
 
     # JWT 配置
     jwt_secret_key: str = "change-me-in-env"

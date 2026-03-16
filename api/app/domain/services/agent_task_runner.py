@@ -11,13 +11,13 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import AsyncGenerator, BinaryIO, Callable, List
 
+from langchain_core.language_models import BaseChatModel
+
 from app.application.services.continuation_intent_classifier import (
     ContinuationIntentClassifier,
 )
 from app.domain.external.browser import Browser
 from app.domain.external.file_storage import FileStorage
-from app.domain.external.json_parser import JSONParser
-from app.domain.external.llm import LLM
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 from app.domain.external.task import Task, TaskRunner
@@ -123,7 +123,7 @@ class AgentTaskRunner(TaskRunner):
     def __init__(
         self,
         uow_factory: Callable[[], IUnitOfWork],
-        llm: LLM,  # 大语言模型
+        llm: BaseChatModel,  # 大语言模型
         agent_config: AgentConfig,  # 智能体配置
         mcp_config: MCPConfig,  # mcp配置
         a2a_config: A2AConfig,  # a2a配置
@@ -132,19 +132,17 @@ class AgentTaskRunner(TaskRunner):
         # session_repository: SessionRepository,  # 会话仓库
         file_storage: FileStorage,  # 文件存储桶
         # file_repository: FileRepository,  # 文件数据仓库
-        json_parser: JSONParser,  # json解析器
         browser: Browser,  # 浏览器
         search_engine: SearchEngine,  # 搜索引擎
         sandbox: Sandbox,  # 沙箱
         skill_creator_service=None,  # skill创建服务
         skill_risk_policy: SkillRiskPolicy | None = None,  # skill风险策略
         overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
-        summary_llm: LLM | None = None,  # 摘要生成模型
+        summary_llm: BaseChatModel | None = None,  # 摘要生成模型
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         self._agent_config = agent_config
         self._llm = llm
-        self._json_parser = json_parser
         self._uow_factory = uow_factory
         self._uow = uow_factory()
         self._session_id = session_id
@@ -197,7 +195,6 @@ class AgentTaskRunner(TaskRunner):
         )
         self._continuation_classifier = ContinuationIntentClassifier(
             llm=llm,
-            json_parser=json_parser,
             timeout_seconds=self._skill_selection_policy.continuation_llm_timeout_seconds,
         )
         self._continuation_phrases = {
@@ -228,8 +225,6 @@ class AgentTaskRunner(TaskRunner):
             llm=llm,
             agent_config=agent_config,
             session_id=session_id,
-            # session_repository=session_repository,
-            json_parser=json_parser,
             browser=browser,
             sandbox=sandbox,
             search_engine=search_engine,
@@ -242,6 +237,7 @@ class AgentTaskRunner(TaskRunner):
             summary_llm=summary_llm,
             user_id=self._user_id or "",
             skill_graph_canary_percent=settings.skill_graph_canary_percent,
+            db_url=settings.sqlalchemy_database_url,
         )
 
     async def _put_and_add_event(
@@ -261,6 +257,10 @@ class AgentTaskRunner(TaskRunner):
         self, event: MessageEvent
     ) -> AsyncGenerator[MessageEvent, None]:
         """将助手消息切片成可增量渲染的事件流，提升前端流式观感"""
+        # 已携带 stream_id（如来自 summarizer 流式推送）→ 直接透传，不重新切片
+        if event.stream_id:
+            yield event
+            return
         text = event.message or ""
         if not text or len(text) <= MESSAGE_STREAM_CHUNK_SIZE:
             event.stream_id = event.stream_id or str(uuid.uuid4())
@@ -1058,10 +1058,13 @@ class AgentTaskRunner(TaskRunner):
             # 1.如果事件状态为已调用则执行以下代码
             if event.status == ToolEventStatus.CALLED:
                 category = self._classify_tool_name(event.tool_name)
+                print(f"[SNAPSHOT-DEBUG] 处理工具事件: tool_name={event.tool_name}, function={event.function_name}, category={category}", flush=True)
                 # 2.工具为浏览器则补全工具浏览器工具内容
                 if category == "browser":
+                    screenshot_url = await self._get_browser_screenshot()
+                    print(f"[SNAPSHOT-DEBUG] 浏览器截图完成: url={screenshot_url[:80] if screenshot_url else '(empty)'}", flush=True)
                     event.tool_content = BrowserToolContent(
-                        screenshot=await self._get_browser_screenshot(),
+                        screenshot=screenshot_url,
                     )
                 elif category == "search":
                     # 3.工具为搜索则添加搜索工具内容
@@ -1085,8 +1088,10 @@ class AgentTaskRunner(TaskRunner):
                     shell_result = await self._sandbox.read_shell_output(
                         session_id, console=True,
                     )
+                    console_records = (shell_result.data or {}).get("console_records", [])
+                    print(f"[SNAPSHOT-DEBUG] Shell控制台记录: session={session_id}, records={len(console_records) if console_records else 0}", flush=True)
                     event.tool_content = ShellToolContent(
-                        console=(shell_result.data or {}).get("console_records", [])
+                        console=console_records
                     )
                 elif category == "file":
                     # 5.工具为file则将文件同步到对象存储
@@ -1185,6 +1190,9 @@ class AgentTaskRunner(TaskRunner):
                             skill_result="(Skill Creator 工具无可用结果)"
                         )
         except Exception as e:
+            import traceback
+            print(f"[SNAPSHOT-DEBUG] ❌ AgentTaskRunner生成工具内容失败: {e}", flush=True)
+            traceback.print_exc()
             logger.exception(f"AgentTaskRunner生成工具内容失败: {str(e)}")
 
     async def _run_flow(self, message: Message) -> AsyncGenerator[BaseEvent, None]:
@@ -1200,6 +1208,8 @@ class AgentTaskRunner(TaskRunner):
             # 3.判断是否为工具事件，如果是则额外处理
             if isinstance(event, ToolEvent):
                 await self._handle_tool_event(event)
+                if event.status == ToolEventStatus.CALLED:
+                    print(f"[SNAPSHOT-DEBUG] enrichment结果: tool_name={event.tool_name}, function={event.function_name}, tool_content={type(event.tool_content).__name__}, is_none={event.tool_content is None}", flush=True)
             elif isinstance(event, MessageEvent):
                 # 4.如果是消息事件则将AI消息事件中的附件同步到存储中
                 await self._sync_message_attachments_to_storage(event)
@@ -1394,10 +1404,12 @@ class AgentTaskRunner(TaskRunner):
                 self._step_skill_state = None
 
             # 14.更新会话状态为已完成
+            print(f"[STATUS-DEBUG] 即将更新会话状态为COMPLETED: session={self._session_id}", flush=True)
             async with self._uow:
                 await self._uow.session.update_status(
                     self._session_id, SessionStatus.COMPLETED
                 )
+            print(f"[STATUS-DEBUG] 会话状态已更新为COMPLETED", flush=True)
         except asyncio.CancelledError:
             # 15.异步任务被取消，根据取消原因分流处理
             cancel_reason = getattr(task, "cancel_reason", "stop")

@@ -10,19 +10,21 @@ Reference: docs/plans/2026-03-10-langchain-langgraph-migration-design.md §4.1-4
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
+import uuid
 from typing import Any, Callable, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import RetryPolicy
+from langgraph.types import RetryPolicy, interrupt
+
+from langchain_core.language_models import BaseChatModel
 
 from app.application.errors.exceptions import ServerRequestsError
-from app.domain.external.json_parser import JSONParser
-from app.domain.external.llm import LLM
+from app.domain.models.file import File
+from app.domain.models.llm_responses import PlanResponse, PlanUpdateResponse, StepDef, SummarizerOutput
 from app.domain.models.event import (
     DoneEvent,
     MessageEvent,
@@ -37,7 +39,7 @@ from app.domain.models.plan import ExecutionStatus, Plan, Step
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.flows.base import FlowStatus
 
-from .message_utils import messages_to_dicts
+from .message_utils import dedup_messages
 from .state import MainGraphState
 
 logger = logging.getLogger(__name__)
@@ -86,25 +88,25 @@ def _compact_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
 
 
 def build_main_graph(
-    planner_llm: LLM,
+    planner_llm: BaseChatModel,
     react_graph: Any,  # compiled react_graph
-    json_parser: JSONParser,
-    summary_llm: LLM,
+    summary_llm: BaseChatModel,
     uow_factory: Callable[[], IUnitOfWork],
     session_id: str,
     agent_config: Any = None,
     prompts: Any = None,
+    checkpointer: Any = None,
 ) -> Any:
     """Build and compile the main orchestration graph.
 
     Parameters
     ----------
-    planner_llm : LLM for plan generation/update.
+    planner_llm : BaseChatModel for plan generation/update (structured output).
     react_graph : Compiled react_graph for step execution.
-    json_parser : JSON parser for extracting plan from LLM response.
-    summary_llm : LLM for summary generation.
+    summary_llm : BaseChatModel for summary generation (streaming via astream).
     uow_factory : Factory for UoW instances.
     session_id : Current session ID.
+    checkpointer : LangGraph checkpointer for interrupt/resume support.
     """
     from app.domain.services.prompts.planner import PLANNER_SYSTEM_PROMPT, CREATE_PLAN_PROMPT, UPDATE_PLAN_PROMPT
 
@@ -133,38 +135,35 @@ def build_main_graph(
         if conversation_summaries:
             system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(conversation_summaries)
 
-        # planner_llm is the raw Actus LLM (not LangChain adapter) — uses dict messages
-        response = await planner_llm.invoke(
-            messages=[
-                {"role": "system", "content": system_content},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-        )
+        # Use structured output via LangChain BaseChatModel
+        messages = [
+            SystemMessage(content=system_content),
+            HumanMessage(content=prompt),
+        ]
+        structured_llm = planner_llm.with_structured_output(PlanResponse)
 
-        content = response.get("content", "")
-        parsed = await json_parser.invoke(content)
-
-        if not isinstance(parsed, dict):
-            # Fallback: single-step plan
-            parsed = {
-                "title": "Task",
-                "goal": state["message"],
-                "language": state.get("language", "zh"),
-                "steps": [{"description": state["message"]}],
-                "message": "好的，我来帮你处理。",
-            }
+        try:
+            parsed: PlanResponse = await structured_llm.ainvoke(messages)
+        except Exception:
+            logger.warning("Planner structured output failed, using fallback plan")
+            parsed = PlanResponse(
+                title="Task",
+                goal=state["message"],
+                language=state.get("language", "zh"),
+                steps=[StepDef(description=state["message"])],
+                message="好的，我来帮你处理。",
+            )
 
         steps = [
-            Step(description=s.get("description", ""))
-            for s in parsed.get("steps", [])
+            Step(description=s.description)
+            for s in parsed.steps
         ]
         plan = Plan(
-            title=parsed.get("title", "Task"),
-            goal=parsed.get("goal", state["message"]),
-            language=parsed.get("language", state.get("language", "zh")),
+            title=parsed.title or "Task",
+            goal=parsed.goal or state["message"],
+            language=parsed.language or state.get("language", "zh"),
             steps=steps,
-            message=parsed.get("message", ""),
+            message=parsed.message or "",
             status=ExecutionStatus.RUNNING,
         )
 
@@ -207,8 +206,11 @@ def build_main_graph(
                 "messages": state.get("messages", []),
             }
 
-        # Emit StepEvent(STARTED) immediately
-        await _emit(StepEvent(step=step, status=StepEventStatus.STARTED))
+        resume_value = state.get("resume_value")
+
+        # Emit StepEvent(STARTED) — skip on resume to avoid duplicate events
+        if resume_value is None:
+            await _emit(StepEvent(step=step, status=StepEventStatus.STARTED))
 
         # Build initial messages with system prompt + execution prompt
         attachments = state.get("attachments", [])
@@ -224,14 +226,12 @@ def build_main_graph(
         if conversation_summaries:
             system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(conversation_summaries)
 
-        # 三分支 messages 构建逻辑（使用 LangChain 消息类型）
-        is_resuming = state.get("is_resuming", False)
+        # 两分支 messages 构建逻辑（使用 LangChain 消息类型）
+        # resume_value 由 interrupt_node 在恢复时设置，或由 DB fallback 路径直接注入
         saved_messages: list[BaseMessage] = state.get("messages") or []
 
-        if is_resuming and saved_messages:
-            # 中断恢复：保留消息 + 追加恢复提示
-            # 检查中断类型：如果最后一条 ToolMessage 是 message_ask_user 的回复，
-            # 说明是用户回答问题（非浏览器/终端接管），使用不同的提示措辞
+        if resume_value is not None:
+            # Resume path: messages 已由 checkpointer 保存，追加用户回复
             last_tool = next(
                 (m for m in reversed(saved_messages)
                  if isinstance(m, ToolMessage) and m.name == "message_ask_user"),
@@ -240,12 +240,12 @@ def build_main_graph(
             if last_tool is not None:
                 resume_hint = (
                     f"用户已回复你之前的提问。请根据用户回复继续执行当前步骤：{step.description}\n"
-                    f"用户回复：{state['message']}"
+                    f"用户回复：{resume_value}"
                 )
             else:
                 resume_hint = (
                     f"用户已完成接管并交还控制。请继续执行当前步骤：{step.description}\n"
-                    f"用户消息：{state['message']}"
+                    f"用户消息：{resume_value}"
                 )
             initial_messages = saved_messages + [HumanMessage(content=resume_hint)]
         elif saved_messages:
@@ -283,40 +283,47 @@ def build_main_graph(
             "attachments": attachments,
             "events": [],
             "should_interrupt": False,
+            "soft_hint_sent": False,
             "attempt_count": 0,
             "failure_count": 0,
         }
 
-        # Stream react_graph — emit events in real-time
-        # 注意：should_interrupt 需要单独跟踪，避免后续 chunk 覆盖
+        # Stream react_graph — emit events in real-time.
+        # ReactGraphState.messages uses add_messages reducer, so astream
+        # (default stream_mode="updates") yields only NEW messages per chunk,
+        # not the full history. We accumulate them manually here.
         react_final: dict[str, Any] = {}
+        all_react_messages: list = []
         seen_interrupt = False
         async for chunk in react_graph.astream(react_input):
             for _node_name, node_output in chunk.items():
                 if not isinstance(node_output, dict):
                     continue
+                # Accumulate messages separately — pop before update to
+                # prevent react_final["messages"] from being overwritten
+                all_react_messages.extend(node_output.pop("messages", []))
                 if node_output.get("should_interrupt"):
                     seen_interrupt = True
                 react_final.update(node_output)
                 # Push react events to frontend immediately
                 for evt in node_output.get("events") or []:
                     await _emit(evt)
+        # Reconstruct full message list: initial input + all new messages,
+        # deduplicating by ID to replicate add_messages semantics.
+        react_final["messages"] = dedup_messages(initial_messages + all_react_messages)
         if seen_interrupt:
             react_final["should_interrupt"] = True
 
-        # Extract execution summary and detect step success from LLM response
+        # Extract execution summary from last AI message
         react_messages: list = react_final.get("messages", [])
-        step_success = True
         summary = ""
         for msg in reversed(react_messages):
             if isinstance(msg, AIMessage) and msg.content:
                 summary = msg.content[:500]
-                try:
-                    result_json = json.loads(msg.content)
-                    step_success = result_json.get("success", True)
-                except (json.JSONDecodeError, TypeError):
-                    pass  # Non-JSON response treated as success
                 break
+
+        # Detect step success from react_graph's accumulated failure_count
+        step_success = react_final.get("failure_count", 0) == 0
 
         # Compact messages to reduce context size for next step
         # (mirrors main-branch compact_memory behaviour)
@@ -335,6 +342,7 @@ def build_main_graph(
                 "current_step": step,
                 "execution_summary": summary,
                 "should_interrupt": True,
+                "resume_value": None,
                 "flow_status": FlowStatus.EXECUTING.value,
                 "original_request": state.get("original_request", ""),
                 "events": [],  # WaitEvent 已通过 _emit 发送，避免重复
@@ -353,6 +361,7 @@ def build_main_graph(
             "messages": final_messages,
             "current_step": step,
             "execution_summary": summary,
+            "resume_value": None,
             "flow_status": FlowStatus.UPDATING.value,
             "events": [],  # already emitted via queue
         }
@@ -403,26 +412,21 @@ def build_main_graph(
                     tool_summary = skill_context[skill_context.index(tool_summary_marker):]
                     system_content += f"\n\n{tool_summary}"
 
-                response = await planner_llm.invoke(
-                    messages=[
-                        {"role": "system", "content": system_content},
-                        {"role": "user", "content": query},
-                    ],
-                    response_format={"type": "json_object"},
-                )
+                update_messages = [
+                    SystemMessage(content=system_content),
+                    HumanMessage(content=query),
+                ]
+                structured_llm = planner_llm.with_structured_output(PlanUpdateResponse)
+                parsed_obj: PlanUpdateResponse = await structured_llm.ainvoke(update_messages)
 
-                content = response.get("content", "")
-                parsed_obj = await json_parser.invoke(content)
-
-                if isinstance(parsed_obj, dict):
-                    new_steps_raw = parsed_obj.get("steps", [])
+                if parsed_obj and parsed_obj.steps:
                     new_steps = [
                         Step(
-                            description=s.get("description", ""),
-                            id=s.get("id", ""),
+                            description=s.description,
+                            id=s.id,
                         )
-                        for s in new_steps_raw
-                        if isinstance(s, dict) and s.get("description")
+                        for s in parsed_obj.steps
+                        if s.description
                     ]
 
                     if new_steps:
@@ -470,54 +474,127 @@ def build_main_graph(
             "events": events,
         }
 
-    async def summarizer_node(state: MainGraphState) -> dict:
-        """Generate final summary and emit completion events."""
+    async def summarizer_node(state: MainGraphState, config: RunnableConfig) -> dict:
+        """Generate final summary with streaming and emit completion events.
+
+        Streams partial MessageEvent chunks via event_queue for real-time
+        frontend updates. The final MessageEvent carries partial=False,
+        the same stream_id, and parsed attachments.
+        """
         from app.domain.services.prompts.react import SUMMARIZE_PROMPT
 
+        event_queue: asyncio.Queue | None = (
+            config.get("configurable", {}).get("event_queue")
+        )
+
+        async def _emit(evt: Any) -> None:
+            if event_queue is not None:
+                await event_queue.put(evt)
+
         plan = state["plan"]
-        events = []
+        events: list = []
 
         if plan:
             # 通过 model_copy 避免直接变异 state 对象
             plan = plan.model_copy(update={"status": ExecutionStatus.COMPLETED})
-            events.append(PlanEvent(plan=plan, status=PlanEventStatus.COMPLETED))
+            plan_evt = PlanEvent(plan=plan, status=PlanEventStatus.COMPLETED)
+            events.append(plan_evt)
+            await _emit(plan_evt)
 
-        # Call LLM to generate a user-facing summary
-        # summary_llm is raw Actus LLM — needs dict messages
-        react_messages: list = state.get("messages", [])
+        # Stream LLM summary to frontend in real-time
+        react_messages: list[BaseMessage] = state.get("messages", [])
+        stream_id = str(uuid.uuid4())
+
         if react_messages:
             try:
-                dict_messages = messages_to_dicts(react_messages) if react_messages else []
-                response = await summary_llm.invoke(
-                    messages=dict_messages + [
-                        {"role": "user", "content": SUMMARIZE_PROMPT},
-                    ],
-                )
-                summary_content = response.get("content", "")
-                if summary_content:
-                    try:
-                        parsed = json.loads(summary_content)
-                        if isinstance(parsed, dict) and parsed.get("message"):
-                            events.append(MessageEvent(
-                                role="assistant",
-                                message=parsed["message"],
-                            ))
-                        else:
-                            events.append(MessageEvent(role="assistant", message=summary_content))
-                    except (json.JSONDecodeError, TypeError):
-                        events.append(MessageEvent(role="assistant", message=summary_content))
-            except Exception as exc:
-                logger.warning(f"Summarizer LLM call failed: {exc}")
+                # summary_llm is BaseChatModel — pass LangChain messages directly
+                messages: list[BaseMessage] = list(react_messages) + [
+                    HumanMessage(content=SUMMARIZE_PROMPT),
+                ]
 
-        events.append(DoneEvent())
+                # Stream with cumulative prefix for frontend
+                chunks: list[str] = []
+                async for chunk in summary_llm.astream(messages):
+                    if chunk.content:
+                        chunks.append(chunk.content)
+                        cumulative_text = "".join(chunks)
+                        await _emit(MessageEvent(
+                            role="assistant",
+                            message=cumulative_text,
+                            stream_id=stream_id,
+                            partial=True,
+                        ))
+
+                full_text = "".join(chunks)
+
+                # Parse {message, attachments} JSON from LLM output
+                summary_text = full_text
+                summary_attachments: list[str] = []
+                if full_text:
+                    try:
+                        parsed = SummarizerOutput.model_validate_json(full_text)
+                        if parsed.message:
+                            summary_text = parsed.message
+                        summary_attachments = [
+                            a for a in parsed.attachments
+                            if isinstance(a, str) and a.strip()
+                        ]
+                    except (ValueError, Exception):
+                        # LLM returned non-JSON or malformed JSON — use raw text
+                        summary_text = full_text
+                        summary_attachments = []
+
+                # Build File attachments
+                file_attachments: list[File] = []
+                for path in summary_attachments:
+                    filename = path.rsplit("/", 1)[-1]
+                    ext = filename.rsplit(".", 1)[-1] if "." in filename else ""
+                    file_attachments.append(File(
+                        filename=filename,
+                        filepath=path,
+                        extension=ext,
+                    ))
+
+                # Final MessageEvent (partial=False, same stream_id, with attachments)
+                final_msg_evt = MessageEvent(
+                    role="assistant",
+                    message=summary_text,
+                    attachments=file_attachments,
+                    stream_id=stream_id,
+                    partial=False,
+                )
+                events.append(final_msg_evt)
+                await _emit(final_msg_evt)
+            except Exception as exc:
+                logger.warning("Summarizer LLM call failed: %s", exc)
+
+        done_evt = DoneEvent()
+        events.append(done_evt)
+        await _emit(done_evt)
 
         result: dict = {
             "flow_status": FlowStatus.COMPLETED.value,
-            "events": events,
+            "events": [],  # events already emitted via queue
         }
         if plan:
             result["plan"] = plan
         return result
+
+    async def interrupt_node(state: MainGraphState) -> dict:
+        """Pause graph execution for user input via LangGraph native interrupt().
+
+        This node is only reached when executor_node sets should_interrupt=True.
+        On resume, interrupt() returns the user's response, which is stored in
+        resume_value for executor_node to consume.
+        """
+        user_response = interrupt({
+            "reason": "user_input_required",
+            "step": state["current_step"].description if state.get("current_step") else "",
+        })
+        return {
+            "resume_value": user_response,
+            "should_interrupt": False,
+        }
 
     # ---- Routing ------------------------------------------------------- #
 
@@ -538,7 +615,7 @@ def build_main_graph(
     def route_after_executor(state: MainGraphState) -> str:
         """Route after step execution."""
         if state.get("should_interrupt"):
-            return END
+            return "interrupt_node"
         status = state.get("flow_status", "")
         if status == FlowStatus.UPDATING.value:
             return "updater_node"
@@ -571,11 +648,13 @@ def build_main_graph(
     g.add_node("executor_node", executor_node)
     g.add_node("updater_node", updater_node)
     g.add_node("summarizer_node", summarizer_node)
+    g.add_node("interrupt_node", interrupt_node)
 
     g.add_conditional_edges(START, route_entry)
     g.add_edge("planner_node", "executor_node")
     g.add_conditional_edges("executor_node", route_after_executor)
+    g.add_edge("interrupt_node", "executor_node")
     g.add_conditional_edges("updater_node", route_after_updater)
     g.add_edge("summarizer_node", END)
 
-    return g.compile()
+    return g.compile(checkpointer=checkpointer)

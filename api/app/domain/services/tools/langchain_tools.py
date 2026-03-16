@@ -18,6 +18,18 @@ from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 
 
+def _unwrap(result: object) -> str:
+    """Convert a ToolResult to string, raising on failure.
+
+    If ``result`` has ``success=False``, raise so that the caller (ToolNode or
+    react_graph tool_node) can handle the error structurally rather than relying
+    on string pattern matching.
+    """
+    if hasattr(result, "success") and not result.success:
+        raise RuntimeError(getattr(result, "message", None) or str(result))
+    return str(result)
+
+
 # --------------------------------------------------------------------------- #
 # Message tools
 # --------------------------------------------------------------------------- #
@@ -68,7 +80,7 @@ def _make_file_tools(sandbox: Sandbox) -> list[StructuredTool]:
     ) -> str:
         """Read file content from the sandbox filesystem."""
         result = await sandbox.read_file(filepath, start_line=start_line, end_line=end_line, sudo=sudo, max_length=max_length)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def file_write(
@@ -84,31 +96,31 @@ def _make_file_tools(sandbox: Sandbox) -> list[StructuredTool]:
             filepath, content, append=append,
             leading_newline=leading_newline, trailing_newline=trailing_newline, sudo=sudo,
         )
-        return str(result) if result else "File written successfully"
+        return _unwrap(result) if result else "File written successfully"
 
     @lc_tool
     async def file_str_replace(filepath: str, old_str: str, new_str: str, sudo: bool = False) -> str:
         """Replace a string in a file."""
         result = await sandbox.replace_in_file(filepath, old_str, new_str, sudo=sudo)
-        return str(result) if result else "Replacement done"
+        return _unwrap(result) if result else "Replacement done"
 
     @lc_tool
     async def file_find_in_content(filepath: str, regex: str, sudo: bool = False) -> str:
         """Search file content using regex."""
         result = await sandbox.search_in_file(filepath, regex, sudo=sudo)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def file_find_by_name(dir_path: str, glob_pattern: str) -> str:
         """Find files by name pattern."""
         result = await sandbox.find_files(dir_path, glob_pattern)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def file_list(dir_path: str) -> str:
         """List directory contents."""
         result = await sandbox.list_files(dir_path)
-        return str(result)
+        return _unwrap(result)
 
     return [file_read, file_write, file_str_replace, file_find_in_content, file_find_by_name, file_list]
 
@@ -125,7 +137,7 @@ def _make_shell_tools(sandbox: Sandbox) -> list[StructuredTool]:
     async def shell_execute(command: str, session_id: str = "default", exec_dir: str = "") -> str:
         """Execute a shell command in the sandbox."""
         result = await sandbox.exec_command(session_id=session_id, exec_dir=exec_dir, command=command)
-        return str(result)
+        return _unwrap(result)
 
     shell_execute.metadata = {"require_confirmation": True}
 
@@ -133,25 +145,25 @@ def _make_shell_tools(sandbox: Sandbox) -> list[StructuredTool]:
     async def shell_read_output(session_id: str = "default") -> str:
         """Read the latest output from a shell session."""
         result = await sandbox.read_shell_output(session_id=session_id)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def shell_wait_process(session_id: str = "default", seconds: int = 5) -> str:
         """Wait for a running process to produce output."""
         result = await sandbox.wait_process(session_id=session_id, seconds=seconds)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def shell_write_input(input_text: str, session_id: str = "default", press_enter: bool = True) -> str:
         """Write input to a running shell process."""
         result = await sandbox.write_shell_input(session_id=session_id, input_text=input_text, press_enter=press_enter)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def shell_kill_process(session_id: str = "default") -> str:
         """Kill a running process in a shell session."""
         result = await sandbox.kill_process(session_id=session_id)
-        return str(result)
+        return _unwrap(result)
 
     return [shell_execute, shell_read_output, shell_wait_process, shell_write_input, shell_kill_process]
 
@@ -168,13 +180,13 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
     async def browser_view() -> str:
         """Get a snapshot of the current browser page content and screenshot."""
         result = await browser.view_page()
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def browser_navigate(url: str) -> str:
         """Navigate the browser to a URL."""
         result = await browser.navigate(url)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def browser_click(
@@ -184,7 +196,7 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
     ) -> str:
         """Click an element on the page by index or coordinates."""
         result = await browser.click(index=index, coordinate_x=coordinate_x, coordinate_y=coordinate_y)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def browser_input(
@@ -196,55 +208,55 @@ def _make_browser_tools(browser: Browser) -> list[StructuredTool]:
     ) -> str:
         """Type text into an input field."""
         result = await browser.input(text, press_enter=press_enter, index=index, coordinate_x=coordinate_x, coordinate_y=coordinate_y)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def browser_move_mouse(coordinate_x: float, coordinate_y: float) -> str:
         """Move the mouse cursor to specific coordinates."""
         result = await browser.move_mouse(coordinate_x=coordinate_x, coordinate_y=coordinate_y)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def browser_press_key(key: str) -> str:
         """Press a keyboard key."""
         result = await browser.press_key(key)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def browser_select_option(index: int, option: int) -> str:
         """Select an option from a dropdown."""
         result = await browser.select_option(index=index, option=option)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def browser_scroll_up(to_top: bool = False) -> str:
         """Scroll the page up."""
         result = await browser.scroll_up(to_top=to_top)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def browser_scroll_down(to_bottom: bool = False) -> str:
         """Scroll the page down."""
         result = await browser.scroll_down(to_down=to_bottom)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def browser_console_exec(javascript: str) -> str:
         """Execute JavaScript in the browser console."""
         result = await browser.console_exec(javascript)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def browser_console_view(max_lines: int = 50) -> str:
         """View the browser console output."""
         result = await browser.console_view(max_lines=max_lines)
-        return str(result)
+        return _unwrap(result)
 
     @lc_tool
     async def browser_restart(url: str = "") -> str:
         """Restart the browser, optionally navigating to a URL."""
         result = await browser.restart(url=url)
-        return str(result)
+        return _unwrap(result)
 
     return [
         browser_view, browser_navigate, browser_click, browser_input,
@@ -266,7 +278,7 @@ def _make_search_tools(search_engine: SearchEngine) -> list[StructuredTool]:
     async def search_web(query: str, date_range: Optional[str] = None) -> str:
         """Search the web for information."""
         result = await search_engine.invoke(query, date_range=date_range)
-        return str(result)
+        return _unwrap(result)
 
     return [search_web]
 

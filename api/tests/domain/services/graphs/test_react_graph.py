@@ -2,6 +2,7 @@
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock
+from langchain_core.messages import ToolMessage
 from app.domain.models.event import ToolEvent
 
 pytestmark = pytest.mark.anyio
@@ -53,6 +54,7 @@ class TestBuildReactGraph:
             "attachments": [],
             "events": [],
             "should_interrupt": False,
+            "soft_hint_sent": False,
             "attempt_count": 0,
             "failure_count": 0,
         })
@@ -90,6 +92,7 @@ class TestBuildReactGraph:
             "attachments": [],
             "events": [],
             "should_interrupt": False,
+            "soft_hint_sent": False,
             "attempt_count": 0,
             "failure_count": 0,
         })
@@ -135,6 +138,7 @@ class TestBuildReactGraph:
             "attachments": [],
             "events": [],
             "should_interrupt": False,
+            "soft_hint_sent": False,
             "attempt_count": 0,
             "failure_count": 0,
         })
@@ -148,12 +152,12 @@ class TestBuildReactGraph:
             "Expected at least one CALLED ToolEvent with success=False"
 
         # Verify tool message is prefixed with [TOOL_ERROR]
-        tool_msgs = [m for m in result["messages"] if isinstance(m, dict) and m.get("role") == "tool"]
-        assert any("[TOOL_ERROR]" in m["content"] for m in tool_msgs), \
+        tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
+        assert any("[TOOL_ERROR]" in m.content for m in tool_msgs), \
             "Expected tool message to contain [TOOL_ERROR] prefix"
 
     async def test_tool_result_success_false_detected(self):
-        """When a tool returns a string containing 'success=False' (from ToolResult.__str__),
+        """When a tool raises an exception (from _unwrap on ToolResult.success=False),
         the system should detect it and mark the ToolEvent accordingly."""
         from langchain_core.messages import AIMessage
         from langchain_core.tools import tool as lc_tool
@@ -162,8 +166,8 @@ class TestBuildReactGraph:
         @lc_tool
         async def search_web(query: str) -> str:
             """Search the web."""
-            # Simulate what happens when str(ToolResult(success=False, ...)) is returned
-            return "success=False message='Bing搜索出错: CAPTCHA blocked' data=SearchResults(query='test', total_results=0, results=[])"
+            # Simulate what happens when _unwrap() encounters ToolResult(success=False)
+            raise RuntimeError("Bing搜索出错: CAPTCHA blocked")
 
         call_count = 0
 
@@ -190,6 +194,7 @@ class TestBuildReactGraph:
             "attachments": [],
             "events": [],
             "should_interrupt": False,
+            "soft_hint_sent": False,
             "attempt_count": 0,
             "failure_count": 0,
         })
@@ -202,5 +207,5 @@ class TestBuildReactGraph:
         assert any(not e.function_result.success for e in called_events)
 
         # Tool message should be prefixed with [TOOL_ERROR]
-        tool_msgs = [m for m in result["messages"] if isinstance(m, dict) and m.get("role") == "tool"]
-        assert any("[TOOL_ERROR]" in m["content"] for m in tool_msgs)
+        tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
+        assert any("[TOOL_ERROR]" in m.content for m in tool_msgs)

@@ -151,14 +151,11 @@ class TestTryDriveSkillGraph:
 
         # 驱动子图
         graph = SkillCreationGraph(MockBrainstormTool(), MockCreateSkillTool())
-        events = []
-        async for event in graph.run(
+        new_state, events = await graph.run(
             state=graph_state, action=action, original_request=""
-        ):
-            events.append(event)
+        )
 
         # 持久化
-        new_state = graph.state
         if new_state is not None:
             if new_state.is_terminal:
                 await session_repo.clear_skill_graph_state("s1")
@@ -286,13 +283,11 @@ class TestTryDriveSkillGraph:
 
         # Step 1: 首次 brainstorm（通过正常流程触发，此处模拟结果）
         graph = SkillCreationGraph(MockBrainstormTool(), MockCreateSkillTool())
-        events = []
-        async for event in graph.run(
+        new_state, events = await graph.run(
             state=None, action=None, original_request="创建天气 skill"
-        ):
-            events.append(event)
-        assert graph.state.status == "wait_generate"
-        await repo.save_skill_graph_state("s1", graph.state)
+        )
+        assert new_state.status == "wait_generate"
+        await repo.save_skill_graph_state("s1", new_state)
 
         # Step 2: 用户确认 generate
         events = await self._simulate_try_drive(

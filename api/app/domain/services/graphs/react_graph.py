@@ -32,6 +32,32 @@ logger = logging.getLogger(__name__)
 # Max ReAct iterations to prevent infinite loops
 MAX_ITERATIONS = 30
 
+# Tool name → category mapping (mirrors agent_task_runner._classify_tool_name)
+_TOOL_CATEGORY_PREFIXES = {
+    "browser_": "browser",
+    "shell_": "shell",
+    "file_": "file",
+    "search_": "search",
+    "message_": "message",
+}
+_KNOWN_CATEGORIES = frozenset(
+    {"browser", "shell", "file", "search", "message", "mcp", "a2a", "skill"}
+)
+
+
+def _classify_tool_name(tool_name: str) -> str:
+    """Extract tool category from LangChain tool name.
+
+    e.g., "browser_navigate" → "browser", "shell_execute" → "shell".
+    Keeps names like "mcp", "browser" as-is if already a category.
+    """
+    if tool_name in _KNOWN_CATEGORIES:
+        return tool_name
+    for prefix, category in _TOOL_CATEGORY_PREFIXES.items():
+        if tool_name.startswith(prefix):
+            return category
+    return tool_name
+
 
 def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
     """Build and compile the inner ReAct loop graph.
@@ -61,11 +87,12 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
         # Emit ToolEvent(CALLING) for each tool call
         if response.tool_calls:
             for tc in response.tool_calls:
+                func_name = tc["name"]
                 new_events.append(
                     ToolEvent(
                         tool_call_id=tc["id"],
-                        tool_name=tc["name"],
-                        function_name=tc["name"],
+                        tool_name=_classify_tool_name(func_name),
+                        function_name=func_name,
                         function_args=tc["args"] if isinstance(tc["args"], dict) else json.loads(tc["args"]),
                         status=ToolEventStatus.CALLING,
                     )
@@ -78,7 +105,7 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
             )
 
         return {
-            "messages": state["messages"] + [response],
+            "messages": [response],
             "events": new_events,
         }
 
@@ -98,17 +125,13 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
         # AIMessage.tool_calls is a list of dicts with id/name/args
         tool_calls = last_msg.tool_calls if isinstance(last_msg, AIMessage) else []
 
-        # Check if there was already a SOFT_HINT in this step's history
-        has_prior_soft_hint = any(
-            isinstance(m, ToolMessage)
-            and m.content == "SOFT_HINT"
-            and m.name == "message_ask_user"
-            for m in messages
-        )
+        # Check if a SOFT_HINT was already returned in this step
+        has_prior_soft_hint = state.get("soft_hint_sent", False)
 
         new_messages = []
         new_events = []
         should_interrupt = False
+        new_failures = 0
 
         for tc in tool_calls:
             tool_name = tc["name"]
@@ -116,7 +139,7 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
             call_id = tc["id"]
 
             # ---- message_ask_user: SOFT_HINT gating ---- #
-            tool_success = True  # default; overridden in normal-tool branch on failure
+            tool_success = True
             if tool_name == "message_ask_user":
                 suggest = str(args.get("suggest_user_takeover", "none")).strip().lower()
                 if suggest in {"browser", "shell"}:
@@ -143,11 +166,12 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
                         result_str = await tool_fn.ainvoke(args)
                         if not isinstance(result_str, str):
                             result_str = str(result_str)
-                        # Detect failure indicators from upstream ToolResult
-                        tool_success = "success=False" not in result_str
                     except Exception as exc:
                         result_str = f"Error executing {tool_name}: {exc}"
                         tool_success = False
+
+            if not tool_success:
+                new_failures += 1
 
             # Prefix error messages so the LLM can clearly identify failures
             content = f"[TOOL_ERROR] {result_str}" if not tool_success else result_str
@@ -162,7 +186,7 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
             new_events.append(
                 ToolEvent(
                     tool_call_id=call_id,
-                    tool_name=tool_name,
+                    tool_name=_classify_tool_name(tool_name),
                     function_name=tool_name,
                     function_args=args,
                     function_result=ToolResult(success=tool_success, message=result_str),
@@ -171,31 +195,24 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
             )
 
         result: dict = {
-            "messages": state["messages"] + new_messages,
+            "messages": new_messages,
             "events": new_events,
             "attempt_count": state["attempt_count"] + 1,
+            "failure_count": state["failure_count"] + new_failures,
         }
         if should_interrupt:
             result["should_interrupt"] = True
+        if not has_prior_soft_hint and any(
+            m.content == "SOFT_HINT" and m.name == "message_ask_user"
+            for m in new_messages
+        ):
+            result["soft_hint_sent"] = True
         return result
-
-    async def confirmation_check(state: ReactGraphState) -> dict:
-        """Check if any tool call requires user confirmation.
-
-        Note: takeover requests (message_ask_user with suggest_user_takeover)
-        are handled by tool_node, which executes the tool first to generate
-        a proper tool response (WAITING_FOR_USER), then sets should_interrupt.
-        This ensures complete tool_call→tool_response pairs in message history,
-        which is required by LLMs on conversation resume.
-        """
-        # Currently a pass-through — all tool calls are routed to tool_node.
-        # Future: add confirmation logic for dangerous tools here.
-        return {}
 
     # ---- Routing ------------------------------------------------------- #
 
     def route_after_llm(state: ReactGraphState) -> str:
-        """Route after LLM call: tool calls → confirmation_check, else END."""
+        """Route after LLM call: tool calls → tool_node, else END."""
         if state.get("should_interrupt"):
             return END
 
@@ -205,15 +222,9 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
 
         last_msg = messages[-1]
         if isinstance(last_msg, AIMessage) and last_msg.tool_calls:
-            return "confirmation_check"
+            return "tool_node"
 
         return END
-
-    def route_after_confirmation(state: ReactGraphState) -> str:
-        """Route after confirmation check."""
-        if state.get("should_interrupt"):
-            return END
-        return "tool_node"
 
     def route_after_tool(state: ReactGraphState) -> str:
         """Route after tool execution: back to LLM."""
@@ -237,11 +248,9 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
 
     g.add_node("llm_node", llm_node, retry_policy=llm_retry)
     g.add_node("tool_node", tool_node)
-    g.add_node("confirmation_check", confirmation_check)
 
     g.add_edge(START, "llm_node")
     g.add_conditional_edges("llm_node", route_after_llm)
-    g.add_conditional_edges("confirmation_check", route_after_confirmation)
     g.add_conditional_edges("tool_node", route_after_tool)
 
     return g.compile()

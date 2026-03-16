@@ -3,6 +3,8 @@ services:
     build:
       context: ./sandbox
       dockerfile: Dockerfile
+      args:
+        PYTHON_PACKAGE_INDEX_URL: ${PYTHON_PACKAGE_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     image: ${SANDBOX_IMAGE:-actus-sandbox:latest}
     command: ["/bin/sh", "-c", "echo 'sandbox image is ready'"]
     restart: "no"
@@ -47,6 +49,8 @@ services:
     build:
       context: ./api
       dockerfile: Dockerfile
+      args:
+        PYTHON_PACKAGE_INDEX_URL: ${PYTHON_PACKAGE_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
     image: actus-api:latest
     restart: unless-stopped
     depends_on:

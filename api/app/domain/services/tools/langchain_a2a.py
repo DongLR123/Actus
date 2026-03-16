@@ -25,6 +25,8 @@ def create_a2a_langchain_tools(a2a_tool: A2ATool) -> list[StructuredTool]:
     async def get_remote_agent_cards() -> str:
         """获取可远程调用的Agent卡片信息, 包含Agent id、名称、描述、技能、请求端点等。"""
         result = await a2a_tool.get_remote_agent_cards()
+        if hasattr(result, "success") and not result.success:
+            raise RuntimeError(getattr(result, "message", None) or str(result))
         if hasattr(result, "data") and result.data is not None:
             return json.dumps(result.data, ensure_ascii=False)
         if hasattr(result, "message") and result.message:
@@ -35,6 +37,8 @@ def create_a2a_langchain_tools(a2a_tool: A2ATool) -> list[StructuredTool]:
     async def call_remote_agent(id: str, query: str) -> str:
         """根据传递的id+query(分配给远程Agent完成的任务query)调用远程Agent完成对应需求"""
         result = await a2a_tool.call_remote_agent(id=id, query=query)
+        if hasattr(result, "success") and not result.success:
+            raise RuntimeError(getattr(result, "message", None) or str(result))
         if hasattr(result, "data") and result.data is not None:
             return json.dumps(result.data, ensure_ascii=False)
         if hasattr(result, "message") and result.message:

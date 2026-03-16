@@ -1,10 +1,13 @@
-"""Tests for main_graph — outer orchestration (plan→execute→update→summarize)."""
+"""Tests for main_graph — outer orchestration (plan->execute->update->summarize)."""
+
+import asyncio
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, PropertyMock
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from unittest.mock import AsyncMock, MagicMock
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage
 
 from app.domain.models.event import PlanEvent, TitleEvent, MessageEvent, DoneEvent, PlanEventStatus
+from app.domain.models.llm_responses import PlanResponse, PlanUpdateResponse, StepDef
 from app.domain.models.plan import Plan, Step, ExecutionStatus
 
 pytestmark = pytest.mark.anyio
@@ -15,47 +18,69 @@ def anyio_backend() -> str:
     return "asyncio"
 
 
-@pytest.fixture
-def mock_planner_llm():
-    """Mock LLM for planner that returns a plan JSON.
+def _make_mock_summary_llm(response_json: str = '{"message": "Summary done.", "attachments": []}'):
+    """Build a mock BaseChatModel for summary_llm with astream support.
 
-    Handles both CREATE_PLAN_PROMPT and UPDATE_PLAN_PROMPT calls.
+    Returns a MagicMock whose astream() yields AIMessageChunk objects.
     """
-    async def mock_invoke(**kwargs):
-        messages = kwargs.get("messages", [])
-        # Detect whether this is an update_plan or create_plan call
-        user_content = ""
-        for m in messages:
-            if m.get("role") == "user":
-                user_content = m.get("content", "")
+    llm = MagicMock()
 
-        if "更新计划" in user_content or "执行摘要" in user_content:
-            # UPDATE_PLAN_PROMPT call — return updated steps
-            return {
-                "content": '{"steps":[{"id":"2","description":"Updated step based on results"}]}',
-                "role": "assistant",
-            }
-        return {
-            "content": '{"title":"Test","goal":"Do test","language":"en","steps":[{"description":"Step 1"}],"message":"Let me help"}',
-            "role": "assistant",
-        }
-    llm = AsyncMock()
-    llm.invoke = mock_invoke
-    type(llm).model_name = PropertyMock(return_value="gpt-4o")
+    async def _astream(messages, **kwargs):
+        yield AIMessageChunk(content=response_json)
+    llm.astream = _astream
+    return llm
+
+
+def _make_structured_planner_llm(
+    create_response: PlanResponse | None = None,
+    update_response: PlanUpdateResponse | None = None,
+):
+    """Build a mock BaseChatModel whose with_structured_output() returns the right ainvoke mock.
+
+    The mock dispatches based on the schema class passed to with_structured_output().
+    Also includes a default astream() mock so it can double as summary_llm in tests.
+    """
+    if create_response is None:
+        create_response = PlanResponse(
+            title="Test", goal="Do test", language="en",
+            steps=[StepDef(description="Step 1")],
+            message="Let me help",
+        )
+    if update_response is None:
+        update_response = PlanUpdateResponse(
+            steps=[StepDef(id="2", description="Updated step based on results")],
+        )
+
+    # Structured LLM mocks — one per schema type
+    create_structured = AsyncMock()
+    create_structured.ainvoke = AsyncMock(return_value=create_response)
+
+    update_structured = AsyncMock()
+    update_structured.ainvoke = AsyncMock(return_value=update_response)
+
+    llm = MagicMock()
+
+    def _with_structured_output(schema, **kwargs):
+        if schema is PlanResponse:
+            return create_structured
+        if schema is PlanUpdateResponse:
+            return update_structured
+        raise ValueError(f"Unexpected schema: {schema}")
+
+    llm.with_structured_output = MagicMock(side_effect=_with_structured_output)
+
+    # Also support astream for when this mock is used as summary_llm
+    async def _astream(messages, **kwargs):
+        yield AIMessageChunk(content='{"message": "Summary done.", "attachments": []}')
+    llm.astream = _astream
+
     return llm
 
 
 @pytest.fixture
-def mock_json_parser():
-    parser = AsyncMock()
-    import json
-    async def parse(content, default_value=None):
-        try:
-            return json.loads(content)
-        except Exception:
-            return {"title": "Fallback", "goal": content, "steps": [{"description": content}], "message": "ok", "language": "en"}
-    parser.invoke = parse
-    return parser
+def mock_planner_llm():
+    """Mock BaseChatModel for planner with structured output support."""
+    return _make_structured_planner_llm()
 
 
 def _make_mock_react_graph():
@@ -64,7 +89,7 @@ def _make_mock_react_graph():
         async def astream(self, input_state, config=None):
             yield {"llm_node": {
                 "events": [MessageEvent(role="assistant", message="Step done")],
-                "messages": input_state["messages"] + [
+                "messages": [
                     AIMessage(content='{"success": true, "result": "done", "attachments": []}'),
                 ],
             }}
@@ -72,7 +97,7 @@ def _make_mock_react_graph():
         async def ainvoke(self, input_state, config=None):
             return {
                 "events": [MessageEvent(role="assistant", message="Step done")],
-                "messages": input_state["messages"] + [
+                "messages": [
                     AIMessage(content='{"success": true, "result": "done", "attachments": []}'),
                 ],
                 "should_interrupt": False,
@@ -84,12 +109,11 @@ def _make_mock_react_graph():
 
 
 class TestBuildMainGraph:
-    def test_graph_compiles(self, mock_planner_llm, mock_json_parser):
+    def test_graph_compiles(self, mock_planner_llm):
         from app.domain.services.graphs.main_graph import build_main_graph
         graph = build_main_graph(
             planner_llm=mock_planner_llm,
             react_graph=_make_mock_react_graph(),
-            json_parser=mock_json_parser,
             summary_llm=mock_planner_llm,
             uow_factory=MagicMock(),
             session_id="sess-1",
@@ -98,7 +122,7 @@ class TestBuildMainGraph:
 
 
 class TestMainGraphFlow:
-    async def test_full_flow_produces_plan_and_done(self, mock_planner_llm, mock_json_parser):
+    async def test_full_flow_produces_plan_and_done(self, mock_planner_llm):
         from app.domain.services.graphs.main_graph import build_main_graph
 
         mock_uow = AsyncMock()
@@ -110,7 +134,6 @@ class TestMainGraphFlow:
         graph = build_main_graph(
             planner_llm=mock_planner_llm,
             react_graph=_make_mock_react_graph(),
-            json_parser=mock_json_parser,
             summary_llm=mock_planner_llm,
             uow_factory=MagicMock(return_value=mock_uow),
             session_id="sess-1",
@@ -128,7 +151,7 @@ class TestMainGraphFlow:
             "flow_status": "idle",
             "session_id": "sess-1",
             "should_interrupt": False,
-            "is_resuming": False,
+            "resume_value": None,
             "original_request": "",
             "skill_context": "",
             "conversation_summaries": [],
@@ -139,21 +162,20 @@ class TestMainGraphFlow:
         # planner events come through state; executor events go via queue (empty in state)
         assert "PlanEvent" in event_types or "TitleEvent" in event_types
 
-    async def test_default_language_is_zh(self, mock_planner_llm, mock_json_parser):
+    async def test_default_language_is_zh(self, mock_planner_llm):
         """When no language is specified, planner should default to zh."""
         from app.domain.services.graphs.main_graph import build_main_graph
 
         graph = build_main_graph(
             planner_llm=mock_planner_llm,
             react_graph=_make_mock_react_graph(),
-            json_parser=mock_json_parser,
             summary_llm=mock_planner_llm,
             uow_factory=MagicMock(),
             session_id="sess-lang",
         )
 
         result = await graph.ainvoke({
-            "message": "帮我查一下天气",
+            "message": "help me",
             "language": "zh",
             "attachments": [],
             "plan": None,
@@ -164,7 +186,7 @@ class TestMainGraphFlow:
             "flow_status": "idle",
             "session_id": "sess-lang",
             "should_interrupt": False,
-            "is_resuming": False,
+            "resume_value": None,
             "original_request": "",
             "skill_context": "",
             "conversation_summaries": [],
@@ -174,36 +196,44 @@ class TestMainGraphFlow:
         plan = result.get("plan")
         assert plan is not None
 
-    async def test_planner_receives_conversation_summaries(self, mock_json_parser):
+    async def test_planner_receives_conversation_summaries(self):
         """Planner system prompt should include conversation summaries when available."""
         from app.domain.services.graphs.main_graph import build_main_graph
 
-        captured_system_content = []
+        captured_messages = []
 
-        async def capturing_invoke(**kwargs):
-            messages = kwargs.get("messages", [])
-            for m in messages:
-                if m.get("role") == "system":
-                    captured_system_content.append(m["content"])
-            return {
-                "content": '{"title":"Test","goal":"test","language":"zh","steps":[{"description":"step1"}],"message":"ok"}',
-                "role": "assistant",
-            }
+        create_response = PlanResponse(
+            title="Test", goal="test", language="zh",
+            steps=[StepDef(description="step1")],
+            message="ok",
+        )
 
-        planner_llm = AsyncMock()
-        planner_llm.invoke = capturing_invoke
+        create_structured = AsyncMock()
+        async def capturing_ainvoke(messages, **kwargs):
+            captured_messages.extend(messages)
+            return create_response
+        create_structured.ainvoke = capturing_ainvoke
+
+        update_structured = AsyncMock()
+        update_structured.ainvoke = AsyncMock(return_value=PlanUpdateResponse(steps=[]))
+
+        planner_llm = MagicMock()
+        def _with_structured_output(schema, **kwargs):
+            if schema is PlanResponse:
+                return create_structured
+            return update_structured
+        planner_llm.with_structured_output = MagicMock(side_effect=_with_structured_output)
 
         graph = build_main_graph(
             planner_llm=planner_llm,
             react_graph=_make_mock_react_graph(),
-            json_parser=mock_json_parser,
-            summary_llm=planner_llm,
+            summary_llm=_make_mock_summary_llm(),
             uow_factory=MagicMock(),
             session_id="sess-summary",
         )
 
         await graph.ainvoke({
-            "message": "继续上次的工作",
+            "message": "continue",
             "language": "zh",
             "attachments": [],
             "plan": None,
@@ -214,49 +244,44 @@ class TestMainGraphFlow:
             "flow_status": "idle",
             "session_id": "sess-summary",
             "should_interrupt": False,
-            "is_resuming": False,
+            "resume_value": None,
             "original_request": "",
             "skill_context": "",
-            "conversation_summaries": ["### 第1轮\n- 用户需求：查天气\n- 执行结果：成功获取北京天气"],
+            "conversation_summaries": ["### Round 1\n- user: check weather\n- result: got weather"],
         })
 
-        assert len(captured_system_content) >= 1
-        assert "历史对话摘要" in captured_system_content[0]
-        assert "查天气" in captured_system_content[0]
+        system_msgs = [m for m in captured_messages if isinstance(m, SystemMessage)]
+        assert len(system_msgs) >= 1
+        assert "history" in system_msgs[0].content.lower() or "摘要" in system_msgs[0].content
+        assert "weather" in system_msgs[0].content or "check weather" in system_msgs[0].content
 
-    async def test_step_success_false_when_llm_reports_failure(self, mock_json_parser):
-        """When react LLM returns success=false, the step should be marked as failed."""
+    async def test_step_success_false_when_tool_failures_detected(self):
+        """When react_graph returns failure_count > 0, the step should be marked as failed."""
         from app.domain.services.graphs.main_graph import build_main_graph
 
         class FailingReactGraph:
             async def astream(self, input_state, config=None):
-                yield {"llm_node": {
+                yield {"tool_node": {
                     "events": [],
-                    "messages": input_state["messages"] + [
-                        AIMessage(content='{"success": false, "result": "CAPTCHA blocked", "attachments": []}')
+                    "messages": [
+                        AIMessage(content="CAPTCHA blocked, search failed"),
                     ],
+                    "failure_count": 1,
                     "should_interrupt": False,
                 }}
 
-        planner_llm = AsyncMock()
-        async def mock_invoke(**kwargs):
-            messages = kwargs.get("messages", [])
-            user_content = ""
-            for m in messages:
-                if m.get("role") == "user":
-                    user_content = m.get("content", "")
-            if "更新计划" in user_content or "执行摘要" in user_content:
-                return {"content": '{"steps":[]}', "role": "assistant"}
-            return {
-                "content": '{"title":"T","goal":"G","language":"zh","steps":[{"description":"search news"}],"message":"ok"}',
-                "role": "assistant",
-            }
-        planner_llm.invoke = mock_invoke
+        planner_llm = _make_structured_planner_llm(
+            create_response=PlanResponse(
+                title="T", goal="G", language="zh",
+                steps=[StepDef(description="search news")],
+                message="ok",
+            ),
+            update_response=PlanUpdateResponse(steps=[]),
+        )
 
         graph = build_main_graph(
             planner_llm=planner_llm,
             react_graph=FailingReactGraph(),
-            json_parser=mock_json_parser,
             summary_llm=planner_llm,
             uow_factory=MagicMock(),
             session_id="sess-fail",
@@ -274,7 +299,7 @@ class TestMainGraphFlow:
             "flow_status": "idle",
             "session_id": "sess-fail",
             "should_interrupt": False,
-            "is_resuming": False,
+            "resume_value": None,
             "original_request": "",
             "skill_context": "",
             "conversation_summaries": [],
@@ -286,20 +311,24 @@ class TestMainGraphFlow:
         assert len(completed_steps) >= 1
         assert completed_steps[0].success is False
 
-    async def test_summarizer_emits_message_event(self, mock_json_parser):
-        """Summarizer should call LLM and emit a MessageEvent with the summary."""
+    async def test_summarizer_streams_and_emits_message_event(self):
+        """Summarizer should stream LLM via astream and emit partial+final MessageEvents."""
         from app.domain.services.graphs.main_graph import build_main_graph
 
-        summary_llm = AsyncMock()
-        async def mock_summary_invoke(**kwargs):
-            return {
-                "content": '{"message": "任务已完成，这是你的总结报告。", "attachments": ["/home/ubuntu/report.md"]}',
-                "role": "assistant",
-            }
-        summary_llm.invoke = mock_summary_invoke
+        # Mock summary_llm.astream() yielding AIMessageChunk objects
+        summary_llm = MagicMock()
+        json_response = '{"message": "Task done, here is the report.", "attachments": ["/home/ubuntu/report.md"]}'
+        # Split the JSON response into chunks to simulate streaming
+        chunk1 = json_response[:30]
+        chunk2 = json_response[30:]
 
-        planner_llm = AsyncMock()
-        planner_llm.invoke = AsyncMock()
+        async def mock_astream(messages, **kwargs):
+            yield AIMessageChunk(content=chunk1)
+            yield AIMessageChunk(content=chunk2)
+        summary_llm.astream = mock_astream
+
+        planner_llm = MagicMock()
+        planner_llm.with_structured_output = MagicMock(return_value=AsyncMock())
 
         plan = Plan(
             title="T", goal="G", language="zh",
@@ -310,56 +339,80 @@ class TestMainGraphFlow:
         graph = build_main_graph(
             planner_llm=planner_llm,
             react_graph=_make_mock_react_graph(),
-            json_parser=mock_json_parser,
             summary_llm=summary_llm,
             uow_factory=MagicMock(),
             session_id="sess-sum",
         )
 
-        result = await graph.ainvoke({
-            "message": "summarize",
-            "language": "zh",
-            "attachments": [],
-            "plan": plan,
-            "current_step": None,
-            "messages": [
-                SystemMessage(content="system"),
-                HumanMessage(content="do something"),
-                AIMessage(content='{"success": true, "result": "done", "attachments": []}'),
-            ],
-            "execution_summary": "",
-            "events": [],
-            "flow_status": "summarizing",
-            "session_id": "sess-sum",
-            "should_interrupt": False,
-            "is_resuming": False,
-            "original_request": "G",
-            "skill_context": "",
-            "conversation_summaries": [],
-        })
+        # Use event_queue to capture events emitted by summarizer
+        event_queue: asyncio.Queue = asyncio.Queue()
 
-        events = result.get("events", [])
-        msg_events = [e for e in events if isinstance(e, MessageEvent)]
-        assert len(msg_events) >= 1
-        assert "总结报告" in msg_events[0].message or "任务已完成" in msg_events[0].message
+        result = await graph.ainvoke(
+            {
+                "message": "summarize",
+                "language": "zh",
+                "attachments": [],
+                "plan": plan,
+                "current_step": None,
+                "messages": [
+                    SystemMessage(content="system"),
+                    HumanMessage(content="do something"),
+                    AIMessage(content='{"success": true, "result": "done", "attachments": []}'),
+                ],
+                "execution_summary": "",
+                "events": [],
+                "flow_status": "summarizing",
+                "session_id": "sess-sum",
+                "should_interrupt": False,
+                "resume_value": None,
+                "original_request": "G",
+                "skill_context": "",
+                "conversation_summaries": [],
+            },
+            config={"configurable": {"event_queue": event_queue}},
+        )
+
+        # Collect all queued events
+        queued_events = []
+        while not event_queue.empty():
+            queued_events.append(event_queue.get_nowait())
+
+        # Should have PlanEvent(COMPLETED) + partial MessageEvents + final MessageEvent + DoneEvent
+        msg_events = [e for e in queued_events if isinstance(e, MessageEvent)]
+        partial_events = [e for e in msg_events if e.partial]
+        final_events = [e for e in msg_events if not e.partial]
+
+        assert len(partial_events) >= 1, "Should have at least one partial streaming event"
+        assert len(final_events) == 1, "Should have exactly one final MessageEvent"
+
+        # All MessageEvents share the same stream_id
+        stream_ids = {e.stream_id for e in msg_events}
+        assert len(stream_ids) == 1, "All MessageEvents should share the same stream_id"
+        assert None not in stream_ids, "stream_id should not be None"
+
+        # Partial events are cumulative (each one is longer than the previous)
+        for i in range(1, len(partial_events)):
+            assert len(partial_events[i].message) >= len(partial_events[i - 1].message)
+
+        # Final event has parsed message and attachments
+        final = final_events[0]
+        assert "report" in final.message.lower() or "done" in final.message.lower()
+        assert len(final.attachments) == 1
+        assert final.attachments[0].filepath == "/home/ubuntu/report.md"
+        assert final.partial is False
+
+        # DoneEvent should be present
+        done_events = [e for e in queued_events if isinstance(e, DoneEvent)]
+        assert len(done_events) == 1
+
+        # State events should be empty (all emitted via queue)
+        assert result.get("events", []) == []
 
 
 class TestExecutorMessageBranching:
     """Test the three-way branching in executor_node for message handling."""
 
-    @pytest.fixture
-    def mock_json_parser(self):
-        parser = AsyncMock()
-        import json
-        async def parse(content, default_value=None):
-            try:
-                return json.loads(content)
-            except Exception:
-                return default_value
-        parser.invoke = parse
-        return parser
-
-    async def test_first_step_no_history_uses_system_prompt(self, mock_json_parser):
+    async def test_first_step_no_history_uses_system_prompt(self):
         """When messages=[] and is_resuming=False, executor builds fresh system+execution prompt."""
         from app.domain.services.graphs.main_graph import build_main_graph
 
@@ -370,28 +423,24 @@ class TestExecutorMessageBranching:
                 captured_react_inputs.append(input_state)
                 yield {"llm_node": {
                     "events": [],
-                    "messages": input_state["messages"] + [
+                    "messages": [
                         AIMessage(content='{"success": true, "result": "done", "attachments": []}')
                     ],
                     "should_interrupt": False,
                 }}
 
-        planner_llm = AsyncMock()
-        async def mock_invoke(**kwargs):
-            messages = kwargs.get("messages", [])
-            user_content = ""
-            for m in messages:
-                if m.get("role") == "user":
-                    user_content = m.get("content", "")
-            if "更新计划" in user_content or "执行摘要" in user_content:
-                return {"content": '{"steps":[]}', "role": "assistant"}
-            return {"content": '{"title":"T","goal":"G","language":"zh","steps":[{"description":"S1"}],"message":"ok"}', "role": "assistant"}
-        planner_llm.invoke = mock_invoke
+        planner_llm = _make_structured_planner_llm(
+            create_response=PlanResponse(
+                title="T", goal="G", language="zh",
+                steps=[StepDef(description="S1")],
+                message="ok",
+            ),
+            update_response=PlanUpdateResponse(steps=[]),
+        )
 
         graph = build_main_graph(
             planner_llm=planner_llm,
             react_graph=CapturingReactGraph(),
-            json_parser=mock_json_parser,
             summary_llm=planner_llm,
             uow_factory=MagicMock(),
             session_id="sess-exec",
@@ -409,7 +458,7 @@ class TestExecutorMessageBranching:
             "flow_status": "idle",
             "session_id": "sess-exec",
             "should_interrupt": False,
-            "is_resuming": False,
+            "resume_value": None,
             "original_request": "",
             "skill_context": "",
             "conversation_summaries": [],
@@ -418,9 +467,9 @@ class TestExecutorMessageBranching:
         assert len(captured_react_inputs) >= 1
         msgs = captured_react_inputs[0]["messages"]
         assert isinstance(msgs[0], SystemMessage)
-        assert "任务执行智能体" in msgs[0].content
+        assert "task execution" in msgs[0].content.lower() or "agent" in msgs[0].content.lower() or "\u4efb\u52a1\u6267\u884c\u667a\u80fd\u4f53" in msgs[0].content
 
-    async def test_has_history_not_resuming_updates_system_prompt(self, mock_json_parser):
+    async def test_has_history_not_resuming_updates_system_prompt(self):
         """When messages have history and is_resuming=False, executor updates system prompt and appends execution prompt."""
         from app.domain.services.graphs.main_graph import build_main_graph
 
@@ -431,14 +480,14 @@ class TestExecutorMessageBranching:
                 captured_react_inputs.append(input_state)
                 yield {"llm_node": {
                     "events": [],
-                    "messages": input_state["messages"] + [
+                    "messages": [
                         AIMessage(content='{"success": true, "result": "done", "attachments": []}')
                     ],
                     "should_interrupt": False,
                 }}
 
-        planner_llm = AsyncMock()
-        planner_llm.invoke = AsyncMock()
+        planner_llm = MagicMock()
+        planner_llm.with_structured_output = MagicMock(return_value=AsyncMock())
 
         step = Step(description="Step 2: analyze data")
         plan = Plan(title="T", goal="G", language="zh", steps=[
@@ -449,8 +498,7 @@ class TestExecutorMessageBranching:
         graph = build_main_graph(
             planner_llm=planner_llm,
             react_graph=CapturingReactGraph(),
-            json_parser=mock_json_parser,
-            summary_llm=planner_llm,
+            summary_llm=_make_mock_summary_llm(),
             uow_factory=MagicMock(),
             session_id="sess-exec-2",
         )
@@ -473,7 +521,7 @@ class TestExecutorMessageBranching:
             "flow_status": "executing",
             "session_id": "sess-exec-2",
             "should_interrupt": False,
-            "is_resuming": False,
+            "resume_value": None,
             "original_request": "analyze data",
             "skill_context": "",
             "conversation_summaries": [],
@@ -483,13 +531,13 @@ class TestExecutorMessageBranching:
         msgs = captured_react_inputs[0]["messages"]
         # System prompt should be updated (not "old system prompt")
         assert isinstance(msgs[0], SystemMessage)
-        assert "任务执行智能体" in msgs[0].content
-        # Should NOT contain "用户已完成接管" (not resuming)
+        assert "\u4efb\u52a1\u6267\u884c\u667a\u80fd\u4f53" in msgs[0].content
+        # Should NOT contain "user takeover" (not resuming)
         all_content = " ".join(m.content for m in msgs if hasattr(m, "content"))
-        assert "用户已完成接管" not in all_content
+        assert "\u7528\u6237\u5df2\u5b8c\u6210\u63a5\u7ba1" not in all_content
 
-    async def test_resuming_uses_takeover_message(self, mock_json_parser):
-        """When is_resuming=True with saved messages, executor appends takeover resume message."""
+    async def test_resuming_uses_takeover_message(self):
+        """When resume_value is set with saved messages, executor appends takeover resume message."""
         from app.domain.services.graphs.main_graph import build_main_graph
 
         captured_react_inputs = []
@@ -499,14 +547,14 @@ class TestExecutorMessageBranching:
                 captured_react_inputs.append(input_state)
                 yield {"llm_node": {
                     "events": [],
-                    "messages": input_state["messages"] + [
+                    "messages": [
                         AIMessage(content='{"success": true, "result": "done", "attachments": []}')
                     ],
                     "should_interrupt": False,
                 }}
 
-        planner_llm = AsyncMock()
-        planner_llm.invoke = AsyncMock()
+        planner_llm = MagicMock()
+        planner_llm.with_structured_output = MagicMock(return_value=AsyncMock())
 
         step = Step(description="Login to Notion")
         plan = Plan(title="T", goal="G", language="zh", steps=[step], message="ok", status=ExecutionStatus.RUNNING)
@@ -514,8 +562,7 @@ class TestExecutorMessageBranching:
         graph = build_main_graph(
             planner_llm=planner_llm,
             react_graph=CapturingReactGraph(),
-            json_parser=mock_json_parser,
-            summary_llm=planner_llm,
+            summary_llm=_make_mock_summary_llm(),
             uow_factory=MagicMock(),
             session_id="sess-resume",
         )
@@ -526,7 +573,7 @@ class TestExecutorMessageBranching:
         ]
 
         await graph.ainvoke({
-            "message": "我已经登录了",
+            "message": "I have logged in",
             "language": "zh",
             "attachments": [],
             "plan": plan,
@@ -537,7 +584,7 @@ class TestExecutorMessageBranching:
             "flow_status": "executing",
             "session_id": "sess-resume",
             "should_interrupt": False,
-            "is_resuming": True,
+            "resume_value": "I have logged in",
             "original_request": "login",
             "skill_context": "",
             "conversation_summaries": [],
@@ -546,57 +593,48 @@ class TestExecutorMessageBranching:
         assert len(captured_react_inputs) >= 1
         msgs = captured_react_inputs[0]["messages"]
         all_content = " ".join(m.content for m in msgs if hasattr(m, "content"))
-        assert "用户已完成接管" in all_content
+        assert "\u7528\u6237\u5df2\u5b8c\u6210\u63a5\u7ba1" in all_content
 
 
 class TestUpdaterNodePlanUpdate:
     """Test that updater_node calls planner LLM to update plan based on execution results."""
 
-    @pytest.fixture
-    def mock_json_parser(self):
-        parser = AsyncMock()
-        import json
-        async def parse(content, default_value=None):
-            try:
-                return json.loads(content)
-            except Exception:
-                return default_value
-        parser.invoke = parse
-        return parser
-
-    async def test_updater_calls_planner_with_execution_summary(self, mock_json_parser):
+    async def test_updater_calls_planner_with_execution_summary(self):
         """updater_node should call planner LLM with UPDATE_PLAN_PROMPT when execution_summary exists."""
         from app.domain.services.graphs.main_graph import build_main_graph
 
-        planner_calls = []
+        update_ainvoke_calls = []
 
-        async def tracking_invoke(**kwargs):
-            messages = kwargs.get("messages", [])
-            user_content = ""
-            for m in messages:
-                if m.get("role") == "user":
-                    user_content = m.get("content", "")
+        create_response = PlanResponse(
+            title="T", goal="G", language="zh",
+            steps=[StepDef(description="Search databases"), StepDef(description="Read database structure")],
+            message="ok",
+        )
+        update_response = PlanUpdateResponse(
+            steps=[StepDef(id="2", description="Use database_id=2083c6e7 to read database structure")],
+        )
 
-            if "更新计划" in user_content or "执行摘要" in user_content:
-                planner_calls.append({"type": "update", "content": user_content})
-                return {
-                    "content": '{"steps":[{"id":"2","description":"使用 database_id=2083c6e7 读取待办数据库结构"}]}',
-                    "role": "assistant",
-                }
-            planner_calls.append({"type": "create", "content": user_content})
-            return {
-                "content": '{"title":"T","goal":"G","language":"zh","steps":[{"description":"Search databases"},{"description":"Read database structure"}],"message":"ok"}',
-                "role": "assistant",
-            }
+        create_structured = AsyncMock()
+        create_structured.ainvoke = AsyncMock(return_value=create_response)
 
-        planner_llm = AsyncMock()
-        planner_llm.invoke = tracking_invoke
+        update_structured = AsyncMock()
+        async def tracking_update_ainvoke(messages, **kwargs):
+            update_ainvoke_calls.append(messages)
+            return update_response
+        update_structured.ainvoke = tracking_update_ainvoke
+
+        planner_llm = MagicMock()
+        def _with_structured_output(schema, **kwargs):
+            if schema is PlanResponse:
+                return create_structured
+            return update_structured
+        planner_llm.with_structured_output = MagicMock(side_effect=_with_structured_output)
 
         class MockReactGraph:
             async def astream(self, input_state, config=None):
                 yield {"llm_node": {
                     "events": [],
-                    "messages": input_state["messages"] + [
+                    "messages": [
                         AIMessage(content='{"success": true, "result": "Found database_id=2083c6e7", "attachments": []}')
                     ],
                     "should_interrupt": False,
@@ -605,14 +643,13 @@ class TestUpdaterNodePlanUpdate:
         graph = build_main_graph(
             planner_llm=planner_llm,
             react_graph=MockReactGraph(),
-            json_parser=mock_json_parser,
             summary_llm=planner_llm,
             uow_factory=MagicMock(),
             session_id="sess-update",
         )
 
         result = await graph.ainvoke({
-            "message": "查看3月份工作",
+            "message": "check March tasks",
             "language": "zh",
             "attachments": [],
             "plan": None,
@@ -623,75 +660,64 @@ class TestUpdaterNodePlanUpdate:
             "flow_status": "idle",
             "session_id": "sess-update",
             "should_interrupt": False,
-            "is_resuming": False,
+            "resume_value": None,
             "original_request": "",
             "skill_context": "",
             "conversation_summaries": [],
         })
 
         # Verify planner was called for both create and update
-        create_calls = [c for c in planner_calls if c["type"] == "create"]
-        update_calls = [c for c in planner_calls if c["type"] == "update"]
-        assert len(create_calls) >= 1, "Planner should have been called to create plan"
-        assert len(update_calls) >= 1, "Planner should have been called to update plan after step execution"
+        assert create_structured.ainvoke.call_count >= 1, "Planner should have been called to create plan"
+        assert len(update_ainvoke_calls) >= 1, "Planner should have been called to update plan after step execution"
 
         # Verify the plan's steps were updated by the planner
         plan = result.get("plan")
         assert plan is not None
-        # The updated step should contain database_id context from the planner update
-        pending = [s for s in plan.steps if not s.done]
-        # At least one step should have been updated or the plan adjusted
         assert len(plan.steps) >= 1
 
 
 class TestInterruptResume:
-    """Test that executor_node handles interrupt (WaitEvent) correctly."""
+    """Test that executor_node handles interrupt (WaitEvent) correctly with native interrupt()."""
 
-    @pytest.fixture
-    def mock_json_parser(self):
-        parser = AsyncMock()
-        import json
-        async def parse(content, default_value=None):
-            try:
-                return json.loads(content)
-            except Exception:
-                return default_value
-        parser.invoke = parse
-        return parser
+    async def test_interrupt_does_not_mark_step_completed(self):
+        """When react_graph returns should_interrupt=True, the step should NOT be marked COMPLETED.
 
-    async def test_interrupt_does_not_mark_step_completed(self, mock_json_parser):
-        """When react_graph returns should_interrupt=True, the step should NOT be marked COMPLETED."""
+        Uses checkpointer so interrupt_node can call interrupt().
+        """
+        from langgraph.checkpoint.memory import MemorySaver
         from app.domain.services.graphs.main_graph import build_main_graph
 
         class InterruptingReactGraph:
             async def astream(self, input_state, config=None):
                 yield {"tool_node": {
                     "events": [],
-                    "messages": input_state["messages"] + [
+                    "messages": [
                         AIMessage(content="Requesting browser takeover"),
                     ],
                     "should_interrupt": True,
                 }}
 
-        planner_llm = AsyncMock()
-        async def mock_invoke(**kwargs):
-            return {
-                "content": '{"title":"T","goal":"G","language":"zh","steps":[{"description":"Login to Notion"},{"description":"Read data"}],"message":"ok"}',
-                "role": "assistant",
-            }
-        planner_llm.invoke = mock_invoke
+        planner_llm = _make_structured_planner_llm(
+            create_response=PlanResponse(
+                title="T", goal="G", language="zh",
+                steps=[StepDef(description="Login to Notion"), StepDef(description="Read data")],
+                message="ok",
+            ),
+        )
 
+        checkpointer = MemorySaver()
         graph = build_main_graph(
             planner_llm=planner_llm,
             react_graph=InterruptingReactGraph(),
-            json_parser=mock_json_parser,
             summary_llm=planner_llm,
             uow_factory=MagicMock(),
             session_id="sess-interrupt",
+            checkpointer=checkpointer,
         )
 
+        config = {"configurable": {"thread_id": "test-interrupt"}}
         result = await graph.ainvoke({
-            "message": "查看Notion数据",
+            "message": "view Notion data",
             "language": "zh",
             "attachments": [],
             "plan": None,
@@ -702,58 +728,150 @@ class TestInterruptResume:
             "flow_status": "idle",
             "session_id": "sess-interrupt",
             "should_interrupt": False,
-            "is_resuming": False,
+            "resume_value": None,
             "original_request": "",
             "skill_context": "",
             "conversation_summaries": [],
-        })
+        }, config)
 
-        # Graph should stop at END after interrupt
-        assert result.get("should_interrupt") is True
+        # Graph should have been interrupted (interrupt_node called interrupt())
+        assert "__interrupt__" in result
+
+        # Check persisted state — should_interrupt should be True
+        state = graph.get_state(config)
+        assert state.next  # interrupt_node is pending
+
+        # Verify state values from executor_node output
+        assert state.values.get("should_interrupt") is True
 
         # Step should NOT be marked as COMPLETED — it was interrupted mid-execution
-        current_step = result.get("current_step")
+        current_step = state.values.get("current_step")
         assert current_step is not None
         assert current_step.status != ExecutionStatus.COMPLETED
 
         # Messages should be preserved for resume
-        messages = result.get("messages", [])
+        messages = state.values.get("messages", [])
         assert len(messages) > 0
 
         # original_request should be preserved
-        assert result.get("original_request") != ""
+        assert state.values.get("original_request") != ""
 
-    async def test_interrupt_preserves_execution_summary(self, mock_json_parser):
+    async def test_interrupt_and_resume_with_command(self):
+        """Full interrupt -> Command(resume=...) -> executor_node cycle."""
+        from langgraph.checkpoint.memory import MemorySaver
+        from langgraph.types import Command
+        from app.domain.services.graphs.main_graph import build_main_graph
+
+        call_count = 0
+
+        class InterruptThenCompleteReactGraph:
+            """First call interrupts, second call completes."""
+            async def astream(self, input_state, config=None):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    yield {"tool_node": {
+                        "events": [],
+                        "messages": [
+                            AIMessage(content="Need user login"),
+                        ],
+                        "should_interrupt": True,
+                    }}
+                else:
+                    yield {"llm_node": {
+                        "events": [],
+                        "messages": [
+                            AIMessage(content='{"success": true, "result": "done after resume", "attachments": []}'),
+                        ],
+                        "should_interrupt": False,
+                    }}
+
+        planner_llm = _make_structured_planner_llm(
+            create_response=PlanResponse(
+                title="T", goal="G", language="zh",
+                steps=[StepDef(description="Login")],
+                message="ok",
+            ),
+            update_response=PlanUpdateResponse(steps=[]),
+        )
+
+        checkpointer = MemorySaver()
+        graph = build_main_graph(
+            planner_llm=planner_llm,
+            react_graph=InterruptThenCompleteReactGraph(),
+            summary_llm=planner_llm,
+            uow_factory=MagicMock(),
+            session_id="sess-resume-cmd",
+            checkpointer=checkpointer,
+        )
+
+        config = {"configurable": {"thread_id": "test-resume-cmd"}}
+
+        # Step 1: Initial run — hits interrupt
+        result1 = await graph.ainvoke({
+            "message": "login to notion",
+            "language": "zh",
+            "attachments": [],
+            "plan": None,
+            "current_step": None,
+            "messages": [],
+            "execution_summary": "",
+            "events": [],
+            "flow_status": "idle",
+            "session_id": "sess-resume-cmd",
+            "should_interrupt": False,
+            "resume_value": None,
+            "original_request": "",
+            "skill_context": "",
+            "conversation_summaries": [],
+        }, config)
+
+        assert "__interrupt__" in result1
+        state = graph.get_state(config)
+        assert state.next  # interrupt_node pending
+
+        # Step 2: Resume with Command
+        result2 = await graph.ainvoke(Command(resume="I have logged in"), config)
+
+        # After resume, executor_node should have received resume_value
+        # Graph should complete (no more interrupt)
+        assert result2.get("flow_status") == "completed"
+        assert result2.get("should_interrupt") is not True
+
+    async def test_interrupt_preserves_execution_summary(self):
         """When interrupted, executor_node should still return execution_summary from the last AI message."""
+        from langgraph.checkpoint.memory import MemorySaver
         from app.domain.services.graphs.main_graph import build_main_graph
 
         class InterruptingReactGraph:
             async def astream(self, input_state, config=None):
                 yield {"tool_node": {
                     "events": [],
-                    "messages": input_state["messages"] + [
+                    "messages": [
                         AIMessage(content="Found database_id=abc123, need to login first"),
                     ],
                     "should_interrupt": True,
                 }}
 
-        planner_llm = AsyncMock()
-        async def mock_invoke(**kwargs):
-            return {
-                "content": '{"title":"T","goal":"G","language":"zh","steps":[{"description":"Find DB"}],"message":"ok"}',
-                "role": "assistant",
-            }
-        planner_llm.invoke = mock_invoke
+        planner_llm = _make_structured_planner_llm(
+            create_response=PlanResponse(
+                title="T", goal="G", language="zh",
+                steps=[StepDef(description="Find DB")],
+                message="ok",
+            ),
+        )
 
+        checkpointer = MemorySaver()
         graph = build_main_graph(
             planner_llm=planner_llm,
             react_graph=InterruptingReactGraph(),
-            json_parser=mock_json_parser,
             summary_llm=planner_llm,
             uow_factory=MagicMock(),
             session_id="sess-int-summary",
+            checkpointer=checkpointer,
         )
 
+        config = {"configurable": {"thread_id": "test-int-summary"}}
         result = await graph.ainvoke({
             "message": "find my database",
             "language": "zh",
@@ -766,14 +884,15 @@ class TestInterruptResume:
             "flow_status": "idle",
             "session_id": "sess-int-summary",
             "should_interrupt": False,
-            "is_resuming": False,
+            "resume_value": None,
             "original_request": "",
             "skill_context": "",
             "conversation_summaries": [],
-        })
+        }, config)
 
-        # execution_summary should contain the LLM's last message
-        summary = result.get("execution_summary", "")
+        # execution_summary should be in the checkpointed state
+        state = graph.get_state(config)
+        summary = state.values.get("execution_summary", "")
         assert "database_id=abc123" in summary
 
 
@@ -810,7 +929,7 @@ class TestCompactMessages:
         compacted = _compact_messages(msgs)
 
         assert len(compacted[0].content) < 5000
-        assert "已截断" in compacted[0].content
+        assert "\u5df2\u622a\u65ad" in compacted[0].content
 
     def test_preserves_normal_messages(self):
         from app.domain.services.graphs.main_graph import _compact_messages

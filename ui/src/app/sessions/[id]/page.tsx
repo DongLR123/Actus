@@ -63,6 +63,7 @@ type ToolVisualContent = {
   searchResults: SearchResultCard[];
   filepath: string | null;
   mcpResult: string | null;
+  mcpAttachments: string[] | null;
 };
 
 type TakeoverMeta = {
@@ -228,6 +229,7 @@ function parseToolVisual(eventData: Record<string, unknown>): ToolVisualContent 
 
   // MCP/A2A 工具调用结果
   let mcpResult: string | null = null;
+  let mcpAttachments: string[] | null = null;
   if ((toolName === "mcp" || toolName === "a2a" || toolName === "skill") && content) {
     const rawResult = (toolName === "a2a")
       ? (content as Record<string, unknown>).a2a_result
@@ -235,11 +237,24 @@ function parseToolVisual(eventData: Record<string, unknown>): ToolVisualContent 
         ? (content as Record<string, unknown>).skill_result
         : (content as Record<string, unknown>).result;
     if (rawResult !== undefined && rawResult !== null) {
-      mcpResult = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
+      if (typeof rawResult === "object" && rawResult !== null && !Array.isArray(rawResult)) {
+        const obj = rawResult as Record<string, unknown>;
+        // 结构化结果：提取 result 文本和 attachments
+        if (typeof obj.result === "string") {
+          mcpResult = obj.result;
+          if (Array.isArray(obj.attachments) && obj.attachments.length > 0) {
+            mcpAttachments = obj.attachments.filter((a): a is string => typeof a === "string");
+          }
+        } else {
+          mcpResult = JSON.stringify(rawResult, null, 2);
+        }
+      } else {
+        mcpResult = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult, null, 2);
+      }
     }
   }
 
-  return { screenshots, searchResults, filepath, mcpResult };
+  return { screenshots, searchResults, filepath, mcpResult, mcpAttachments };
 }
 
 /** 可展开/折叠的工具详情文本 */
@@ -267,6 +282,52 @@ function stripXmlTags(text: string): string {
   result = result.replace(/<tool\b[^>]*>/g, "");
   result = result.replace(/<\/tool>/g, "");
   return result;
+}
+
+/**
+ * 从消息文本中提取嵌入的结构化 JSON 结果。
+ * LLM 有时会在回复中直接包含 {"success":..., "result":"...", "attachments":[...]} 格式的原始 JSON，
+ * 此函数将其拆解为纯文本 + 附件路径，以便前端正常渲染。
+ */
+function extractEmbeddedJsonResult(message: string): {
+  text: string;
+  embeddedAttachments: string[];
+} {
+  // 从消息末尾向前查找最后一个 `{` 开头的 JSON 块
+  const lastBrace = message.lastIndexOf("}");
+  if (lastBrace === -1) return { text: message, embeddedAttachments: [] };
+
+  // 尝试从不同的 `{` 位置解析 JSON，从后往前查找有效的顶层 JSON 对象
+  let searchFrom = lastBrace;
+  while (searchFrom >= 0) {
+    const openBrace = message.lastIndexOf("{", searchFrom);
+    if (openBrace === -1) break;
+
+    const candidate = message.slice(openBrace, lastBrace + 1).trim();
+    try {
+      const parsed = JSON.parse(candidate);
+      if (typeof parsed === "object" && parsed !== null) {
+        // Support both "result" (MCP/skill tools) and "message" (summarizer) keys
+        const resultText =
+          typeof parsed.result === "string" ? parsed.result
+          : typeof parsed.message === "string" ? parsed.message
+          : null;
+        if (resultText !== null) {
+          const prefix = message.slice(0, openBrace).trim();
+          const text = prefix ? `${prefix}\n\n${resultText}` : resultText;
+          const attachments: string[] = Array.isArray(parsed.attachments)
+            ? parsed.attachments.filter((a: unknown): a is string => typeof a === "string")
+            : [];
+          return { text, embeddedAttachments: attachments };
+        }
+      }
+    } catch {
+      // 该位置不是有效 JSON，继续向前查找
+    }
+    searchFrom = openBrace - 1;
+  }
+
+  return { text: message, embeddedAttachments: [] };
 }
 
 function renderEventItem(
@@ -303,6 +364,11 @@ function renderEventItem(
       );
     }
 
+    // 提取嵌入的结构化 JSON 结果（如 skill/a2a 工具返回的 {"success","result","attachments"}）
+    const extracted = isPartial ? null : extractEmbeddedJsonResult(message);
+    const displayMessage = extracted ? extracted.text : message;
+    const embeddedAttachments = extracted?.embeddedAttachments || [];
+
     return (
       <div key={eventKey} className="mt-4">
         <div className="mb-1 flex items-center justify-between">
@@ -316,9 +382,22 @@ function renderEventItem(
           {isPartial ? (
             <p className="whitespace-pre-wrap leading-7">{stripXmlTags(message) || "（空消息）"}</p>
           ) : (
-            <MarkdownRenderer content={message || "（空消息）"} />
+            <MarkdownRenderer content={displayMessage || "（空消息）"} />
           )}
           {renderMessageAttachments(attachments, onPreviewFile)}
+          {embeddedAttachments.length > 0 ? (
+            <div className="mt-2 flex flex-wrap gap-2">
+              {embeddedAttachments.map((filePath) => (
+                <button
+                  key={filePath}
+                  className="inline-flex items-center rounded-lg border border-blue-200 bg-blue-50 px-2 py-1 text-xs text-blue-700 hover:bg-blue-100 dark:border-blue-500/30 dark:bg-blue-500/10 dark:text-blue-400 dark:hover:bg-blue-500/20"
+                  onClick={() => onPreviewFilePath(filePath)}
+                >
+                  📎 {getPathTail(filePath)}
+                </button>
+              ))}
+            </div>
+          ) : null}
           {isStreamingAssistant || isPartial ? (
             <div className="mt-2 inline-flex items-center gap-1 text-xs text-amber-600">
               <Loader2 size={12} className="animate-spin" />
@@ -479,10 +558,24 @@ function renderEventItem(
             <summary className="cursor-pointer text-xs text-muted-foreground hover:text-foreground">
               查看调用结果
             </summary>
-            <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-muted p-2 text-xs text-muted-foreground">
-              {visual.mcpResult}
-            </pre>
+            <div className="mt-1 max-h-60 overflow-auto rounded-lg bg-muted p-2">
+              <MarkdownRenderer content={visual.mcpResult} className="text-xs leading-6 text-muted-foreground" />
+            </div>
           </details>
+        ) : null}
+
+        {!isRunning && visual.mcpAttachments && visual.mcpAttachments.length > 0 ? (
+          <div className="mt-2 flex flex-wrap gap-2">
+            {visual.mcpAttachments.map((filePath) => (
+              <button
+                key={filePath}
+                className="inline-flex items-center rounded-lg border border-blue-200 bg-blue-50 px-2 py-1 text-xs text-blue-700 hover:bg-blue-100 dark:border-blue-500/30 dark:bg-blue-500/10 dark:text-blue-400 dark:hover:bg-blue-500/20"
+                onClick={() => onPreviewFilePath(filePath)}
+              >
+                📎 {getPathTail(filePath)}
+              </button>
+            ))}
+          </div>
         ) : null}
       </div>
     );

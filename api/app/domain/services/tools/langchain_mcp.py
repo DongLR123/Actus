@@ -108,6 +108,9 @@ def _make_mcp_coroutine(mcp_tool: MCPTool, tool_name: str):
 
     async def _invoke(**kwargs: Any) -> str:
         result = await mcp_tool.invoke(tool_name, **kwargs)
+        # Raise on failure so the caller detects errors structurally
+        if hasattr(result, "success") and not result.success:
+            raise RuntimeError(getattr(result, "message", None) or str(result))
         if hasattr(result, "message") and result.message:
             return result.message
         if hasattr(result, "data") and result.data:
