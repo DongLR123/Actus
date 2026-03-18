@@ -403,6 +403,52 @@ class AgentTaskRunner(TaskRunner):
         except Exception as e:
             logger.exception(f"AgentTaskRunner同步消息附件到文件存储桶失败: {str(e)}")
 
+    # 需要同步到会话文件列表的输出文件扩展名
+    _OUTPUT_FILE_EXTENSIONS = {
+        ".pdf", ".pptx", ".ppt", ".docx", ".doc", ".xlsx", ".xls",
+        ".csv", ".md", ".txt", ".html", ".htm",
+        ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp",
+        ".mp3", ".mp4", ".wav",
+        ".json", ".xml", ".yaml", ".yml",
+    }
+
+    async def _sync_generated_files(self, exec_dir: str) -> None:
+        """扫描 exec_dir 中的输出文件并同步到会话文件列表。
+
+        仅同步已知输出类型的文件，跳过 .py 等源代码文件
+        （源代码通过 file_write 工具已自动同步）。
+        """
+        try:
+            list_result = await self._sandbox.list_files(exec_dir)
+            if not list_result.success:
+                return
+
+            files_data = (list_result.data or {}).get("files", [])
+            for file_info in files_data:
+                if file_info.get("is_dir"):
+                    continue
+                filepath = file_info.get("path", "")
+                if not filepath:
+                    continue
+
+                # 仅同步已知输出文件类型
+                ext = filepath.rsplit(".", 1)[-1] if "." in filepath else ""
+                if f".{ext}" not in self._OUTPUT_FILE_EXTENSIONS:
+                    continue
+
+                # 检查是否已存在于会话文件列表
+                async with self._uow:
+                    existing = await self._uow.session.get_file_by_path(
+                        self._session_id, filepath
+                    )
+                if existing:
+                    continue
+
+                logger.info(f"自动同步 shell/skill 输出文件: {filepath}")
+                await self._sync_file_to_storage(filepath)
+        except Exception as e:
+            logger.warning(f"扫描输出文件失败（不影响主流程）: {e}")
+
     async def _sync_message_attachments_to_storage(self, event: MessageEvent) -> None:
         """将消息事件的附件同步到文件存储桶中"""
         # 1.定义附件列表存储数据
@@ -1089,10 +1135,13 @@ class AgentTaskRunner(TaskRunner):
                         session_id, console=True,
                     )
                     console_records = (shell_result.data or {}).get("console_records", [])
-                    print(f"[SNAPSHOT-DEBUG] Shell控制台记录: session={session_id}, records={len(console_records) if console_records else 0}", flush=True)
                     event.tool_content = ShellToolContent(
                         console=console_records
                     )
+                    # Shell 命令可能生成输出文件，主动扫描并同步
+                    exec_dir = event.function_args.get("exec_dir", "")
+                    if exec_dir:
+                        await self._sync_generated_files(exec_dir)
                 elif category == "file":
                     # 5.工具为file则将文件同步到对象存储
                     filepath = event.function_args.get("filepath")
@@ -1164,7 +1213,34 @@ class AgentTaskRunner(TaskRunner):
                             else A2AToolContent(a2a_result="(A2A智能体无可用结果)")
                         )
                 elif category == "skill":
-                    if event.function_result and event.function_result.data is not None:
+                    # Native skill 通过 ToolResult.data.shell_session_id 传递沙箱会话
+                    skill_data = (
+                        event.function_result.data
+                        if event.function_result and event.function_result.data is not None
+                        else {}
+                    )
+                    shell_sid = (
+                        skill_data.get("shell_session_id")
+                        if isinstance(skill_data, dict)
+                        else None
+                    )
+                    if shell_sid:
+                        # 读取终端输出，供 UI 终端面板展示
+                        try:
+                            shell_result = await self._sandbox.read_shell_output(
+                                shell_sid, console=True,
+                            )
+                            console_records = (shell_result.data or {}).get(
+                                "console_records", []
+                            )
+                            event.tool_content = ShellToolContent(
+                                console=console_records
+                            )
+                        except Exception:
+                            event.tool_content = SkillToolContent(
+                                skill_result=skill_data
+                            )
+                    elif event.function_result and event.function_result.data is not None:
                         event.tool_content = SkillToolContent(
                             skill_result=event.function_result.data
                         )
@@ -1176,6 +1252,14 @@ class AgentTaskRunner(TaskRunner):
                         event.tool_content = SkillToolContent(
                             skill_result="(Skill工具无可用结果)"
                         )
+                    # Skill 执行可能生成输出文件，主动扫描并同步
+                    skill_exec_dir = (
+                        skill_data.get("exec_dir")
+                        if isinstance(skill_data, dict)
+                        else None
+                    )
+                    if skill_exec_dir:
+                        await self._sync_generated_files(skill_exec_dir)
                 elif category == "skill_creation":
                     if event.function_result and event.function_result.data is not None:
                         event.tool_content = SkillToolContent(

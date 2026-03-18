@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.application.services.skill_creator_service import SkillCreatorService
+from app.application.services.skill_creator_service import ManifestOutput, SkillCreatorService
 from app.domain.models.skill_creator import (
     ScriptFile,
     SkillBlueprint,
@@ -93,8 +93,7 @@ async def test_full_pipeline_with_mocked_llm_and_sandbox() -> None:
         search_keywords=["echo python"],
         estimated_deps=[],
     )
-    generate_files = SkillGeneratedFiles(
-        skill_md="---\nname: echo\nruntime_type: native\n---\n# Echo",
+    manifest_output = ManifestOutput(
         manifest={
             "name": "echo",
             "slug": "echo",
@@ -111,16 +110,13 @@ async def test_full_pipeline_with_mocked_llm_and_sandbox() -> None:
                 }
             ],
         },
-        scripts=[
-            ScriptFile(
-                path="bundle/echo.py",
-                content="import sys, json\nargs = json.loads(sys.argv[1]) if len(sys.argv)>1 else {}\nprint(json.dumps({'result': args.get('text', '')}))",
-            )
-        ],
         dependencies=[],
     )
+    script_code = "import sys, json\nargs = json.loads(sys.argv[1]) if len(sys.argv)>1 else {}\nprint(json.dumps({'result': args.get('text', '')}))"
+    skill_md = "---\nname: echo\nruntime_type: native\n---\n# Echo"
     mock_llm, _ = _make_mock_llm(
-        structured_returns=[analyze_blueprint, generate_files],
+        structured_returns=[analyze_blueprint, manifest_output],
+        direct_returns=[script_code, skill_md],
     )
 
     service = SkillCreatorService(
@@ -176,9 +172,8 @@ async def test_brainstorm_generate_install_flow() -> None:
         estimated_deps=["googletrans"],
     )
 
-    # Step 2: generate
-    generated = SkillGeneratedFiles(
-        skill_md="---\nname: translator\n---\n# Translator",
+    # Step 2: generate (phased: manifest → script → skill_md)
+    manifest_output = ManifestOutput(
         manifest={
             "name": "translator",
             "slug": "translator",
@@ -195,12 +190,14 @@ async def test_brainstorm_generate_install_flow() -> None:
                 }
             ],
         },
-        scripts=[ScriptFile(path="bundle/translate.py", content="print('ok')")],
         dependencies=["googletrans"],
     )
+    script_code = "print('ok')"
+    skill_md = "---\nname: translator\n---\n# Translator"
 
     mock_llm, _ = _make_mock_llm(
-        structured_returns=[analyze_blueprint, generated],
+        structured_returns=[analyze_blueprint, manifest_output],
+        direct_returns=[script_code, skill_md],
     )
     service = SkillCreatorService(
         llm=mock_llm,

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 import ast
 import json
 import logging
 import re
 import shlex
 import tempfile
+import uuid
 from pathlib import Path
-from typing import AsyncGenerator
+from typing import Any, AsyncGenerator
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.domain.external.sandbox import Sandbox
 from app.domain.models.skill import SkillSourceType
@@ -29,6 +32,65 @@ from app.infrastructure.external.github_search_client import GitHubSearchClient
 logger = logging.getLogger(__name__)
 
 MAX_FIX_RETRIES = 2
+
+
+class ManifestOutput(BaseModel):
+    """Phase 1 输出：manifest + dependencies。仅用于生成管线内部。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    manifest: dict[str, Any] = Field(
+        description='manifest.json 对象，必须包含 name, runtime_type("native"), '
+        "tools 数组。每个 tool 必须有 name, description, parameters(object), "
+        'required, entry(含 command: "python bundle/<name>.py")'
+    )
+    dependencies: list[str] = Field(
+        default_factory=list,
+        description="pip 包名列表（如 requests, beautifulsoup4），不要写中文描述",
+    )
+
+
+def _normalize_generated_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    """归一化 LLM 生成的 manifest：补全 runtime_type 和 entry.command。"""
+    manifest = dict(manifest)
+    if "runtime_type" not in manifest:
+        manifest["runtime_type"] = "native"
+    for tool in manifest.get("tools", []):
+        if isinstance(tool, dict):
+            entry = tool.get("entry")
+            if isinstance(entry, dict) and "command" not in entry:
+                tool_name = tool.get("name", "tool")
+                entry["command"] = f"python bundle/{tool_name}.py"
+            elif entry is None:
+                tool_name = tool.get("name", "tool")
+                tool["entry"] = {"command": f"python bundle/{tool_name}.py"}
+    return manifest
+
+
+def _normalize_generated_dependencies(raw: Any) -> list[str]:
+    """归一化 LLM 生成的 dependencies：dict/list-of-dicts → list[str]，过滤中文。"""
+    if isinstance(raw, dict):
+        extracted: list[str] = []
+        for _key, val in raw.items():
+            if isinstance(val, list):
+                for item in val:
+                    if isinstance(item, str):
+                        extracted.append(item)
+            elif isinstance(val, str):
+                extracted.append(val)
+        return [d for d in extracted if not any('\u4e00' <= c <= '\u9fff' for c in d)]
+    if isinstance(raw, list):
+        result: list[str] = []
+        for dep in raw:
+            if isinstance(dep, str):
+                if not any('\u4e00' <= c <= '\u9fff' for c in dep):
+                    result.append(dep)
+            elif isinstance(dep, dict):
+                name = dep.get("name", "")
+                if name and not any('\u4e00' <= c <= '\u9fff' for c in name):
+                    result.append(name)
+        return result
+    return []
 
 ANALYZE_SYSTEM_PROMPT = """\
 你是 Skill 架构师。你的任务是：将用户的"创建 Skill"需求解析为结构化 JSON 蓝图。
@@ -59,42 +121,12 @@ ANALYZE_SYSTEM_PROMPT = """\
 - 直接返回 JSON 对象，不要嵌套在其他键下
 - 仅返回上述结构的 JSON，不要返回其他文本或执行实际操作"""
 
-GENERATE_SYSTEM_PROMPT = """\
-你是 Skill 代码生成器。请根据需求蓝图和 GitHub 调研结果，生成可安装的 Native Skill。
+MANIFEST_SYSTEM_PROMPT = """\
+你是 Skill manifest 生成器。请根据需求蓝图和调研报告，生成 manifest.json 和 pip 依赖列表。
 
-必须返回严格 JSON，包含以下四个字段：
+必须返回包含两个字段的 JSON：
 
-### 1. skill_md (string)
-完整的 SKILL.md 内容，格式必须严格如下（注意 --- 分隔符）：
-```
----
-name: skill-name
-version: "0.1.0"
-description: 功能描述
-runtime_type: native
-tools:
-  - name: tool_name
-    description: 工具描述
-    parameters:
-      param1:
-        type: string
-        description: 参数描述
-    required:
-      - param1
-    entry:
-      command: python bundle/tool_name.py
-activation: {}
-policy:
-  risk_level: low
----
-
-# Skill 名称
-
-使用说明文档...
-```
-
-### 2. manifest (object)
-必须符合以下结构：
+### 1. manifest (object)
 {
   "name": "skill-name",
   "slug": "skill-name",
@@ -122,24 +154,68 @@ policy:
 - parameters 必须是 object 格式（键为参数名，值为 {type, description}），不是数组
 - entry.command 指向 bundle/ 下的脚本，格式为 "python bundle/<script>.py"
 - runtime_type 必须为 "native"
+- 每个蓝图中的工具都必须有对应的 tool 条目
 
-### 3. scripts (array)
-每个元素包含 path 和 content：
-[{"path": "bundle/tool_name.py", "content": "...python code..."}]
+### 2. dependencies (array)
+需要 pip install 的包名列表（如 ["requests", "beautifulsoup4"]）。
+只写 pip 包名，不要写中文描述。
+
+仅返回 JSON，不要返回其他文字。"""
+
+SCRIPT_SYSTEM_PROMPT = """\
+你是 Python 脚本生成器。请为指定的工具生成一个完整的 Python 脚本。
 
 脚本要求：
-- 接受一个 JSON 字符串作为命令行参数: sys.argv[1]
-- 输出 JSON 格式结果到 stdout
-- 支持 --help 参数（用 argparse 或简单判断）
-- 优先使用调研到的成熟开源库
+1. 接受一个 JSON 字符串作为命令行参数: sys.argv[1]
+2. 解析 JSON 输入，执行工具逻辑
+3. 输出 JSON 格式结果到 stdout（使用 print(json.dumps(...))）
+4. 支持 --help 参数（使用 argparse 或简单的 sys.argv 判断）
+5. 优先使用调研报告中推荐的成熟开源库
+6. 合理处理异常，出错时也输出 JSON 格式的错误信息
 
-### 4. dependencies (array)
-需要 pip install 的包名列表。
+直接返回 Python 代码，不要包含任何解释性文字。
+如果使用 markdown 代码块，请用 ```python 标记。"""
 
-只返回 JSON，不要返回其他文字。"""
+SKILL_MD_SYSTEM_PROMPT = """\
+你是 SKILL.md 文档生成器。请根据已生成的 manifest 和脚本列表，生成完整的 SKILL.md 文件。
+
+SKILL.md 格式必须严格如下：
+---
+name: skill-name
+version: "0.1.0"
+description: 功能描述
+runtime_type: native
+tools:
+  - name: tool_name
+    description: 工具描述
+    parameters:
+      param1:
+        type: string
+        description: 参数描述
+    required:
+      - param1
+    entry:
+      command: python bundle/tool_name.py
+activation: {}
+policy:
+  risk_level: low
+---
+
+# Skill 名称
+
+## 功能说明
+描述该 Skill 的用途和适用场景。
+
+## 工具列表
+列出每个工具的使用方式和参数说明。
+
+## 使用示例
+提供 1-2 个典型使用场景。
+
+直接返回 SKILL.md 的完整内容，不要包含额外解释。"""
 
 
-def _parse_llm_json(text: str) -> dict:
+def _parse_llm_json(text: str) -> dict[str, Any]:
     """从 LLM 文本响应中提取 JSON 对象。
 
     处理常见格式：
@@ -184,6 +260,50 @@ def _parse_llm_json(text: str) -> dict:
     raise ValueError(f"无法从 LLM 响应中提取 JSON（前 200 字符）: {text[:200]}")
 
 
+def _extract_python_code(text: str) -> str:
+    """从 LLM 响应中提取 Python 代码。
+
+    优先级：```python 代码块 > ``` 通用代码块 > 原始文本（去掉首尾非代码行）。
+    """
+    text = text.strip()
+    if not text:
+        raise ValueError("LLM 响应为空，无法提取 Python 代码")
+
+    # 1. 提取 ```python ... ``` 代码块
+    py_match = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
+    if py_match:
+        return py_match.group(1).strip()
+
+    # 2. 提取 ``` ... ``` 通用代码块
+    generic_match = re.search(r"```\s*\n(.*?)```", text, re.DOTALL)
+    if generic_match:
+        return generic_match.group(1).strip()
+
+    # 3. 原始文本：去掉首尾的非 Python 行
+    lines = text.splitlines()
+    code_pattern = re.compile(
+        r"^(import |from |def |class |#|@|if |for |while |try:|except |return |"
+        r"with |async |await |print\(|raise |    )"
+    )
+    start = None
+    for i, line in enumerate(lines):
+        if code_pattern.match(line):
+            start = i
+            break
+
+    if start is None:
+        raise ValueError(f"无法从 LLM 响应中提取 Python 代码（前 200 字符）: {text[:200]}")
+
+    code_lines = lines[start:]
+    while code_lines and not code_lines[-1].strip():
+        code_lines.pop()
+
+    result = "\n".join(code_lines).strip()
+    if not result:
+        raise ValueError(f"提取到空的 Python 代码（前 200 字符）: {text[:200]}")
+    return result
+
+
 def _validate_generated_files(files: SkillGeneratedFiles) -> None:
     """校验 LLM 生成结果的结构完整性。
 
@@ -191,11 +311,21 @@ def _validate_generated_files(files: SkillGeneratedFiles) -> None:
     """
     errors: list[str] = []
 
-    # 1. manifest 不能是空壳（LLM 未生成 manifest 时会 fallback 为 {}）
-    if not files.manifest or not any(
-        k in files.manifest for k in ("name", "tools", "runtime_type")
-    ):
-        errors.append("manifest 为空或缺少关键字段（name/tools/runtime_type）")
+    # 1. manifest 必须包含安装所需的关键字段
+    if not files.manifest:
+        errors.append("manifest 为空")
+    else:
+        for required_key in ("name", "runtime_type", "tools"):
+            if required_key not in files.manifest:
+                errors.append(f"manifest 缺少必填字段: {required_key}")
+        manifest_tools = files.manifest.get("tools", [])
+        if isinstance(manifest_tools, list) and manifest_tools:
+            for i, tool in enumerate(manifest_tools):
+                if isinstance(tool, dict) and not tool.get("entry", {}).get("command"):
+                    errors.append(
+                        f"manifest.tools[{i}]({tool.get('name', '?')}) "
+                        f"缺少 entry.command"
+                    )
 
     # 2. 必须有 bundle/ 下的 Python 脚本
     py_scripts = [s for s in files.scripts if s.path.endswith(".py")]
@@ -243,7 +373,7 @@ _SAMPLE_VALUES = {
 }
 
 
-def _build_sample_input(tool_def: dict) -> dict:
+def _build_sample_input(tool_def: dict[str, Any]) -> dict[str, Any]:
     """根据 manifest tool 定义构造最小测试 JSON 输入。"""
     params_raw = tool_def.get("parameters", {})
     required_raw = tool_def.get("required", [])
@@ -311,7 +441,16 @@ class SkillCreatorService:
             )
 
             yield SkillCreationProgress(step="generating", message="正在生成 Skill 文件...")
-            files = await self._generate_files(blueprint, report)
+            try:
+                files = await self._generate_files(blueprint, report)
+            except Exception as exc:
+                logger.exception("Skill 文件生成失败: %s", exc)
+                yield SkillCreationProgress(
+                    step="generating",
+                    message="生成失败",
+                    detail=str(exc),
+                )
+                return
             yield SkillCreationProgress(
                 step="generating",
                 message=f"生成完成，共 {len(files.scripts)} 个脚本",
@@ -391,7 +530,16 @@ class SkillCreatorService:
         )
 
         yield SkillCreationProgress(step="generating", message="正在生成 Skill 文件...")
-        files = await self._generate_files(blueprint, report)
+        try:
+            files = await self._generate_files(blueprint, report)
+        except Exception as exc:
+            logger.exception("Skill 文件生成失败: %s", exc)
+            yield SkillCreationProgress(
+                step="generating",
+                message="生成失败",
+                detail=str(exc),
+            )
+            return
         yield SkillCreationProgress(
             step="generating",
             message=f"生成完成，共 {len(files.scripts)} 个脚本",
@@ -438,8 +586,6 @@ class SkillCreatorService:
         )
 
     async def _analyze_requirement(self, description: str) -> SkillBlueprint:
-        import asyncio
-
         messages = [
             SystemMessage(content=ANALYZE_SYSTEM_PROMPT),
             HumanMessage(content=description),
@@ -468,67 +614,222 @@ class SkillCreatorService:
             logger.warning("GitHub 调研失败，降级为空结果: %s", exc)
             return []
 
-    async def _generate_files(
+    # ---- Phase 方法 -------------------------------------------------------- #
+
+    async def _generate_manifest(
         self,
         blueprint: SkillBlueprint,
         research_report: str,
-    ) -> SkillGeneratedFiles:
-        """调用 LLM 生成 Skill 文件集合。
-
-        使用双路策略确保 LLM 同时遵循结构约束和内容约束：
-        1. with_structured_output(SkillGeneratedFiles) 保证返回 JSON 结构
-           （Field descriptions 携带 manifest/bundle/pip 等格式要求）
-        2. GENERATE_SYSTEM_PROMPT 提供详细的格式说明和代码示例
-        3. _validate_generated_files 做结构校验，不通过则重试
-        """
-        import asyncio
-
+    ) -> ManifestOutput:
+        """Phase 1: 生成 manifest + dependencies。"""
         tool_payload = [tool.model_dump() for tool in blueprint.tools]
         prompt = (
             "## 需求蓝图\n"
             f"- 名称: {blueprint.skill_name}\n"
             f"- 描述: {blueprint.description}\n"
             f"- 工具: {json.dumps(tool_payload, ensure_ascii=False)}\n"
-            f"- 依赖: {json.dumps(blueprint.estimated_deps, ensure_ascii=False)}\n\n"
+            f"- 预计依赖: {json.dumps(blueprint.estimated_deps, ensure_ascii=False)}\n\n"
             f"{research_report}"
         )
         messages = [
-            SystemMessage(content=GENERATE_SYSTEM_PROMPT),
+            SystemMessage(content=MANIFEST_SYSTEM_PROMPT),
             HumanMessage(content=prompt),
         ]
 
-        # 优先 with_structured_output（强制 JSON），失败时回退 ainvoke + JSON 解析
+        # 先尝试 with_structured_output（3 次），全部失败后回退到 ainvoke + JSON 解析
+        structured = self._llm.with_structured_output(ManifestOutput)
         last_exc: Exception | None = None
         for attempt in range(3):
             try:
-                if attempt < 2:
-                    # 前两次用 with_structured_output（tool call 强制 JSON）
-                    structured = self._llm.with_structured_output(SkillGeneratedFiles)
-                    files: SkillGeneratedFiles = await structured.ainvoke(messages)
-                else:
-                    # 最后一次回退：直接 ainvoke + JSON 解析
-                    response = await self._llm.ainvoke(
-                        messages,
-                        response_format={"type": "json_object"},
-                    )
-                    text = response.content if hasattr(response, "content") else str(response)
-                    parsed = _parse_llm_json(text)
-                    files = SkillGeneratedFiles.model_validate(parsed)
-
-                # 结构化校验：LLM 必须生成有效的可执行 Skill
-                _validate_generated_files(files)
-
-                return files
+                result = await structured.ainvoke(messages)
+                result.manifest = _normalize_generated_manifest(result.manifest)
+                result.dependencies = _normalize_generated_dependencies(result.dependencies)
+                return result
             except Exception as exc:
                 last_exc = exc
                 if attempt < 2:
                     delay = 2 * (2 ** attempt)
                     logger.warning(
-                        "Skill 文件生成失败 (attempt %d/3), %ds 后重试: %s",
+                        "Phase 1 structured output 失败 (attempt %d/3), %ds 后重试: %s",
+                        attempt + 1, delay, exc,
+                    )
+                    await asyncio.sleep(delay)
+
+        # structured output 全部失败，回退到 ainvoke + JSON 解析（3 次）
+        logger.warning("Phase 1 structured output 全部失败，回退到 ainvoke + JSON 解析")
+        for attempt in range(3):
+            try:
+                response = await self._llm.ainvoke(
+                    messages,
+                    response_format={"type": "json_object"},
+                )
+                text = response.content if hasattr(response, "content") else str(response)
+                parsed = _parse_llm_json(text)
+                manifest = _normalize_generated_manifest(parsed.get("manifest", {}))
+                dependencies = _normalize_generated_dependencies(
+                    parsed.get("dependencies", [])
+                )
+                return ManifestOutput(manifest=manifest, dependencies=dependencies)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    delay = 2 * (2 ** attempt)
+                    logger.warning(
+                        "Phase 1 fallback 失败 (attempt %d/3), %ds 后重试: %s",
                         attempt + 1, delay, exc,
                     )
                     await asyncio.sleep(delay)
         raise last_exc  # type: ignore[misc]
+
+    async def _generate_script(
+        self,
+        tool_def: dict,
+        blueprint: SkillBlueprint,
+        research_report: str,
+    ) -> ScriptFile:
+        """Phase 2: 为单个工具生成 Python 脚本。"""
+        tool_name = tool_def.get("name", "tool")
+        params_desc = json.dumps(tool_def.get("parameters", {}), ensure_ascii=False)
+        required_desc = json.dumps(tool_def.get("required", []), ensure_ascii=False)
+
+        prompt = (
+            f"## 工具信息\n"
+            f"- 工具名: {tool_name}\n"
+            f"- 描述: {tool_def.get('description', '')}\n"
+            f"- 参数: {params_desc}\n"
+            f"- 必填参数: {required_desc}\n\n"
+            f"## 所属 Skill\n"
+            f"- 名称: {blueprint.skill_name}\n"
+            f"- 描述: {blueprint.description}\n\n"
+            f"{research_report}\n\n"
+            f"请生成 {tool_name} 的完整 Python 脚本。"
+        )
+        messages = [
+            SystemMessage(content=SCRIPT_SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ]
+
+        # 提取脚本路径
+        entry = tool_def.get("entry", {})
+        command = entry.get("command", "") if isinstance(entry, dict) else ""
+        if command.startswith("python "):
+            script_path = command[len("python "):].strip()
+        else:
+            script_path = f"bundle/{tool_name}.py"
+
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = await self._llm.ainvoke(messages)
+                text = response.content if hasattr(response, "content") else str(response)
+                code = _extract_python_code(text)
+                ast.parse(code)  # 语法校验
+                return ScriptFile(path=script_path, content=code)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    delay = 2 * (2 ** attempt)
+                    logger.warning(
+                        "Phase 2 脚本生成失败 (%s, attempt %d/3), %ds 后重试: %s",
+                        tool_name, attempt + 1, delay, exc,
+                    )
+                    await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
+    async def _generate_skill_md(
+        self,
+        manifest: dict[str, Any],
+        scripts: list[ScriptFile],
+        blueprint: SkillBlueprint,
+    ) -> str:
+        """Phase 3: 生成 SKILL.md 文档。"""
+        manifest_json = json.dumps(manifest, ensure_ascii=False, indent=2)
+        script_list = ", ".join(s.path for s in scripts)
+        prompt = (
+            f"## 已生成的 Manifest\n```json\n{manifest_json}\n```\n\n"
+            f"## 脚本文件列表\n{script_list}\n\n"
+            f"## Skill 描述\n{blueprint.description}\n\n"
+            f"请生成完整的 SKILL.md 文件。"
+        )
+        messages = [
+            SystemMessage(content=SKILL_MD_SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ]
+
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = await self._llm.ainvoke(messages)
+                text = response.content if hasattr(response, "content") else str(response)
+                text = text.strip()
+
+                # 去掉 markdown 代码块包裹
+                for fence in ("```yaml\n", "```markdown\n", "```\n"):
+                    if text.startswith(fence):
+                        text = text[len(fence):]
+                        if text.endswith("```"):
+                            text = text[:-3]
+                        text = text.strip()
+                        break
+
+                if not text or "---" not in text:
+                    raise ValueError(
+                        f"SKILL.md 缺少 --- frontmatter（前 100 字符）: {text[:100]}"
+                    )
+
+                return text
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    delay = 2 * (2 ** attempt)
+                    logger.warning(
+                        "Phase 3 SKILL.md 生成失败 (attempt %d/3), %ds 后重试: %s",
+                        attempt + 1, delay, exc,
+                    )
+                    await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
+    async def _generate_files(
+        self,
+        blueprint: SkillBlueprint,
+        research_report: str,
+    ) -> SkillGeneratedFiles:
+        """三阶段生成 Skill 文件：manifest → 逐个脚本 → SKILL.md。"""
+        # Phase 1: manifest + dependencies
+        manifest_output = await self._generate_manifest(blueprint, research_report)
+        manifest = manifest_output.manifest
+        dependencies = manifest_output.dependencies
+
+        # Phase 2: 逐个工具生成脚本
+        scripts: list[ScriptFile] = []
+        for tool_def in manifest.get("tools", []):
+            if not isinstance(tool_def, dict):
+                continue
+            script = await self._generate_script(tool_def, blueprint, research_report)
+            scripts.append(script)
+
+        # Phase 3: SKILL.md
+        skill_md = await self._generate_skill_md(manifest, scripts, blueprint)
+
+        # 交叉校验：manifest 中每个工具都有对应脚本
+        tool_commands = {
+            t["entry"]["command"]
+            for t in manifest.get("tools", [])
+            if isinstance(t, dict) and isinstance(t.get("entry"), dict)
+        }
+        script_commands = {f"python {s.path}" for s in scripts}
+        missing = tool_commands - script_commands
+        if missing:
+            logger.warning("Manifest 工具缺少对应脚本: %s", missing)
+
+        files = SkillGeneratedFiles(
+            skill_md=skill_md,
+            manifest=manifest,
+            scripts=scripts,
+            dependencies=dependencies,
+        )
+        _validate_generated_files(files)
+        return files
 
     async def _validate_in_sandbox(
         self,
@@ -558,14 +859,21 @@ class SkillCreatorService:
             return errors
 
         # ---- 2. 部署到沙箱 ---- #
-        session_id = "skill_creator_validate"
-        skill_root = "/tmp/skill_creator_validate"
+        run_id = uuid.uuid4().hex[:8]
+        session_id = f"skill_creator_validate_{run_id}"
+        skill_root = f"/tmp/skill_creator_validate_{run_id}"
+
+        print(
+            f"[沙箱验证] 开始: scripts={[s.path for s in files.scripts]}, "
+            f"deps={files.dependencies}, manifest_tools={len(files.manifest.get('tools', []))}"
+        )
 
         mkdir_result = await sandbox.exec_command(
             session_id=session_id,
             exec_dir="/tmp",
             command=f"rm -rf {skill_root} && mkdir -p {skill_root}/bundle",
         )
+        logger.info("[沙箱验证] mkdir: success={mkdir_result.success}, message={(mkdir_result.message or '')[:100]}")
         if not mkdir_result.success:
             errors.append(f"创建验证目录失败: {mkdir_result.message or ''}".strip())
             return errors
@@ -584,29 +892,39 @@ class SkillCreatorService:
         # ---- 3. 依赖安装 ---- #
         if files.dependencies:
             deps_str = " ".join(shlex.quote(dep) for dep in files.dependencies)
+            install_cmd = f"python -m pip install {deps_str}"
+            logger.info("[沙箱验证] pip install: {install_cmd}")
             install_result = await sandbox.exec_command(
                 session_id=session_id,
                 exec_dir=skill_root,
-                command=f"python -m pip install {deps_str}",
+                command=install_cmd,
             )
+            logger.info("[沙箱验证] pip install: success={install_result.success}, message={(install_result.message or '')[:200]}")
             if not install_result.success:
                 errors.append(f"依赖安装失败: {install_result.message or ''}".strip())
                 return errors
 
         # ---- 4. --help 测试 ---- #
         for script in files.scripts:
+            help_cmd = f"python {shlex.quote(script.path)} --help"
+            logger.info("[沙箱验证] --help: {help_cmd}")
             run_result = await sandbox.exec_command(
                 session_id=session_id,
                 exec_dir=skill_root,
-                command=f"python {shlex.quote(script.path)} --help",
+                command=help_cmd,
             )
+            logger.info("[沙箱验证] --help: success={run_result.success}, message={(run_result.message or '')[:200]}")
             if not run_result.success:
                 errors.append(f"脚本 --help 失败 ({script.path}): {run_result.message or ''}".strip())
                 return errors
 
-        # ---- 5. 烟雾测试：用最小输入实际运行每个工具 ---- #
-        smoke_errors = await self._smoke_test_tools(files, sandbox, session_id, skill_root)
-        errors.extend(smoke_errors)
+        # ---- 5. 烟雾测试（仅警告，不阻断） ---- #
+        # 烟雾测试用伪造的最小输入运行工具，对需要网络/API 的工具（如视频下载、
+        # 翻译等）必然失败，因此仅记录日志不作为阻断条件。
+        smoke_warnings = await self._smoke_test_tools(files, sandbox, session_id, skill_root)
+        for warning in smoke_warnings:
+            logger.warning("[烟雾测试] %s", warning)
+            logger.info("[沙箱验证] 烟雾测试警告（不阻断）: {warning[:200]}")
 
         return errors
 
@@ -642,6 +960,7 @@ class SkillCreatorService:
 
             # 执行: python bundle/tool.py '{"param": "test"}'
             full_cmd = f"{command} {shlex.quote(sample_json)}"
+            logger.info("[沙箱验证] 烟雾测试 {tool_name}: {full_cmd}")
             run_result = await sandbox.exec_command(
                 session_id=session_id,
                 exec_dir=skill_root,
@@ -649,6 +968,7 @@ class SkillCreatorService:
             )
 
             output = (run_result.message or "").strip()
+            logger.info("[沙箱验证] 烟雾测试 {tool_name}: success={run_result.success}, output={output[:200]}")
 
             if not run_result.success:
                 errors.append(
@@ -690,13 +1010,64 @@ class SkillCreatorService:
         blueprint: SkillBlueprint,
         research_report: str,
     ) -> SkillGeneratedFiles:
-        del files
-        fix_patch = (
-            "\n\n## 验证错误\n"
-            + "\n".join(f"- {item}" for item in errors)
-            + "\n请修复后返回完整 JSON。"
+        """智能修复：脚本错误只重生成坏脚本，manifest 错误全量重生成。"""
+        fix_context = (
+            research_report
+            + "\n\n## 验证错误\n"
+            + "\n".join(f"- {e}" for e in errors)
+            + "\n请修复上述问题。"
         )
-        return await self._generate_files(blueprint, research_report + fix_patch)
+
+        # 分类错误
+        script_errors = [
+            e for e in errors
+            if "脚本" in e or "bundle/" in e or "烟雾测试" in e or "语法错误" in e
+        ]
+        manifest_errors = [e for e in errors if "manifest" in e]
+
+        if manifest_errors or not script_errors:
+            # manifest 问题或无法分类 → 全量重生成
+            return await self._generate_files(blueprint, fix_context)
+
+        # 仅脚本错误 → 定向修复
+        new_scripts = list(files.scripts)
+        for error in script_errors:
+            broken_path = self._extract_script_path_from_error(error)
+            if not broken_path:
+                return await self._generate_files(blueprint, fix_context)
+            tool_def = self._find_tool_def_by_path(broken_path, files.manifest)
+            if not tool_def:
+                return await self._generate_files(blueprint, fix_context)
+            new_script = await self._generate_script(tool_def, blueprint, fix_context)
+            new_scripts = [
+                new_script if s.path == broken_path else s
+                for s in new_scripts
+            ]
+
+        return SkillGeneratedFiles(
+            skill_md=files.skill_md,
+            manifest=files.manifest,
+            scripts=new_scripts,
+            dependencies=files.dependencies,
+        )
+
+    @staticmethod
+    def _extract_script_path_from_error(error: str) -> str | None:
+        """从错误消息中提取 bundle/*.py 路径。"""
+        match = re.search(r"(bundle/\S+\.py)", error)
+        return match.group(1) if match else None
+
+    @staticmethod
+    def _find_tool_def_by_path(script_path: str, manifest: dict) -> dict | None:
+        """根据脚本路径在 manifest 中找到对应的 tool 定义。"""
+        target_command = f"python {script_path}"
+        for tool in manifest.get("tools", []):
+            if not isinstance(tool, dict):
+                continue
+            entry = tool.get("entry", {})
+            if isinstance(entry, dict) and entry.get("command") == target_command:
+                return tool
+        return None
 
     async def _install(self, files: SkillGeneratedFiles, installed_by: str):
         with tempfile.TemporaryDirectory() as tmpdir:

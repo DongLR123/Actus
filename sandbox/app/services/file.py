@@ -42,11 +42,38 @@ class FileService:
         max_length: Optional[int] = 10000,
     ) -> FileReadResult:
         """根据传递的文件路径+起始行号+权限+最大长度读取文件内容"""
+        # 不支持文本预览的二进制文件扩展名
+        BINARY_EXTENSIONS = {
+            ".pdf", ".pptx", ".ppt", ".docx", ".doc", ".xlsx", ".xls",
+            ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar",
+            ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg",
+            ".mp3", ".mp4", ".avi", ".mov", ".mkv", ".wav", ".flac",
+            ".exe", ".dll", ".so", ".dylib", ".bin", ".dat",
+            ".woff", ".woff2", ".ttf", ".otf", ".eot",
+            ".sqlite", ".db",
+        }
+
         try:
             # 1.检测在当前权限下能否获取该文件
             if not os.path.exists(filepath) and not sudo:
                 logger.error(f"要读取的文件不存在或无权限: {filepath}")
                 raise NotFoundException(f"要读取的文件不存在或无权限: {filepath}")
+
+            # 1.5 检测二进制文件，返回友好提示而不是崩溃
+            ext = os.path.splitext(filepath)[1].lower()
+            if ext in BINARY_EXTENSIONS:
+                file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+                size_str = (
+                    f"{file_size / 1024 / 1024:.1f} MB" if file_size > 1024 * 1024
+                    else f"{file_size / 1024:.1f} KB" if file_size > 1024
+                    else f"{file_size} B"
+                )
+                return FileReadResult(
+                    filepath=filepath,
+                    content=f"[二进制文件] {os.path.basename(filepath)} ({size_str})\n"
+                    f"该文件为 {ext} 格式，不支持文本预览。\n"
+                    f"可通过下载功能获取原始文件。",
+                )
 
             # 2.ubuntu系统下统一使用utf-8编码
             encoding = "utf-8"

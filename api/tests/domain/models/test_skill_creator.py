@@ -90,6 +90,57 @@ class TestSkillGeneratedFiles:
         assert len(files.scripts) == 1
         assert files.dependencies == ["requests"]
 
+    def test_dependencies_dict_normalized_to_list(self) -> None:
+        """LLM 返回 dependencies 为 dict 时应自动提取 pip 包名并过滤中文。"""
+        files = SkillGeneratedFiles.model_validate(
+            {
+                "skill_md": "---\nname: test\n---\n# Test",
+                "manifest": {"name": "test", "tools": []},
+                "scripts": [{"path": "bundle/run.py", "content": "print('hello')"}],
+                "dependencies": {
+                    "external_capabilities": [
+                        "视频页面解析/平台识别能力",
+                        "字幕抓取或音频转写能力",
+                    ],
+                    "pip_packages": ["requests", "beautifulsoup4", "yt-dlp"],
+                },
+            }
+        )
+        # 中文描述应被过滤，仅保留 pip 包名
+        assert files.dependencies == ["requests", "beautifulsoup4", "yt-dlp"]
+
+    def test_dependencies_dict_all_chinese_yields_empty(self) -> None:
+        """dependencies 为 dict 且全为中文描述时，应返回空列表。"""
+        files = SkillGeneratedFiles.model_validate(
+            {
+                "skill_md": "---\nname: test\n---\n# Test",
+                "manifest": {"name": "test", "tools": []},
+                "scripts": [{"path": "bundle/run.py", "content": "print('hello')"}],
+                "dependencies": {
+                    "external_capabilities": [
+                        "视频页面解析能力",
+                        "字幕接口访问模块",
+                    ],
+                },
+            }
+        )
+        assert files.dependencies == []
+
+    def test_dependencies_list_of_dicts_normalized(self) -> None:
+        """LLM 返回 dependencies 为 [{name, description}] 时应提取包名。"""
+        files = SkillGeneratedFiles.model_validate(
+            {
+                "skill_md": "---\nname: test\n---\n# Test",
+                "manifest": {"name": "test", "tools": []},
+                "scripts": [{"path": "bundle/run.py", "content": "print('hello')"}],
+                "dependencies": [
+                    {"name": "requests", "description": "HTTP library"},
+                    {"name": "中文包名", "description": "should be filtered"},
+                ],
+            }
+        )
+        assert files.dependencies == ["requests"]
+
 
 class TestSkillCreationProgress:
     def test_progress_serialization(self) -> None:

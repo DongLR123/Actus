@@ -104,9 +104,12 @@ class CreateSkillTool(BaseTool):
                     },
                 )
 
+            # 构建包含详细错误的消息，确保沙箱验证的具体原因不被吞掉
+            summary = progress_log[-1] if progress_log else "未知错误"
+            detail_suffix = f"\n详细错误: {last_error}" if last_error else ""
             return ToolResult(
                 success=False,
-                message=f"Skill 生成失败: {progress_log[-1] if progress_log else '未知错误'}",
+                message=f"Skill 生成失败: {summary}{detail_suffix}",
                 data={
                     "validation_errors": last_error or (progress_log[-1] if progress_log else ""),
                     "progress_log": progress_log,

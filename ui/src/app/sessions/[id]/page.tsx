@@ -630,6 +630,7 @@ export default function SessionPage() {
   const [previewTextContent, setPreviewTextContent] = useState("");
   const [previewBlobUrl, setPreviewBlobUrl] = useState<string | null>(null);
   const [previewFile, setPreviewFile] = useState<FileInfo | null>(null);
+  const [sandboxDownloadPath, setSandboxDownloadPath] = useState<string | null>(null);
   const [imagePreview, setImagePreview] = useState<{
     src: string;
     title: string;
@@ -644,6 +645,7 @@ export default function SessionPage() {
     setPreviewTextContent("");
     setPreviewKind("unsupported");
     setPreviewLoading(false);
+    setSandboxDownloadPath(null);
   }, []);
 
   useEffect(() => {
@@ -856,22 +858,50 @@ export default function SessionPage() {
         return;
       }
 
+      // 文件不在当前列表中，刷新文件列表后重新查找
+      await fetchSessionFiles(sessionId, { silent: true });
+      const refreshed = useSessionStore.getState().currentSessionFiles;
+      const retryTarget = refreshed.find(
+        (file) => file.filepath === filepath || file.filename === getPathTail(filepath)
+      );
+      if (retryTarget) {
+        await openFilePreview(retryTarget);
+        return;
+      }
+
+      // 仍未找到：根据扩展名判断文件类型，直接从沙箱读取/下载
       resetPreviewState();
-      setPreviewTitle(getPathTail(filepath));
+      const filename = getPathTail(filepath);
+      setPreviewTitle(filename);
       setPreviewOpen(true);
       setPreviewLoading(true);
-      setPreviewKind("text");
+
+      const nextKind = getFilePreviewKind({ filename });
+      setPreviewKind(nextKind);
 
       try {
-        const result = await sessionApi.viewFile(sessionId, { filepath });
-        setPreviewTextContent(result.content || "文件为空。");
+        if (nextKind === "pdf" || nextKind === "image") {
+          // 二进制可预览文件：从沙箱下载 blob 后用 iframe/img 展示
+          const blob = await sessionApi.downloadSandboxFile(sessionId, filepath);
+          const url = URL.createObjectURL(blob);
+          setPreviewBlobUrl(url);
+        } else if (nextKind === "text") {
+          const result = await sessionApi.viewFile(sessionId, { filepath });
+          setPreviewTextContent(result.content || "文件为空。");
+        }
+        // unsupported 类型：不读取内容，显示提示 + 下载按钮
       } catch (error) {
         setPreviewError(error instanceof Error ? error.message : "文件预览失败");
       } finally {
         setPreviewLoading(false);
       }
+
+      // 为非文本文件设置 sandboxFilepath，供下载按钮使用
+      if (nextKind !== "text") {
+        setSandboxDownloadPath(filepath);
+      }
     },
-    [currentSessionFiles, openFilePreview, resetPreviewState, sessionId]
+    [currentSessionFiles, fetchSessionFiles, openFilePreview, resetPreviewState, sessionId]
   );
 
   const handleFileDownload = useCallback(
@@ -1106,6 +1136,30 @@ export default function SessionPage() {
                     variant="outline"
                     onClick={() => {
                       void handleFileDownload(previewFile);
+                    }}
+                  >
+                    下载文件
+                  </Button>
+                ) : null}
+                {!previewFile && sandboxDownloadPath && sessionId ? (
+                  <Button
+                    className="mt-3 rounded-xl"
+                    variant="outline"
+                    onClick={async () => {
+                      try {
+                        const blob = await sessionApi.downloadSandboxFile(sessionId, sandboxDownloadPath);
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement("a");
+                        a.href = url;
+                        a.download = getPathTail(sandboxDownloadPath);
+                        a.click();
+                        URL.revokeObjectURL(url);
+                      } catch (error) {
+                        setMessage({
+                          type: "error",
+                          text: error instanceof Error ? error.message : "下载文件失败",
+                        });
+                      }
                     }}
                   >
                     下载文件

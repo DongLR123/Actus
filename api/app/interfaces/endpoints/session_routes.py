@@ -55,6 +55,7 @@ from app.interfaces.service_dependencies import get_agent_service, get_session_s
 from app.infrastructure.storage.redis import RedisClient, get_redis
 from core.config import get_settings
 from fastapi import APIRouter, Depends, Response as FastAPIResponse
+from fastapi.responses import StreamingResponse
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.websockets import WebSocket, WebSocketDisconnect
 from websockets import ConnectionClosed
@@ -526,6 +527,48 @@ async def read_file(
         is_admin=current_user.is_admin(),
     )
     return Response.success(msg="获取会话文件内容成功", data=result)
+
+
+@router.get(
+    path="/{session_id}/file/download",
+    summary="从沙箱中下载文件",
+    description="通过会话ID和文件路径直接从沙箱中下载文件（支持二进制文件）",
+    dependencies=[Depends(rate_limit_read)],
+)
+async def download_sandbox_file(
+    session_id: str,
+    filepath: str,
+    current_user: CurrentUser,
+    session_service: SessionService = Depends(get_session_service),
+) -> StreamingResponse:
+    """通过 session + filepath 直接从沙箱下载文件"""
+    import mimetypes
+    import os
+
+    async with session_service._uow:
+        session = await session_service._get_accessible_session(
+            session_id, current_user.id, current_user.is_admin()
+        )
+
+    if not session.sandbox_id:
+        raise NotFoundError("当前会话无沙箱环境")
+
+    from app.infrastructure.external.sandbox.docker_sandbox import DockerSandbox
+    sandbox = await DockerSandbox.get(session.sandbox_id)
+    if not sandbox:
+        raise NotFoundError("当前会话沙箱不存在或已销毁")
+
+    file_data = await sandbox.download_file(filepath)
+    filename = os.path.basename(filepath)
+    content_type, _ = mimetypes.guess_type(filename)
+
+    return StreamingResponse(
+        file_data,
+        media_type=content_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{quote(filename)}"',
+        },
+    )
 
 
 @router.post(

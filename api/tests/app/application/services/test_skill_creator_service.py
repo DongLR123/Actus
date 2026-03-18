@@ -6,7 +6,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from app.application.services.skill_creator_service import SkillCreatorService
+from app.application.services.skill_creator_service import (
+    ManifestOutput,
+    SkillCreatorService,
+    _normalize_generated_dependencies,
+    _normalize_generated_manifest,
+)
 from app.domain.models.skill_creator import (
     SkillBlueprint,
     SkillCreationProgress,
@@ -199,11 +204,12 @@ class TestAnalyzeRequirement:
 
 
 class TestGenerateFiles:
-    async def test_generate_produces_valid_files(
+    async def test_phased_generation_produces_valid_files(
         self,
         mock_github_client: MagicMock,
         mock_skill_service: AsyncMock,
     ) -> None:
+        """Phased pipeline: structured manifest → per-tool scripts → SKILL.md."""
         blueprint = SkillBlueprint(
             skill_name="test-skill",
             description="测试用",
@@ -212,13 +218,10 @@ class TestGenerateFiles:
             estimated_deps=["requests"],
         )
 
-        generated = SkillGeneratedFiles(
-            skill_md="---\nname: test-skill\n---\n# Test Skill",
+        # Phase 1: with_structured_output returns ManifestOutput
+        manifest_output = ManifestOutput(
             manifest={
                 "name": "test-skill",
-                "slug": "test-skill",
-                "version": "0.1.0",
-                "description": "测试用",
                 "runtime_type": "native",
                 "tools": [
                     {
@@ -230,10 +233,17 @@ class TestGenerateFiles:
                     }
                 ],
             },
-            scripts=[ScriptFile(path="bundle/run.py", content="import sys\nprint('hello')")],
             dependencies=["requests"],
         )
-        mock_llm, _ = _make_mock_llm(single_return=generated)
+        # Phase 2 (1 tool): ainvoke returns Python code
+        script_code = "import sys\nimport json\nprint(json.dumps({'ok': True}))"
+        # Phase 3: ainvoke returns SKILL.md
+        skill_md = '---\nname: test-skill\nversion: "0.1.0"\n---\n# Test'
+
+        mock_llm, _ = _make_mock_llm(
+            single_return=manifest_output,
+            direct_returns=[script_code, skill_md],
+        )
         service = SkillCreatorService(
             llm=mock_llm,
             github_client=mock_github_client,
@@ -242,10 +252,13 @@ class TestGenerateFiles:
 
         files = await service._generate_files(blueprint, "调研报告内容")
 
-        assert "name: test-skill" in files.skill_md
+        assert files.manifest["name"] == "test-skill"
         assert files.manifest["runtime_type"] == "native"
         assert len(files.scripts) == 1
-        ast.parse(files.scripts[0].content)
+        assert files.scripts[0].path == "bundle/run.py"
+        assert "import sys" in files.scripts[0].content
+        assert "---" in files.skill_md
+        assert files.dependencies == ["requests"]
 
 
 class TestValidateInSandbox:
@@ -311,29 +324,24 @@ class TestFullPipeline:
             search_keywords=["test python"],
             estimated_deps=[],
         )
-        generate_files = SkillGeneratedFiles(
-            skill_md="---\nname: test-skill\n---\n# Test",
+        # _analyze_requirement → blueprint, _generate_manifest → manifest
+        manifest_output = ManifestOutput(
             manifest={
                 "name": "test-skill",
-                "slug": "test-skill",
-                "version": "0.1.0",
-                "description": "测试",
                 "runtime_type": "native",
                 "tools": [
-                    {
-                        "name": "run",
-                        "description": "执行",
-                        "parameters": {},
-                        "required": [],
-                        "entry": {"command": "python bundle/run.py"},
-                    }
+                    {"name": "run", "description": "执行", "parameters": {},
+                     "required": [], "entry": {"command": "python bundle/run.py"}}
                 ],
             },
-            scripts=[ScriptFile(path="bundle/run.py", content="print('ok')")],
             dependencies=[],
         )
         mock_llm, _ = _make_mock_llm(
-            structured_returns=[analyze_blueprint, generate_files],
+            structured_returns=[analyze_blueprint, manifest_output],
+            direct_returns=[
+                "import sys\nprint('ok')",          # Phase 2: script
+                "---\nname: test-skill\n---\n# Test",  # Phase 3: SKILL.md
+            ],
         )
         service = SkillCreatorService(
             llm=mock_llm,
@@ -386,28 +394,21 @@ class TestGenerate:
             search_keywords=["test python"],
             estimated_deps=[],
         )
-        generated = SkillGeneratedFiles(
-            skill_md="---\nname: test-skill\n---\n# Test",
+        manifest_output = ManifestOutput(
             manifest={
                 "name": "test-skill",
-                "slug": "test-skill",
-                "version": "0.1.0",
-                "description": "测试",
                 "runtime_type": "native",
                 "tools": [
-                    {
-                        "name": "run",
-                        "description": "执行",
-                        "parameters": {},
-                        "required": [],
-                        "entry": {"command": "python bundle/run.py"},
-                    }
+                    {"name": "run", "description": "执行", "parameters": {},
+                     "required": [], "entry": {"command": "python bundle/run.py"}}
                 ],
             },
-            scripts=[ScriptFile(path="bundle/run.py", content="print('ok')")],
             dependencies=[],
         )
-        mock_llm, _ = _make_mock_llm(single_return=generated)
+        mock_llm, _ = _make_mock_llm(
+            single_return=manifest_output,
+            direct_returns=["print('ok')", "---\nname: test-skill\n---\n# Test"],
+        )
         service = SkillCreatorService(
             llm=mock_llm,
             github_client=mock_github_client,
@@ -452,29 +453,20 @@ class TestGenerate:
             search_keywords=["test python"],
             estimated_deps=[],
         )
-        generated = SkillGeneratedFiles(
-            skill_md="---\nname: test-skill\n---\n# Test",
+        manifest_output = ManifestOutput(
             manifest={
                 "name": "test-skill",
-                "slug": "test-skill",
-                "version": "0.1.0",
-                "description": "测试",
                 "runtime_type": "native",
                 "tools": [
-                    {
-                        "name": "run",
-                        "description": "执行",
-                        "parameters": {},
-                        "required": [],
-                        "entry": {"command": "python bundle/run.py"},
-                    }
+                    {"name": "run", "description": "执行", "parameters": {},
+                     "required": [], "entry": {"command": "python bundle/run.py"}}
                 ],
             },
-            scripts=[ScriptFile(path="bundle/run.py", content="print('ok')")],
             dependencies=[],
         )
         mock_llm, _ = _make_mock_llm(
-            structured_returns=[analyze_blueprint, generated],
+            structured_returns=[analyze_blueprint, manifest_output],
+            direct_returns=["print('ok')", "---\nname: test-skill\n---\n# Test"],
         )
         service = SkillCreatorService(
             llm=mock_llm,
@@ -502,7 +494,7 @@ class TestGenerate:
         mock_skill_service: AsyncMock,
         mock_sandbox: AsyncMock,
     ) -> None:
-        """Syntax error in script yields validation failure progress."""
+        """Phase 2 keeps producing bad syntax → generate() yields failure."""
         blueprint = SkillBlueprint(
             skill_name="bad-skill",
             description="坏的",
@@ -510,16 +502,24 @@ class TestGenerate:
             search_keywords=[],
             estimated_deps=[],
         )
-        bad_files = SkillGeneratedFiles(
-            skill_md="---\nname: bad-skill\n---\n# Bad",
-            manifest={"name": "bad-skill", "tools": []},
-            scripts=[
-                ScriptFile(path="bundle/run.py", content="def f(\n  broken")
-            ],
+        # Phase 1 succeeds, Phase 2 always returns bad Python
+        manifest_output = ManifestOutput(
+            manifest={
+                "name": "bad-skill",
+                "runtime_type": "native",
+                "tools": [
+                    {"name": "run", "description": "运行", "parameters": {},
+                     "required": [], "entry": {"command": "python bundle/run.py"}}
+                ],
+            },
             dependencies=[],
         )
-        # generate_files called once, then _fix_files calls generate_files again (MAX_FIX_RETRIES=2)
-        mock_llm, _ = _make_mock_llm(single_return=bad_files)
+        bad_code = "def f(\n  broken"
+        mock_llm, _ = _make_mock_llm(
+            single_return=manifest_output,
+            # All 3 retries of Phase 2 return bad syntax
+            direct_returns=[bad_code, bad_code, bad_code],
+        )
         service = SkillCreatorService(
             llm=mock_llm,
             github_client=mock_github_client,
@@ -586,3 +586,281 @@ class TestInstallPublic:
         assert result.files_count == 4
         assert "创建成功" in result.summary
         mock_skill_service.install_skill.assert_awaited_once()
+
+
+class TestGenerateManifest:
+    async def test_structured_output_path(
+        self,
+        mock_github_client: MagicMock,
+        mock_skill_service: AsyncMock,
+    ) -> None:
+        manifest_output = ManifestOutput(
+            manifest={
+                "name": "test-skill",
+                "runtime_type": "native",
+                "tools": [
+                    {
+                        "name": "run",
+                        "description": "运行",
+                        "parameters": {},
+                        "required": [],
+                        "entry": {"command": "python bundle/run.py"},
+                    }
+                ],
+            },
+            dependencies=["requests"],
+        )
+        mock_llm, _ = _make_mock_llm(single_return=manifest_output)
+        service = SkillCreatorService(
+            llm=mock_llm,
+            github_client=mock_github_client,
+            skill_service=mock_skill_service,
+        )
+
+        result = await service._generate_manifest(SAMPLE_BLUEPRINT, "调研报告")
+
+        assert result.manifest["name"] == "test-skill"
+        assert result.dependencies == ["requests"]
+        mock_llm.with_structured_output.assert_called_once()
+
+    async def test_fallback_to_ainvoke(
+        self,
+        mock_github_client: MagicMock,
+        mock_skill_service: AsyncMock,
+    ) -> None:
+        mock_llm, structured = _make_mock_llm(
+            direct_return={
+                "manifest": {"name": "fallback", "runtime_type": "native", "tools": []},
+                "dependencies": ["requests"],
+            },
+        )
+        structured.ainvoke = AsyncMock(side_effect=Exception("tool calling not supported"))
+
+        service = SkillCreatorService(
+            llm=mock_llm,
+            github_client=mock_github_client,
+            skill_service=mock_skill_service,
+        )
+
+        result = await service._generate_manifest(SAMPLE_BLUEPRINT, "调研报告")
+
+        assert result.manifest["name"] == "fallback"
+
+
+class TestGenerateScript:
+    async def test_generates_valid_python_script(
+        self,
+        mock_github_client: MagicMock,
+        mock_skill_service: AsyncMock,
+    ) -> None:
+        code = 'import sys\nimport json\ndata = json.loads(sys.argv[1])\nprint(json.dumps({"ok": True}))'
+        mock_llm, _ = _make_mock_llm(direct_return=f"```python\n{code}\n```")
+        service = SkillCreatorService(
+            llm=mock_llm,
+            github_client=mock_github_client,
+            skill_service=mock_skill_service,
+        )
+
+        tool_def = {
+            "name": "parse_url",
+            "description": "解析URL",
+            "parameters": {"url": {"type": "string", "description": "视频URL"}},
+            "required": ["url"],
+            "entry": {"command": "python bundle/parse_url.py"},
+        }
+        result = await service._generate_script(tool_def, SAMPLE_BLUEPRINT, "调研报告")
+
+        assert result.path == "bundle/parse_url.py"
+        assert "import sys" in result.content
+        ast.parse(result.content)
+
+    async def test_fallback_path_from_tool_name(
+        self,
+        mock_github_client: MagicMock,
+        mock_skill_service: AsyncMock,
+    ) -> None:
+        mock_llm, _ = _make_mock_llm(direct_return="print('ok')")
+        service = SkillCreatorService(
+            llm=mock_llm,
+            github_client=mock_github_client,
+            skill_service=mock_skill_service,
+        )
+
+        tool_def = {"name": "my_tool", "description": "d"}
+        result = await service._generate_script(tool_def, SAMPLE_BLUEPRINT, "")
+
+        assert result.path == "bundle/my_tool.py"
+
+
+class TestGenerateSkillMd:
+    async def test_generates_valid_skill_md(
+        self,
+        mock_github_client: MagicMock,
+        mock_skill_service: AsyncMock,
+    ) -> None:
+        skill_md_content = '---\nname: test-skill\nversion: "0.1.0"\n---\n\n# Test Skill\n\nUsage docs.'
+        mock_llm, _ = _make_mock_llm(direct_return=skill_md_content)
+        service = SkillCreatorService(
+            llm=mock_llm,
+            github_client=mock_github_client,
+            skill_service=mock_skill_service,
+        )
+
+        manifest = {"name": "test-skill", "tools": [{"name": "run"}]}
+        scripts = [ScriptFile(path="bundle/run.py", content="print('ok')")]
+        result = await service._generate_skill_md(manifest, scripts, SAMPLE_BLUEPRINT)
+
+        assert "---" in result
+        assert "test-skill" in result
+
+    async def test_strips_wrapping_code_fences(
+        self,
+        mock_github_client: MagicMock,
+        mock_skill_service: AsyncMock,
+    ) -> None:
+        wrapped = "```yaml\n---\nname: t\n---\n# T\n```"
+        mock_llm, _ = _make_mock_llm(direct_return=wrapped)
+        service = SkillCreatorService(
+            llm=mock_llm,
+            github_client=mock_github_client,
+            skill_service=mock_skill_service,
+        )
+
+        result = await service._generate_skill_md({}, [], SAMPLE_BLUEPRINT)
+        assert result.startswith("---")
+        assert "```" not in result
+
+
+class TestFixFiles:
+    async def test_script_error_only_regenerates_broken_script(
+        self,
+        mock_github_client: MagicMock,
+        mock_skill_service: AsyncMock,
+    ) -> None:
+        existing = SkillGeneratedFiles(
+            skill_md="---\nname: t\n---\n# T",
+            manifest={
+                "name": "t",
+                "runtime_type": "native",
+                "tools": [
+                    {"name": "good", "description": "ok", "entry": {"command": "python bundle/good.py"}},
+                    {"name": "bad", "description": "broken", "entry": {"command": "python bundle/bad.py"}},
+                ],
+            },
+            scripts=[
+                ScriptFile(path="bundle/good.py", content="print('ok')"),
+                ScriptFile(path="bundle/bad.py", content="broken code"),
+            ],
+            dependencies=[],
+        )
+        errors = ["脚本 --help 失败 (bundle/bad.py): SyntaxError"]
+
+        fixed_code = "import sys\nprint('fixed')"
+        mock_llm, _ = _make_mock_llm(direct_return=fixed_code)
+        service = SkillCreatorService(
+            llm=mock_llm,
+            github_client=mock_github_client,
+            skill_service=mock_skill_service,
+        )
+
+        result = await service._fix_files(existing, errors, SAMPLE_BLUEPRINT, "报告")
+
+        good_script = next(s for s in result.scripts if s.path == "bundle/good.py")
+        bad_script = next(s for s in result.scripts if s.path == "bundle/bad.py")
+        assert good_script.content == "print('ok')"
+        assert "fixed" in bad_script.content
+
+    async def test_manifest_error_triggers_full_regeneration(
+        self,
+        mock_github_client: MagicMock,
+        mock_skill_service: AsyncMock,
+    ) -> None:
+        existing = SkillGeneratedFiles(
+            skill_md="---\nname: t\n---\n# T",
+            manifest={"name": "t", "runtime_type": "native", "tools": []},
+            scripts=[ScriptFile(path="bundle/run.py", content="print('ok')")],
+            dependencies=[],
+        )
+        errors = ["manifest 缺少必填字段: tools"]
+
+        manifest_output = ManifestOutput(
+            manifest={"name": "t", "runtime_type": "native", "tools": [
+                {"name": "run", "description": "d", "entry": {"command": "python bundle/run.py"}}
+            ]},
+            dependencies=[],
+        )
+        mock_llm, _ = _make_mock_llm(
+            single_return=manifest_output,
+            direct_returns=["print('regen')", "---\nname: t\n---\n# T"],
+        )
+        service = SkillCreatorService(
+            llm=mock_llm,
+            github_client=mock_github_client,
+            skill_service=mock_skill_service,
+        )
+
+        result = await service._fix_files(existing, errors, SAMPLE_BLUEPRINT, "报告")
+
+        mock_llm.with_structured_output.assert_called()
+
+
+class TestManifestOutput:
+    def test_basic_creation(self) -> None:
+        mo = ManifestOutput(
+            manifest={"name": "test", "runtime_type": "native", "tools": []},
+            dependencies=["requests"],
+        )
+        assert mo.manifest["name"] == "test"
+        assert mo.dependencies == ["requests"]
+
+    def test_extra_fields_ignored(self) -> None:
+        mo = ManifestOutput.model_validate({
+            "manifest": {"name": "t", "tools": []},
+            "dependencies": [],
+            "extra_field": "ignored",
+        })
+        assert mo.manifest["name"] == "t"
+
+
+class TestNormalizeGeneratedManifest:
+    def test_auto_fills_runtime_type(self) -> None:
+        manifest = {"name": "test", "tools": []}
+        result = _normalize_generated_manifest(manifest)
+        assert result["runtime_type"] == "native"
+
+    def test_auto_fills_entry_command(self) -> None:
+        manifest = {
+            "name": "test",
+            "runtime_type": "native",
+            "tools": [{"name": "run", "description": "runs"}],
+        }
+        result = _normalize_generated_manifest(manifest)
+        assert result["tools"][0]["entry"]["command"] == "python bundle/run.py"
+
+    def test_preserves_existing_entry(self) -> None:
+        manifest = {
+            "name": "test",
+            "runtime_type": "native",
+            "tools": [
+                {"name": "run", "description": "runs", "entry": {"command": "python bundle/custom.py"}}
+            ],
+        }
+        result = _normalize_generated_manifest(manifest)
+        assert result["tools"][0]["entry"]["command"] == "python bundle/custom.py"
+
+
+class TestNormalizeGeneratedDependencies:
+    def test_dict_to_list(self) -> None:
+        raw = {"pip_packages": ["requests", "yt-dlp"], "capabilities": ["中文处理"]}
+        result = _normalize_generated_dependencies(raw)
+        assert result == ["requests", "yt-dlp"]
+
+    def test_list_of_dicts(self) -> None:
+        raw = [{"name": "requests"}, {"name": "中文包"}]
+        result = _normalize_generated_dependencies(raw)
+        assert result == ["requests"]
+
+    def test_normal_list_unchanged(self) -> None:
+        raw = ["requests", "beautifulsoup4"]
+        result = _normalize_generated_dependencies(raw)
+        assert result == ["requests", "beautifulsoup4"]

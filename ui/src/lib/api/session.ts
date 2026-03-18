@@ -1,4 +1,4 @@
-import { createSSEStream, get, parseSSEStream, post } from "./fetch";
+import { createSSEStream, get, parseSSEStream, post, requestBlob } from "./fetch";
 import type {
   ChatParams,
   CreateSessionResponse,
@@ -159,6 +159,10 @@ export const sessionApi = {
 
   viewFile: (sessionId: string, params: ViewFileParams): Promise<FileReadResponse> => {
     return post<FileReadResponse>(`/sessions/${sessionId}/file`, params);
+  },
+
+  downloadSandboxFile: (sessionId: string, filepath: string): Promise<Blob> => {
+    return requestBlob(`/sessions/${sessionId}/file/download?filepath=${encodeURIComponent(filepath)}`);
   },
 
   viewShell: (

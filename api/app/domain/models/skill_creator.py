@@ -230,9 +230,72 @@ class SkillGeneratedFiles(BaseModel):
 
         data = dict(data)
 
+        # scripts: LLM 可能返回 dict {"tool_name": "code..."} 而不是 list [{path, content}]
+        raw_scripts = data.get("scripts")
+        if isinstance(raw_scripts, dict):
+            normalized_scripts = []
+            for name, content in raw_scripts.items():
+                if isinstance(content, str):
+                    path = name if name.startswith("bundle/") else f"bundle/{name}"
+                    if not path.endswith(".py"):
+                        path += ".py"
+                    normalized_scripts.append({"path": path, "content": content})
+                elif isinstance(content, dict):
+                    # {"tool_name": {"path": ..., "content": ...}}
+                    path = content.get("path", f"bundle/{name}.py")
+                    code = content.get("content", content.get("code", ""))
+                    if not path.startswith("bundle/"):
+                        path = f"bundle/{path}"
+                    normalized_scripts.append({"path": path, "content": code})
+            data["scripts"] = normalized_scripts
+
+        # dependencies: LLM 可能返回 [{name, description}] 或 dict 而不是 ["pkg_name"]
+        raw_deps = data.get("dependencies")
+        if isinstance(raw_deps, dict):
+            # LLM 返回了 {"external_capabilities": [...], "pip_packages": [...]} 等结构
+            # 尝试提取所有字符串值，过滤中文描述
+            extracted: list[str] = []
+            for _key, val in raw_deps.items():
+                if isinstance(val, list):
+                    for item in val:
+                        if isinstance(item, str):
+                            extracted.append(item)
+                elif isinstance(val, str):
+                    extracted.append(val)
+            data["dependencies"] = [
+                d for d in extracted
+                if not any('\u4e00' <= c <= '\u9fff' for c in d)
+            ]
+        elif isinstance(raw_deps, list):
+            normalized_deps = []
+            for dep in raw_deps:
+                if isinstance(dep, str):
+                    normalized_deps.append(dep)
+                elif isinstance(dep, dict):
+                    name = dep.get("name", "")
+                    # 跳过中文描述性 "依赖"（不是 pip 包名）
+                    if name and not any('\u4e00' <= c <= '\u9fff' for c in name):
+                        normalized_deps.append(name)
+            data["dependencies"] = normalized_deps
+
         # manifest 缺失时尝试从 skill_md 解析
         if not data.get("manifest") and data.get("skill_md"):
             data["manifest"] = _extract_manifest_from_skill_md(data["skill_md"])
+
+        # 自动补全 manifest 常见缺失字段（生成的 Skill 都是 native 类型）
+        manifest = data.get("manifest")
+        if isinstance(manifest, dict):
+            if "runtime_type" not in manifest:
+                manifest["runtime_type"] = "native"
+            for tool in manifest.get("tools", []):
+                if isinstance(tool, dict):
+                    entry = tool.get("entry")
+                    if isinstance(entry, dict) and "command" not in entry:
+                        tool_name = tool.get("name", "tool")
+                        entry["command"] = f"python bundle/{tool_name}.py"
+                    elif entry is None:
+                        tool_name = tool.get("name", "tool")
+                        tool["entry"] = {"command": f"python bundle/{tool_name}.py"}
 
         return data
 

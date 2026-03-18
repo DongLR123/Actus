@@ -217,10 +217,23 @@ class SkillTool(BaseTool):
 
         result = await self._sandbox.exec_command(session_id, exec_dir, full_command)
         if not result.success:
+            # 即使失败也传递 session_id，便于 UI 终端读取输出
+            if result.data is None:
+                result.data = {}
+            if isinstance(result.data, dict):
+                result.data["shell_session_id"] = session_id
+                result.data["exec_dir"] = exec_dir
             return result
 
         output = await self._sandbox.read_shell_output(session_id)
-        return output if output.success else result
+        final = output if output.success else result
+        # 将 session_id 和 exec_dir 注入 data，供 agent_task_runner 使用
+        if final.data is None:
+            final.data = {}
+        if isinstance(final.data, dict):
+            final.data["shell_session_id"] = session_id
+            final.data["exec_dir"] = exec_dir
+        return final
 
     async def _invoke_mcp(
         self,
