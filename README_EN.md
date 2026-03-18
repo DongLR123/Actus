@@ -23,12 +23,12 @@ Actus is organized around three runtimes:
 - `ui/`: Next.js 16 frontend for chat, task progress, workbench, settings, and admin views
 - `sandbox/`: per-session Docker sandbox with Shell, filesystem access, Chromium, and VNC/noVNC
 
-The default execution model is a `Planner + ReAct` flow: Actus first builds a plan, then executes it step by step while streaming plan updates, tool calls, messages, and takeover events back to the client.
+The default execution model is a **LangGraph**-based `Planner + ReAct` flow: Actus uses a two-layer state machine (main_graph for planning/coordination + react_graph for tool execution loops) while streaming plan updates, tool calls, messages, and takeover events back to the client.
 
 ## Core Capabilities
 
-- **Planner + ReAct agent flow**
-- **Built-in tools** for file, shell, browser, search, and messaging
+- **LangGraph agent orchestration** — two-layer graph architecture with planning, step execution, and summarization
+- **LangChain tool system** — file, shell, browser, search tools registered via `@tool` decorators
 - **MCP / A2A / Skill integrations** managed as first-class agent tools
 - **Skill v2 filesystem storage** under `/app/data/skills`
 - **Human takeover** for both `shell` and `browser` scopes

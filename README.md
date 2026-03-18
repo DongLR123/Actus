@@ -23,12 +23,12 @@ Actus 由三个核心运行时组成：
 - `ui/`：Next.js 16 前端，提供聊天、任务摘要、工作台、设置页和管理界面
 - `sandbox/`：按会话动态拉起的 Docker 沙箱，内置 Shell、文件系统、Chromium、VNC/noVNC
 
-系统默认采用 `Planner + ReAct` 双阶段流程：先规划任务，再逐步执行，并在执行过程中通过 SSE 持续推送计划、步骤、工具调用、消息和接管事件。
+系统基于 **LangGraph** 状态机实现 `Planner + ReAct` 双阶段流程：先规划任务，再逐步执行，并在执行过程中通过 SSE 持续推送计划、步骤、工具调用、消息和接管事件。
 
 ## 核心能力
 
-- **Planner + ReAct Agent**：支持规划、步骤执行、等待用户输入和任务完成总结
-- **内置工具链**：文件、Shell、浏览器、搜索、消息工具开箱即用
+- **LangGraph Agent 编排**：两层图架构（main_graph 规划调度 + react_graph 工具执行循环），支持规划、步骤执行、等待用户输入和任务完成总结
+- **LangChain 工具体系**：文件、Shell、浏览器、搜索工具通过 `@tool` 装饰器统一注册
 - **MCP / A2A / Skill 扩展**：统一纳入 Agent 工具选择与运行时编排
 - **Skill v2 文件系统存储**：Skill 保存在 `/app/data/skills`，支持 GitHub 与本地目录安装
 - **人工接管**：支持 `shell` 和 `browser` 两类接管，包含申请、续期、结束、补救流程
@@ -221,7 +221,7 @@ Actus/
 | 数据库 | PostgreSQL 17、SQLAlchemy 2.0 async、Alembic |
 | 缓存 / 限流 | Redis |
 | 对象存储 | MinIO / S3 兼容 |
-| Agent | PlannerAgent、ReActAgent、PlannerReActFlow |
+| Agent | LangGraph StateGraph、LangChain BaseChatModel、PlannerReActFlow |
 | 扩展协议 | MCP、A2A、Skill |
 | 前端 | Next.js 16、React 19、Tailwind CSS 4、Zustand |
 | 浏览器执行 | Chromium、CDP、Playwright 风格 DOM 操作 |
