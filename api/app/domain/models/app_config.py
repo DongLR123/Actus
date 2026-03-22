@@ -113,6 +113,16 @@ class SkillSelectionPolicy(BaseModel):
         return self
 
 
+class SkillEmbeddingConfig(BaseModel):
+    """Skill 向量化检索配置。"""
+
+    enabled: bool = False
+    api_base: str = ""
+    api_key: str = ""
+    model: str = "text-embedding-3-small"
+    dimensions: int = 256
+
+
 class MemoryConfig(BaseModel):
     """对话记忆配置"""
 
@@ -132,6 +142,7 @@ class AgentConfig(BaseModel):
     max_retries: int = Field(default=3, gt=1, lt=10)  # 最大重试次数
     max_search_results: int = Field(default=10, gt=1, lt=30)  # 最大搜索结果条数
     skill_selection: SkillSelectionPolicy = Field(default_factory=SkillSelectionPolicy)
+    skill_embedding: SkillEmbeddingConfig = Field(default_factory=SkillEmbeddingConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
 

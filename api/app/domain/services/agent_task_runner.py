@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import io
 import logging
@@ -89,6 +90,16 @@ SKILL_CONTEXT_MAX_SNIPPET_CHARS = 1200
 TOOL_SUMMARY_MAX_ITEMS_PER_GROUP = 6
 
 
+def _compute_has_positive_match(scores: list[float]) -> bool:
+    """基于相对排名判断是否有正向匹配（模型无关的阈值逻辑）。"""
+    if not scores or scores[0] < 0.15:
+        return False
+    if len(scores) < 2:
+        return True
+    gap = scores[0] - scores[1]
+    return gap > 0.05 or scores[0] > 0.4
+
+
 @dataclass(slots=True)
 class SelectionDebugMeta:
     selection_source: str
@@ -115,6 +126,34 @@ class StepSkillActivationState:
     locked_skills: list[Skill] = field(default_factory=list)
     consecutive_unknown_tool_calls: int = 0
     reselect_count: int = 0
+
+
+class SkillGuideInjector:
+    """按需注入 Tier 2 skill guide 到 tool result 中。"""
+
+    def __init__(self, skills: list, preloaded_ids: set[str]):
+        from typing import Any
+
+        self._tool_to_skill: dict[str, Any] = {}
+        self._injected: set[str] = set()
+        self._preloaded_ids = preloaded_ids
+        for skill in skills:
+            for tool in (skill.manifest or {}).get("tools", []):
+                if isinstance(tool, dict) and tool.get("name"):
+                    # 保留第一个映射（高分 skill 优先，假设 skills 已按 score 排序）
+                    if tool["name"] not in self._tool_to_skill:
+                        self._tool_to_skill[tool["name"]] = skill
+
+    def __call__(self, tool_name: str) -> str | None:
+        skill = self._tool_to_skill.get(tool_name)
+        if not skill:
+            return None
+        if skill.id in self._preloaded_ids or skill.id in self._injected:
+            return None
+        self._injected.add(skill.id)
+        manifest = skill.manifest or {}
+        body = str(manifest.get("context_blob") or manifest.get("skill_md") or "")
+        return body[:1200] if body else None
 
 
 class AgentTaskRunner(TaskRunner):
@@ -216,10 +255,16 @@ class AgentTaskRunner(TaskRunner):
         self._current_message_text: str = ""
         self._last_initialized_skill_ids: tuple[str, ...] = ()
         self._last_virtual_step_id: str = ""
+        self._embedding_available: bool = False
+        self._embedding_index = None  # SkillEmbeddingIndex | None
+        self._current_embedding_scores: list[float] | None = None
+        self._tier2_preloaded_skill_ids: set[str] = set()
+        self._last_skill_context: str = ""
         self._file_storage = file_storage
         self._overflow_config = overflow_config or ContextOverflowConfig()
         # self._file_repository = file_repository
         self._browser = browser
+        self._search_engine = search_engine
         self._flow = PlannerReActFlow(
             uow_factory=uow_factory,
             llm=llm,
@@ -347,6 +392,88 @@ class AgentTaskRunner(TaskRunner):
             event.attachments = attachments
         except Exception as e:
             logger.exception(f"AgentTaskRunner同步消息附件到沙箱失败: {str(e)}")
+
+    # 支持多模态识图的 MIME 类型前缀
+    _IMAGE_MIME_PREFIXES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+    # 跳过超过 20MB 的图片（base64 会放大 ~33%，避免过大 payload）
+    _MAX_IMAGE_SIZE = 20 * 1024 * 1024
+
+    async def _get_image_presigned_url(self, file: File) -> str | None:
+        """尝试为图片文件生成 presigned URL，供 LLM provider 直接拉取。
+
+        Returns presigned URL string, or None if generation fails.
+        """
+        try:
+            minio_store = getattr(self._file_storage, "minio_store", None)
+            bucket = getattr(self._file_storage, "bucket", None)
+            if minio_store and bucket and file.key:
+                url = await minio_store.presigned_get_url(
+                    bucket_name=bucket,
+                    object_name=file.key,
+                    expiry_seconds=24 * 60 * 60,
+                )
+                return url
+        except Exception as e:
+            logger.debug("生成图片 presigned URL 失败: %s", e)
+        return None
+
+    async def _build_image_content_blocks(self, attachments: list) -> list[dict]:
+        """为图片附件构建 OpenAI multimodal content blocks。
+
+        优先使用 presigned URL（请求体更小，兼容性更好）；
+        如果 URL 不可用则回退为 base64 data URL。
+
+        Args:
+            attachments: 同步到沙箱后的 File 对象列表。
+
+        Returns:
+            OpenAI Chat Completions image_url content block 列表。
+        """
+        blocks: list[dict] = []
+        for attachment in attachments:
+            if not isinstance(attachment, File):
+                continue
+            mime = attachment.mime_type or ""
+            if not any(mime.startswith(prefix) for prefix in self._IMAGE_MIME_PREFIXES):
+                continue
+            try:
+                # 优先尝试 presigned URL（不需要下载文件，请求体更小）
+                presigned_url = await self._get_image_presigned_url(attachment)
+                if presigned_url:
+                    blocks.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": presigned_url,
+                            "detail": "high",
+                        },
+                    })
+                    print(f"[DEBUG-IMG] 使用 presigned URL: file={attachment.filename}, "
+                          f"url_prefix={presigned_url[:80]}...", flush=True)
+                    continue
+
+                # 回退：下载文件并编码为 base64
+                file_data, _ = await self._file_storage.download_file(attachment.id)
+                with file_data:
+                    raw_bytes = file_data.read()
+                if len(raw_bytes) > self._MAX_IMAGE_SIZE:
+                    logger.warning(
+                        "图片附件 %s 过大 (%d bytes)，跳过多模态编码",
+                        attachment.id, len(raw_bytes),
+                    )
+                    continue
+                b64_data = base64.b64encode(raw_bytes).decode("utf-8")
+                blocks.append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{mime};base64,{b64_data}",
+                        "detail": "high",
+                    },
+                })
+                print(f"[DEBUG-IMG] 使用 base64: file={attachment.filename}, "
+                      f"size={len(raw_bytes)} bytes", flush=True)
+            except Exception as e:
+                logger.warning("构建图片内容块失败 (file_id=%s): %s", attachment.id, e)
+        return blocks
 
     @classmethod
     def _get_stream_size(cls, f: BinaryIO) -> int:
@@ -629,7 +756,47 @@ class AgentTaskRunner(TaskRunner):
             )
             return [], debug
 
+        # Phase 1: 优先使用 embedding
+        embedding_results = None
+        if self._embedding_available and self._embedding_index is not None:
+            try:
+                embedding_results = await self._embedding_index.query(user_message, top_k=12)
+            except Exception:
+                logger.warning("Embedding 检索失败，降级为 token-overlap")
+
+        # 始终运行 token-overlap（shadow mode + fallback）
         meta = self._skill_selector.select_with_meta(skill_pool, user_message)
+
+        if embedding_results:
+            id_to_skill = {s.id: s for s in skill_pool}
+            selected = [id_to_skill[sid] for sid, _ in embedding_results if sid in id_to_skill]
+            scores = [score for sid, score in embedding_results if sid in id_to_skill]
+
+            if selected:
+                # Shadow mode 日志
+                emb_ids = [s.id for s in selected[:6]]
+                tok_ids = [s.id for s in meta.selected_skills[:6]]
+                overlap = len(set(emb_ids) & set(tok_ids))
+                logger.info("Skill选择对比 overlap=%d/6 emb=%s tok=%s", overlap, emb_ids, tok_ids)
+
+                # 映射为 SkillSelectionMeta
+                max_score = int(scores[0] * 100) if scores else 0
+                second_score = int(scores[1] * 100) if len(scores) > 1 else 0
+                has_positive = _compute_has_positive_match(scores)
+                effective_threshold = min(max_score, 1) if has_positive else max_score + 1
+                meta = SkillSelectionMeta(
+                    selected_skills=selected,
+                    max_score=max_score,
+                    second_score=second_score,
+                    token_count=len(user_message.split()),
+                    effective_threshold=effective_threshold,
+                )
+                self._current_embedding_scores = scores
+            else:
+                self._current_embedding_scores = None
+        else:
+            self._current_embedding_scores = None
+
         (
             is_continuation,
             continuation_source,
@@ -701,8 +868,24 @@ class AgentTaskRunner(TaskRunner):
                 return "\n".join(lines[idx + 1 :]).strip()
         return raw
 
-    def _build_skill_context_prompt(self, skills: list[Skill]) -> str:
-        """将已选中的 Skill 构建为运行时系统上下文。"""
+    def _get_skill_guide_body(self, manifest: dict, skill) -> str:
+        """提取 Skill 的完整 guide 内容（context_blob 或 skill_md）。"""
+        context_blob = str(manifest.get("context_blob") or "").strip()
+        if context_blob:
+            body = context_blob
+        else:
+            skill_md = str(manifest.get("skill_md") or "").strip()
+            body = self._strip_skill_frontmatter(skill_md)
+        body = re.sub(r"\n{3,}", "\n\n", body).strip()
+        if len(body) > SKILL_CONTEXT_MAX_SNIPPET_CHARS:
+            body = body[:SKILL_CONTEXT_MAX_SNIPPET_CHARS].rstrip() + "\n...(truncated)"
+        return body or (skill.description or "").strip() or "No additional guide content."
+
+    def _build_skill_context_prompt(self, skills: list[Skill], scores: list[float] | None = None) -> str:
+        """将已选中的 Skill 构建为运行时系统上下文（两级：Tier 2 完整指南 / Tier 1 轻量卡片）。"""
+        TIER2_MAX_COUNT = 2
+        TIER2_SCORE_THRESHOLD = 0.5
+
         if not skills:
             return ""
 
@@ -711,25 +894,32 @@ class AgentTaskRunner(TaskRunner):
             "Follow these selected SKILL.md guides when they are relevant to the current task.",
         ]
 
+        self._tier2_preloaded_skill_ids = set()
+        tier2_count = 0
         total_chars = sum(len(item) for item in sections)
-        for skill in skills[:SKILL_CONTEXT_MAX_SKILLS]:
+        for i, skill in enumerate(skills[:SKILL_CONTEXT_MAX_SKILLS]):
             manifest = skill.manifest if isinstance(skill.manifest, dict) else {}
-            context_blob = str(manifest.get("context_blob") or "").strip()
-            if context_blob:
-                body = context_blob
+
+            # 决定是否使用 Tier 2（完整指南）
+            if scores is not None:
+                score = scores[i] if i < len(scores) else 0.0
+                use_tier2 = score >= TIER2_SCORE_THRESHOLD and tier2_count < TIER2_MAX_COUNT
             else:
-                skill_md = str(manifest.get("skill_md") or "").strip()
-                body = self._strip_skill_frontmatter(skill_md)
-            body = re.sub(r"\n{3,}", "\n\n", body).strip()
-            if len(body) > SKILL_CONTEXT_MAX_SNIPPET_CHARS:
-                body = body[:SKILL_CONTEXT_MAX_SNIPPET_CHARS].rstrip() + "\n...(truncated)"
+                use_tier2 = i == 0  # 无分数时，top-1 使用 Tier 2
 
-            if not body:
-                body = (skill.description or "").strip()
-            if not body:
-                body = "No additional guide content."
+            if use_tier2:
+                body = self._get_skill_guide_body(manifest, skill)
+                block = f"### {skill.name} ({skill.slug})\n{body}"
+                self._tier2_preloaded_skill_ids.add(skill.id)
+                tier2_count += 1
+            else:
+                # Tier 1: 轻量卡片，仅包含名称、描述和工具名
+                desc = (skill.description or "").strip() or "No description."
+                tools_list = manifest.get("tools") or []
+                tool_names = [t["name"] for t in tools_list if isinstance(t, dict) and "name" in t]
+                tools_line = f"Tools: {', '.join(tool_names)}" if tool_names else "Tools: (none)"
+                block = f"### {skill.name} ({skill.slug})\n{desc}\n{tools_line}"
 
-            block = f"### {skill.name} ({skill.slug})\n{body}"
             if total_chars + len(block) > SKILL_CONTEXT_MAX_TOTAL_CHARS:
                 break
 
@@ -813,7 +1003,10 @@ class AgentTaskRunner(TaskRunner):
                 + ", ".join(skill_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
             )
         else:
-            lines.append("- active skill tools: (none)")
+            lines.append(
+                "- active skill tools: (none, use get_skill_guide to load full guide, "
+                "tools will be bound at step execution)"
+            )
         if creator_tools:
             lines.append(
                 "- skill creator tools: "
@@ -878,27 +1071,120 @@ class AgentTaskRunner(TaskRunner):
             summary = summary[:char_budget].rstrip() + "\n...(truncated)"
         return summary
 
-    def _build_runtime_system_context(self, skills: list[Skill]) -> str:
+    def _build_runtime_system_context(self, skills: list[Skill], scores: list[float] | None = None) -> str:
         """组装运行时上下文（Skill指南 + 可用工具摘要）。"""
         sections: list[str] = []
-        skill_context = self._build_skill_context_prompt(skills)
+        skill_context = self._build_skill_context_prompt(skills, scores=scores)
         if skill_context:
             sections.append(skill_context)
         sections.append(self._build_available_tool_summary())
         return "\n\n".join(section for section in sections if section).strip()
 
-    def _set_runtime_system_context(self, skills: list[Skill]) -> None:
-        context = self._build_runtime_system_context(skills)
+    def _set_runtime_system_context(self, skills: list[Skill], scores: list[float] | None = None) -> None:
+        context = self._build_runtime_system_context(skills, scores=scores)
         if hasattr(self._flow, "set_skill_context"):
             self._flow.set_skill_context(context)
+
+    async def _refresh_skill_context_for_step(self, step_description: str) -> str:
+        """Phase 3: 根据 step 描述重新选择 skill 并构建上下文。"""
+        query_parts = [step_description]
+        if self._current_message_text:
+            query_parts.append(self._current_message_text)
+        query = "\n".join(query_parts)[:2000]
+
+        if self._embedding_available and self._embedding_index is not None:
+            try:
+                results = await self._embedding_index.query(query, top_k=12)
+                if results and results[0][1] < 0.2:
+                    return self._last_skill_context
+                id_to_skill = {s.id: s for s in self._session_skill_pool}
+                skills = [id_to_skill[sid] for sid, _ in results if sid in id_to_skill]
+                scores = [score for sid, score in results if sid in id_to_skill]
+            except Exception:
+                logger.warning("Step-level embedding 检索失败，使用 token-overlap")
+                skills = self._skill_selector.select(self._session_skill_pool, query)
+                scores = None
+        else:
+            skills = self._skill_selector.select(self._session_skill_pool, query)
+            scores = None
+
+        if skills:
+            await self._initialize_skill_tool_if_needed(skills)
+        context = self._build_runtime_system_context(skills, scores=scores)
+        self._last_skill_context = context
+        return context
+
+    async def _build_step_react_graph(self, step_description: str = ""):
+        """Phase 3: 渐进式构建 react_graph — 按步骤描述选择相关 Skill 工具。
+
+        1. 根据 step_description 刷新 Skill 选择（更新 _skill_tool）
+        2. 构建包含基础工具 + 当前步骤相关 Skill 工具的 react_graph
+        """
+        # 按步骤描述刷新 skill 选择
+        if step_description:
+            try:
+                await self._refresh_skill_context_for_step(step_description)
+            except Exception as exc:
+                logger.warning("[ProgressiveSkillLoad] 步骤级 skill 刷新失败: %s", exc)
+
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        from app.domain.services.tools.langchain_mcp import create_mcp_langchain_tools
+        from app.domain.services.tools.langchain_a2a import create_a2a_langchain_tools
+        from app.domain.services.tools.langchain_skill_tools import create_skill_langchain_tools
+        from app.domain.services.tools.langchain_dynamic_skill_tools import create_dynamic_skill_langchain_tools
+        from app.domain.services.graphs.react_graph import build_react_graph
+
+        lc_tools = create_native_tools(
+            sandbox=self._sandbox, browser=self._browser,
+            search_engine=self._search_engine,
+        )
+        lc_tools.extend(create_mcp_langchain_tools(self._mcp_tool))
+        lc_tools.extend(create_a2a_langchain_tools(self._a2a_tool))
+        lc_tools.extend(create_skill_langchain_tools(
+            brainstorm_skill_tool=self._brainstorm_skill_tool,
+            create_skill_tool=self._create_skill_tool,
+        ))
+
+        # 渐进式注入：只绑定当前步骤相关的 Skill 工具
+        dynamic_tools = create_dynamic_skill_langchain_tools(self._skill_tool)
+        lc_tools.extend(dynamic_tools)
+
+        # get_skill_guide 始终可用（空 pool 时返回友好提示），让 LLM 能按需获取完整 SKILL.md
+        from app.domain.services.tools.langchain_skill_tools import create_skill_guide_tool
+        lc_tools.append(create_skill_guide_tool(
+            skill_pool_ref=lambda: self._session_skill_pool,
+        ))
+
+        skill_tool_names = [t.name for t in dynamic_tools]
+        logger.info(
+            "[ProgressiveSkillLoad] step='%s' → 动态Skill工具 %d 个: %s, get_skill_guide=%s",
+            step_description[:80] if step_description else "(无步骤描述)",
+            len(skill_tool_names),
+            skill_tool_names,
+            bool(self._session_skill_pool),
+        )
+
+        return build_react_graph(
+            llm=self._llm, tools=lc_tools, agent_config=self._agent_config,
+        )
 
     async def _initialize_skill_tool_if_needed(self, skills: list[Skill]) -> None:
         """仅在技能集合变化时重新初始化 SkillTool，避免同 step 内抖动。"""
         skill_ids = tuple(skill.id for skill in skills)
         if skill_ids == self._last_initialized_skill_ids:
+            logger.debug(
+                "[ProgressiveSkillLoad] SkillTool 未变化，跳过重新初始化 (skills=%d)",
+                len(skills),
+            )
             return
+        prev_ids = self._last_initialized_skill_ids
         await self._skill_tool.initialize(skills)
         self._last_initialized_skill_ids = skill_ids
+        logger.info(
+            "[ProgressiveSkillLoad] SkillTool 已更新: %s → %s",
+            list(prev_ids) if prev_ids else "[]",
+            list(skill_ids),
+        )
 
     @staticmethod
     def _is_unknown_tool_event(event: ToolEvent) -> bool:
@@ -1366,6 +1652,35 @@ class AgentTaskRunner(TaskRunner):
                 enabled_skills,
                 skill_preference_map,
             )
+            # Phase 1: Embedding 索引构建
+            embedding_config = getattr(self._agent_config, 'skill_embedding', None)
+            if embedding_config and embedding_config.enabled and embedding_config.api_base and embedding_config.api_key:
+                try:
+                    from app.infrastructure.external.embedding.openai_embedding_provider import OpenAIEmbeddingProvider
+                    from app.infrastructure.external.embedding.skill_embedding_index import SkillEmbeddingIndex
+                    provider = OpenAIEmbeddingProvider(
+                        api_base=embedding_config.api_base,
+                        api_key=embedding_config.api_key,
+                        model=embedding_config.model,
+                        dimensions=embedding_config.dimensions,
+                    )
+                    # 尝试使用 Redis 缓存
+                    embedding_cache = None
+                    try:
+                        from app.infrastructure.external.embedding.redis_embedding_cache import RedisEmbeddingCache
+                        from app.infrastructure.storage.redis import get_redis
+                        redis_client = get_redis()
+                        _ = redis_client.client  # Raises RuntimeError if not initialized
+                        embedding_cache = RedisEmbeddingCache(redis_client.client)
+                    except (RuntimeError, Exception):
+                        embedding_cache = None
+                    self._embedding_index = SkillEmbeddingIndex(provider, cache=embedding_cache)
+                    await self._embedding_index.build(self._session_skill_pool)
+                    self._embedding_available = True
+                    logger.info("Embedding 索引构建完成: skills=%d, model=%s", len(self._session_skill_pool), embedding_config.model)
+                except Exception:
+                    logger.warning("Embedding 不可用，将使用 token-overlap", exc_info=True)
+                    self._embedding_available = False
             initial_skills = self._select_skills_from_pool(
                 self._session_skill_pool,
                 "",
@@ -1379,6 +1694,10 @@ class AgentTaskRunner(TaskRunner):
             self._set_runtime_system_context(initial_skills)
             self._skill_bundle_sync.start_background_sync()
 
+            # 传递 skill pool getter 给 flow，用于 get_skill_guide 按需加载
+            if hasattr(self._flow, '_skill_pool_getter'):
+                self._flow._skill_pool_getter = lambda: self._session_skill_pool
+
             # 3.循环读取任务中的输入消息队列
             while not await task.input_stream.is_empty():
                 # 4.从输入流中获取数据
@@ -1388,13 +1707,25 @@ class AgentTaskRunner(TaskRunner):
                 message = ""
 
                 # 5.判断事件类型是否为消息事件，如果是则处理消息并将附件同步到沙箱中
+                image_content_blocks: list[dict] = []
                 if isinstance(event, MessageEvent):
                     message = event.message or ""
                     await self._sync_message_attachments_to_sandbox(event)
+                    # 构建图片附件的多模态内容块，使 LLM 能直接"看到"图片
+                    print(f"[DEBUG-IMG] before _build_image_content_blocks: "
+                          f"attachments count={len(event.attachments)}, "
+                          f"types={[type(a).__name__ for a in event.attachments]}, "
+                          f"mimes={[getattr(a, 'mime_type', 'N/A') for a in event.attachments]}", flush=True)
+                    image_content_blocks = await self._build_image_content_blocks(
+                        event.attachments
+                    )
+                    print(f"[DEBUG-IMG] after _build_image_content_blocks: "
+                          f"blocks={len(image_content_blocks)}", flush=True)
                     logger.info(
-                        "AgentTaskRunner接收到新消息(len=%s, digest=%s)",
+                        "AgentTaskRunner接收到新消息(len=%s, digest=%s, images=%d)",
                         len(message),
                         hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                        len(image_content_blocks),
                     )
 
                 # 6.将消息事件转换称消息对象
@@ -1405,6 +1736,7 @@ class AgentTaskRunner(TaskRunner):
                         if isinstance(event, MessageEvent)
                         else []
                     ),
+                    image_content_blocks=image_content_blocks,
                     skill_confirmation_action=(
                         event.skill_confirmation_action
                         if isinstance(event, MessageEvent)
@@ -1421,7 +1753,15 @@ class AgentTaskRunner(TaskRunner):
                 self._step_skill_state = None
                 self._last_virtual_step_id = ""
                 await self._initialize_skill_tool_if_needed(selected_skills)
-                self._set_runtime_system_context(selected_skills)
+                self._set_runtime_system_context(selected_skills, scores=self._current_embedding_scores)
+
+                # Phase 2+3: 设置 LangGraph configurable 回调
+                if hasattr(self._flow, '_skill_context_refresher'):
+                    self._flow._skill_context_refresher = self._refresh_skill_context_for_step
+                    self._flow._react_graph_provider = self._build_step_react_graph
+                    self._flow._skill_guide_injector = SkillGuideInjector(
+                        selected_skills, self._tier2_preloaded_skill_ids
+                    )
 
                 # 7.传递消息对象并运行PlannerReActFlow
                 async for event in self._run_flow(message_obj):

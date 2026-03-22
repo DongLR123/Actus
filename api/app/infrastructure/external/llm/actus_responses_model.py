@@ -188,12 +188,33 @@ class ActusResponsesModel(BaseChatModel):
         return result
 
     @staticmethod
+    def _convert_content_blocks_for_responses(content: list) -> list[dict[str, Any]]:
+        """Convert Chat Completions multimodal content blocks to Responses API format.
+
+        Chat Completions: {"type": "text", "text": "..."} / {"type": "image_url", "image_url": {"url": "..."}}
+        Responses API:    {"type": "input_text", "text": "..."} / {"type": "input_image", "image_url": "..."}
+        """
+        converted: list[dict[str, Any]] = []
+        for block in content:
+            block_type = block.get("type", "")
+            if block_type == "text":
+                converted.append({"type": "input_text", "text": block.get("text", "")})
+            elif block_type == "image_url":
+                image_url = block.get("image_url", {})
+                url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
+                converted.append({"type": "input_image", "image_url": url})
+            else:
+                converted.append(block)
+        return converted
+
+    @staticmethod
     def _convert_input_messages_from_dicts(messages: List[dict[str, Any]]) -> List[dict[str, Any]]:
         """Convert Chat-style message dicts to Responses API input items.
 
         Handles:
         - role "tool" -> type "function_call_output"
         - assistant tool_calls -> "function_call" items
+        - user messages with multimodal content (list) -> Responses API format
         - Other messages pass through unchanged
         """
         converted: List[dict[str, Any]] = []
@@ -225,6 +246,16 @@ class ActusResponsesModel(BaseChatModel):
                         "name": function.get("name", ""),
                         "arguments": function.get("arguments", "{}"),
                     })
+                continue
+
+            # Convert multimodal content blocks for user messages
+            if role == "user" and isinstance(message.get("content"), list):
+                converted.append({
+                    "role": "user",
+                    "content": ActusResponsesModel._convert_content_blocks_for_responses(
+                        message["content"]
+                    ),
+                })
                 continue
 
             converted.append(message)

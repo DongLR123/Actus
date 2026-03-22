@@ -17,6 +17,41 @@ from langchain_core.messages import (
 )
 
 
+_IMAGE_VISION_HINT = (
+    '\n\n【多模态识图提示】上述附件中的图片已直接嵌入本消息中，你可以直接看到图片内容。'
+    '请基于你直接看到的图片进行分析，无需使用 file_read、浏览器或其他工具来查看或打开图片。'
+)
+
+
+def format_attachments_text(
+    attachments: list[str],
+    has_image_blocks: bool = False,
+) -> str:
+    """Format attachments list as prompt text, with conditional image vision hint.
+
+    When image blocks are present, appends a hint telling the LLM that images
+    are directly embedded in the message and it should analyze them visually
+    instead of trying to open them with tools.
+    """
+    text = ", ".join(attachments) if attachments else "无"
+    if has_image_blocks:
+        text += _IMAGE_VISION_HINT
+    return text
+
+
+def build_multimodal_content(
+    text: str, image_blocks: list[dict] | None = None,
+) -> str | list[dict]:
+    """Build HumanMessage content, optionally with image content blocks.
+
+    Returns plain text string if no image blocks, or a list of content blocks
+    (OpenAI Chat Completions multimodal format) when images are present.
+    """
+    if not image_blocks:
+        return text
+    return [{"type": "text", "text": text}] + list(image_blocks)
+
+
 def dicts_to_messages(dicts: list[dict[str, Any]]) -> list[BaseMessage]:
     """Convert Actus dict messages to LangChain BaseMessage list."""
     messages: list[BaseMessage] = []
@@ -78,14 +113,37 @@ def dedup_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
     return result
 
 
+def _flatten_multimodal_content(content: Any) -> str:
+    """Extract text from multimodal content blocks for Memory persistence.
+
+    When HumanMessage.content is a list[dict] (multimodal), extract only
+    the text blocks and discard image blocks to avoid storing large base64
+    payloads in Memory/database.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts = [
+            block.get("text", "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
+        return "\n".join(text_parts) if text_parts else str(content)
+    return str(content)
+
+
 def messages_to_dicts(messages: list[BaseMessage]) -> list[dict[str, Any]]:
-    """Convert LangChain BaseMessage list to Actus dict format (for Memory/raw-LLM)."""
+    """Convert LangChain BaseMessage list to Actus dict format (for Memory/raw-LLM).
+
+    Note: Multimodal content (image blocks) in HumanMessage is flattened to
+    text-only to avoid persisting large base64 image data in Memory/database.
+    """
     dicts: list[dict[str, Any]] = []
     for msg in messages:
         if isinstance(msg, SystemMessage):
             dicts.append({"role": "system", "content": msg.content})
         elif isinstance(msg, HumanMessage):
-            dicts.append({"role": "user", "content": msg.content})
+            dicts.append({"role": "user", "content": _flatten_multimodal_content(msg.content)})
         elif isinstance(msg, AIMessage):
             d: dict[str, Any] = {
                 "role": "assistant",

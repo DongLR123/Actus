@@ -86,7 +86,7 @@ def mock_planner_llm():
 def _make_mock_react_graph():
     """Create a mock react_graph with async generator astream."""
     class MockReactGraph:
-        async def astream(self, input_state, config=None):
+        async def astream(self, input_state, config=None, **kwargs):
             yield {"llm_node": {
                 "events": [MessageEvent(role="assistant", message="Step done")],
                 "messages": [
@@ -143,6 +143,7 @@ class TestMainGraphFlow:
             "message": "help me test",
             "language": "en",
             "attachments": [],
+            "image_content_blocks": [],
             "plan": None,
             "current_step": None,
             "messages": [],
@@ -178,6 +179,7 @@ class TestMainGraphFlow:
             "message": "help me",
             "language": "zh",
             "attachments": [],
+            "image_content_blocks": [],
             "plan": None,
             "current_step": None,
             "messages": [],
@@ -236,6 +238,7 @@ class TestMainGraphFlow:
             "message": "continue",
             "language": "zh",
             "attachments": [],
+            "image_content_blocks": [],
             "plan": None,
             "current_step": None,
             "messages": [],
@@ -260,7 +263,7 @@ class TestMainGraphFlow:
         from app.domain.services.graphs.main_graph import build_main_graph
 
         class FailingReactGraph:
-            async def astream(self, input_state, config=None):
+            async def astream(self, input_state, config=None, **kwargs):
                 yield {"tool_node": {
                     "events": [],
                     "messages": [
@@ -291,6 +294,7 @@ class TestMainGraphFlow:
             "message": "search AI news",
             "language": "zh",
             "attachments": [],
+            "image_content_blocks": [],
             "plan": None,
             "current_step": None,
             "messages": [],
@@ -352,6 +356,7 @@ class TestMainGraphFlow:
                 "message": "summarize",
                 "language": "zh",
                 "attachments": [],
+                "image_content_blocks": [],
                 "plan": plan,
                 "current_step": None,
                 "messages": [
@@ -419,7 +424,7 @@ class TestExecutorMessageBranching:
         captured_react_inputs = []
 
         class CapturingReactGraph:
-            async def astream(self, input_state, config=None):
+            async def astream(self, input_state, config=None, **kwargs):
                 captured_react_inputs.append(input_state)
                 yield {"llm_node": {
                     "events": [],
@@ -450,6 +455,7 @@ class TestExecutorMessageBranching:
             "message": "do something",
             "language": "zh",
             "attachments": [],
+            "image_content_blocks": [],
             "plan": None,
             "current_step": None,
             "messages": [],
@@ -476,7 +482,7 @@ class TestExecutorMessageBranching:
         captured_react_inputs = []
 
         class CapturingReactGraph:
-            async def astream(self, input_state, config=None):
+            async def astream(self, input_state, config=None, **kwargs):
                 captured_react_inputs.append(input_state)
                 yield {"llm_node": {
                     "events": [],
@@ -513,6 +519,7 @@ class TestExecutorMessageBranching:
             "message": "continue",
             "language": "zh",
             "attachments": [],
+            "image_content_blocks": [],
             "plan": plan,
             "current_step": step,
             "messages": history_messages,
@@ -543,7 +550,7 @@ class TestExecutorMessageBranching:
         captured_react_inputs = []
 
         class CapturingReactGraph:
-            async def astream(self, input_state, config=None):
+            async def astream(self, input_state, config=None, **kwargs):
                 captured_react_inputs.append(input_state)
                 yield {"llm_node": {
                     "events": [],
@@ -576,6 +583,7 @@ class TestExecutorMessageBranching:
             "message": "I have logged in",
             "language": "zh",
             "attachments": [],
+            "image_content_blocks": [],
             "plan": plan,
             "current_step": step,
             "messages": saved,
@@ -631,7 +639,7 @@ class TestUpdaterNodePlanUpdate:
         planner_llm.with_structured_output = MagicMock(side_effect=_with_structured_output)
 
         class MockReactGraph:
-            async def astream(self, input_state, config=None):
+            async def astream(self, input_state, config=None, **kwargs):
                 yield {"llm_node": {
                     "events": [],
                     "messages": [
@@ -652,6 +660,7 @@ class TestUpdaterNodePlanUpdate:
             "message": "check March tasks",
             "language": "zh",
             "attachments": [],
+            "image_content_blocks": [],
             "plan": None,
             "current_step": None,
             "messages": [],
@@ -688,7 +697,7 @@ class TestInterruptResume:
         from app.domain.services.graphs.main_graph import build_main_graph
 
         class InterruptingReactGraph:
-            async def astream(self, input_state, config=None):
+            async def astream(self, input_state, config=None, **kwargs):
                 yield {"tool_node": {
                     "events": [],
                     "messages": [
@@ -720,6 +729,7 @@ class TestInterruptResume:
             "message": "view Notion data",
             "language": "zh",
             "attachments": [],
+            "image_content_blocks": [],
             "plan": None,
             "current_step": None,
             "messages": [],
@@ -766,7 +776,7 @@ class TestInterruptResume:
 
         class InterruptThenCompleteReactGraph:
             """First call interrupts, second call completes."""
-            async def astream(self, input_state, config=None):
+            async def astream(self, input_state, config=None, **kwargs):
                 nonlocal call_count
                 call_count += 1
                 if call_count == 1:
@@ -812,6 +822,7 @@ class TestInterruptResume:
             "message": "login to notion",
             "language": "zh",
             "attachments": [],
+            "image_content_blocks": [],
             "plan": None,
             "current_step": None,
             "messages": [],
@@ -844,7 +855,7 @@ class TestInterruptResume:
         from app.domain.services.graphs.main_graph import build_main_graph
 
         class InterruptingReactGraph:
-            async def astream(self, input_state, config=None):
+            async def astream(self, input_state, config=None, **kwargs):
                 yield {"tool_node": {
                     "events": [],
                     "messages": [
@@ -876,6 +887,7 @@ class TestInterruptResume:
             "message": "find my database",
             "language": "zh",
             "attachments": [],
+            "image_content_blocks": [],
             "plan": None,
             "current_step": None,
             "messages": [],

@@ -59,6 +59,18 @@ class ActusFallbackChatModel(BaseChatModel):
         run_manager: Optional[AsyncCallbackManagerForLLMRun] = None,
         **kwargs: Any,
     ) -> ChatResult:
+        # 检测多模态内容用于调试
+        has_multimodal = any(
+            isinstance(m.content, list) for m in messages
+            if hasattr(m, "content")
+        )
+        if has_multimodal:
+            logger.info(
+                "[MULTIMODAL] FallbackModel dispatching with multimodal content, "
+                "primary=%s, fallback=%s",
+                getattr(self.primary, "model_name", self.primary._llm_type),
+                getattr(self.fallback, "model_name", self.fallback._llm_type),
+            )
         try:
             return await self.primary._agenerate(
                 messages, stop=stop, run_manager=run_manager, **kwargs,

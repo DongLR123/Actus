@@ -34,7 +34,12 @@ from langgraph.types import Command
 
 from app.domain.services.graphs.event_bridge import GraphEventBridge
 from app.domain.services.graphs.main_graph import build_main_graph
-from app.domain.services.graphs.message_utils import dicts_to_messages, messages_to_dicts
+from app.domain.services.graphs.message_utils import (
+    build_multimodal_content,
+    dicts_to_messages,
+    format_attachments_text,
+    messages_to_dicts,
+)
 from app.domain.services.graphs.react_graph import build_react_graph
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.base import BaseTool
@@ -89,6 +94,7 @@ class PlannerReActFlow(BaseFlow):
         self._skill_graph_canary_percent = skill_graph_canary_percent
         self._brainstorm_skill_tool = brainstorm_skill_tool
         self._create_skill_tool = create_skill_tool
+        self._skill_tool = skill_tool
 
         # 延迟绑定：保存依赖引用，在 invoke() 时构建工具和图
         # MCP/A2A 在 AgentTaskRunner.run() 中异步初始化，构造时尚未就绪
@@ -106,6 +112,16 @@ class PlannerReActFlow(BaseFlow):
         # LangGraph checkpointer — 跨 graph 重建复用，支持 interrupt/resume
         self._checkpointer = checkpointer  # None = lazy-init AsyncPostgresSaver
         self._db_url = db_url
+
+        # Phase 3: 动态 skill 切换回调（由 AgentTaskRunner 在 invoke 前设置）
+        self._skill_context_refresher = None
+        self._react_graph_provider = None
+        self._skill_guide_injector = None
+
+        # 会话 Skill 池 getter（由 AgentTaskRunner 在 run() 中设置），
+        # 用于 get_skill_guide 工具按需加载完整 SKILL.md。
+        # 使用 callable 而非直接列表引用，避免 runner 重新赋值后 stale。
+        self._skill_pool_getter: Callable[[], list] | None = None
 
     async def _get_checkpointer(self):
         """Lazy-initialize checkpointer. Returns injected checkpointer (test) or AsyncPostgresSaver (prod).
@@ -136,6 +152,11 @@ class PlannerReActFlow(BaseFlow):
 
         在 invoke() 首次调用时执行，此时 MCP/A2A 已完成异步初始化，
         能正确获取到所有可用工具。后续调用会重新构建以反映工具变化。
+
+        注意：此处只绑定 native + MCP + A2A + skill_creation 工具。
+        动态 Skill 工具（来自 SkillTool）不在此绑定，而是由
+        react_graph_provider 按步骤渐进式注入，避免一次性全量绑定。
+        Planner 和 Executor 通过 skill_context（名称+描述）了解可用 Skill。
         """
         checkpointer = await self._get_checkpointer()
         from app.domain.services.tools.langchain_a2a import create_a2a_langchain_tools
@@ -150,9 +171,20 @@ class PlannerReActFlow(BaseFlow):
             brainstorm_skill_tool=self._brainstorm_skill_tool,
             create_skill_tool=self._create_skill_tool,
         ))
+        # 动态 Skill 工具不在此绑定 — 由 react_graph_provider 按步骤渐进式注入
+        # 但提供 get_skill_guide 工具，让 LLM 能按需获取完整 SKILL.md 指南
+        from app.domain.services.tools.langchain_skill_tools import create_skill_guide_tool
+        if self._skill_pool_getter is not None:
+            lc_tools.append(create_skill_guide_tool(
+                skill_pool_ref=self._skill_pool_getter,
+            ))
 
+        has_guide_tool = self._skill_pool_getter is not None
         tool_names = [t.name for t in lc_tools]
-        logger.info("延迟绑定工具列表 (%d tools): %s", len(lc_tools), tool_names)
+        logger.info(
+            "基础工具列表 (%d tools, get_skill_guide=%s, 不含动态Skill): %s",
+            len(lc_tools), has_guide_tool, tool_names,
+        )
 
         self._react_graph = build_react_graph(
             llm=self._llm, tools=lc_tools, agent_config=self._agent_config,
@@ -392,9 +424,11 @@ class PlannerReActFlow(BaseFlow):
         )
 
         attachments = getattr(message, "attachments", [])
+        image_blocks = getattr(message, "image_content_blocks", [])
+        print(f"[DEBUG-IMG] _run_planner_for_detection: image_blocks={len(image_blocks)}, attachments={attachments}", flush=True)
         prompt = CREATE_PLAN_PROMPT.format(
             message=message.message,
-            attachments=", ".join(attachments) if attachments else "无",
+            attachments=format_attachments_text(attachments, has_image_blocks=bool(image_blocks)),
         )
 
         system_content = PLANNER_SYSTEM_PROMPT
@@ -409,9 +443,11 @@ class PlannerReActFlow(BaseFlow):
         if summary_texts:
             system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(summary_texts)
 
+        # Build multimodal prompt if image attachments exist
+        prompt_content = build_multimodal_content(prompt, image_blocks)
         messages = [
             SystemMessage(content=system_content),
-            HumanMessage(content=prompt),
+            HumanMessage(content=prompt_content),
         ]
         structured = self._llm.with_structured_output(PlanResponse)
         parsed: PlanResponse | None = await structured.ainvoke(messages)
@@ -476,7 +512,14 @@ class PlannerReActFlow(BaseFlow):
         await self._ensure_graphs()
 
         # LangGraph config with thread_id for checkpointer
-        config = {"configurable": {"thread_id": self._session_id}}
+        config = {
+            "configurable": {
+                "thread_id": self._session_id,
+                "skill_context_refresher": self._skill_context_refresher,
+                "react_graph_provider": self._react_graph_provider,
+                "skill_guide_injector": self._skill_guide_injector,
+            }
+        }
 
         # === Before Graph: load summaries ===
         async with self._uow_factory() as uow:
@@ -547,6 +590,7 @@ class PlannerReActFlow(BaseFlow):
                     "message": message.message,
                     "language": getattr(message, "language", "zh"),
                     "attachments": getattr(message, "attachments", []),
+                    "image_content_blocks": getattr(message, "image_content_blocks", []),
                     "plan": plan,
                     "current_step": plan.get_next_step(),
                     "messages": lc_messages,
@@ -569,6 +613,7 @@ class PlannerReActFlow(BaseFlow):
                     "message": message.message,
                     "language": getattr(message, "language", "zh"),
                     "attachments": getattr(message, "attachments", []),
+                    "image_content_blocks": getattr(message, "image_content_blocks", []),
                     "plan": self.plan,
                     "current_step": None,
                     "messages": lc_messages,

@@ -24,6 +24,7 @@ class MainGraphState(TypedDict):
     message: str
     language: str
     attachments: list[str]
+    image_content_blocks: list[dict]  # 图片附件的多模态内容块 (OpenAI image_url format)
 
     # Planning
     plan: Plan | None
@@ -66,6 +67,7 @@ class ReactGraphState(TypedDict):
     original_request: str
     language: str
     attachments: list[str]
+    image_content_blocks: list[dict]  # 图片附件的多模态内容块
 
     # Events produced by nodes (accumulated)
     events: Annotated[list, operator.add]

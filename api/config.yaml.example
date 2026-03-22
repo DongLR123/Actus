@@ -110,3 +110,11 @@ skill_risk_policy:
 # - 目录型 Skill 会在会话启动时预同步到 sandbox（默认 /home/ubuntu/workspace/.skills，可通过 SKILL_SANDBOX_BUNDLE_ROOT 调整）
 # - 用户偏好仍存储在 user_tool_preferences（tool_type=skill）
 # - 请在前端「设置 -> Skill 生态」中安装和管理 Skill
+
+# Skill embedding configuration (optional, disabled by default)
+# skill_embedding:
+#   enabled: false
+#   api_base: "https://api.openai.com/v1"
+#   api_key: ""
+#   model: "text-embedding-3-small"
+#   dimensions: 256

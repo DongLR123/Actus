@@ -14,6 +14,7 @@ import logging
 from typing import Any
 
 from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import RetryPolicy
 
@@ -80,6 +81,18 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
         """Call the LLM with current messages."""
         messages = state["messages"]
 
+        # 诊断日志：检查多模态内容是否到达 react_graph
+        multimodal_msgs = [
+            (i, [b.get("type") for b in m.content if isinstance(b, dict)])
+            for i, m in enumerate(messages)
+            if hasattr(m, "content") and isinstance(m.content, list)
+        ]
+        if multimodal_msgs:
+            logger.info(
+                "[MULTIMODAL] react llm_node: %d multimodal messages found: %s",
+                len(multimodal_msgs), multimodal_msgs,
+            )
+
         response: AIMessage = await llm_with_tools.ainvoke(messages)
 
         new_events = []
@@ -109,7 +122,7 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
             "events": new_events,
         }
 
-    async def tool_node(state: ReactGraphState) -> dict:
+    async def tool_node(state: ReactGraphState, config: RunnableConfig) -> dict:
         """Execute tool calls from the last assistant message.
 
         Special handling for ``message_ask_user``:
@@ -119,6 +132,8 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
           autonomously). If a SOFT_HINT was already returned in this step
           and the LLM calls again, it truly needs user input → interrupt.
         """
+        guide_injector = (config or {}).get("configurable", {}).get("skill_guide_injector") if config else None
+
         messages = state["messages"]
         last_msg = messages[-1]
 
@@ -175,6 +190,12 @@ def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
 
             # Prefix error messages so the LLM can clearly identify failures
             content = f"[TOOL_ERROR] {result_str}" if not tool_success else result_str
+
+            # Phase 2: 首次调用 Tier 1 skill 时注入 guide
+            if tool_success and guide_injector:
+                guide = guide_injector(tool_name)
+                if guide:
+                    content = f"{content}\n\n---\n[Skill Guide]\n{guide}"
 
             new_messages.append(ToolMessage(
                 content=content,

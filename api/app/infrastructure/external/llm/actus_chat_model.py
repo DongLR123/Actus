@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, AsyncIterator, Iterator, List, Optional
+import re
+import uuid
+from typing import Any, AsyncIterator, Optional
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
@@ -58,7 +60,9 @@ class ActusChatModel(BaseChatModel):
     supports_response_format: bool = True
 
     # Tools bound via bind_tools() — None means no tools bound
-    _bound_tools: Optional[list] = None
+    _bound_tools: Optional[list[dict[str, Any]]] = None
+    # Cached tool names from _bound_tools (computed once in bind_tools)
+    _bound_tool_names: frozenset[str] = frozenset()
 
     # ---- Properties ------------------------------------------------------ #
 
@@ -84,6 +88,16 @@ class ActusChatModel(BaseChatModel):
             if isinstance(msg, SystemMessage):
                 result.append({"role": "system", "content": msg.content})
             elif isinstance(msg, HumanMessage):
+                # content may be str (text) or list[dict] (multimodal with image blocks).
+                # OpenAI Chat Completions API accepts both formats natively.
+                if isinstance(msg.content, list):
+                    block_types = [b.get("type", "?") for b in msg.content if isinstance(b, dict)]
+                    image_count = sum(1 for t in block_types if t == "image_url")
+                    logger.info(
+                        "[MULTIMODAL] HumanMessage has %d content blocks (%d images), "
+                        "block_types=%s",
+                        len(msg.content), image_count, block_types,
+                    )
                 result.append({"role": "user", "content": msg.content})
             elif isinstance(msg, AIMessage):
                 entry: dict[str, Any] = {
@@ -152,6 +166,208 @@ class ActusChatModel(BaseChatModel):
             })
         return tool_calls
 
+    # ---- Fallback: extract tool calls from content text -------------------- #
+
+    # Skip fallback scanning on excessively long content to avoid
+    # performance issues from regex/brace-scanning on large outputs.
+    _MAX_CONTENT_TO_SCAN = 32_000
+
+    def _extract_tool_calls_from_content(
+        self, content: str,
+    ) -> tuple[list[dict], str]:
+        """Fallback: extract tool calls embedded in content text.
+
+        Some LLM providers (e.g. MiniMax) return tool calls as XML or JSON
+        inside the ``content`` field instead of the structured ``tool_calls``
+        response field. This method attempts to detect and parse them.
+
+        Only tool names that match bound tools are accepted (avoids false
+        positives).
+
+        Limitations:
+        - Nested XML inside parameter values is not supported (e.g.
+          ``<command>echo <b>hi</b></command>`` will not parse correctly).
+        - Content longer than ``_MAX_CONTENT_TO_SCAN`` chars is skipped.
+
+        Returns ``(tool_calls, cleaned_content)`` where *tool_calls* is in
+        LangChain format and *cleaned_content* has the matched text removed.
+        """
+        if not content or not self._bound_tool_names:
+            return [], content
+        if len(content) > self._MAX_CONTENT_TO_SCAN:
+            return [], content
+
+        valid_names = self._bound_tool_names
+
+        # --- Strategy 1: XML <invoke name="...">...</invoke> --- #
+        tool_calls, cleaned = self._try_extract_xml_invoke(content, valid_names)
+        if tool_calls:
+            return tool_calls, cleaned
+
+        # --- Strategy 2: JSON object with "name" + "arguments" --- #
+        tool_calls, cleaned = self._try_extract_json_tool_call(content, valid_names)
+        if tool_calls:
+            return tool_calls, cleaned
+
+        return [], content
+
+    # -- XML extraction ---------------------------------------------------- #
+
+    # Bounded quantifiers prevent catastrophic backtracking on malformed input.
+    _RE_INVOKE = re.compile(
+        r'<invoke\s+name="([^"]{1,256})"[^>]{0,256}>([\s\S]{0,16384}?)</invoke>',
+        re.DOTALL,
+    )
+    _RE_XML_PARAM = re.compile(r'<(\w{1,64})>(.{0,4096}?)</\1>', re.DOTALL)
+    # Tags inside <invoke> that are control metadata, not tool arguments
+    _XML_CONTROL_TAGS = frozenset({"end_turn"})
+    # Marker that immediately precedes XML tool calls (e.g. "minimax:tool_call")
+    # Anchored to line start via MULTILINE to avoid corrupting normal text.
+    _RE_TOOL_CALL_MARKER = re.compile(r'^\w+:tool_call\s*$', re.MULTILINE)
+
+    def _try_extract_xml_invoke(
+        self, content: str, valid_names: frozenset[str],
+    ) -> tuple[list[dict], str]:
+        """Try to extract ``<invoke name="tool">`` blocks from *content*.
+
+        Only removes matched (accepted) spans — unrecognised tool names are
+        left intact in the returned content.
+        """
+        tool_calls: list[dict] = []
+        accepted_spans: list[tuple[int, int]] = []
+
+        for match in self._RE_INVOKE.finditer(content):
+            tool_name = match.group(1)
+            inner = match.group(2)
+
+            if tool_name not in valid_names:
+                continue
+
+            # Parse child XML elements as arguments
+            args: dict[str, Any] = {}
+            for pm in self._RE_XML_PARAM.finditer(inner):
+                key = pm.group(1)
+                if key in self._XML_CONTROL_TAGS:
+                    continue
+                value = pm.group(2).strip()
+                # Try to interpret as JSON value (number, bool, null, etc.)
+                try:
+                    args[key] = json.loads(value)
+                except (json.JSONDecodeError, ValueError):
+                    args[key] = value
+
+            tool_calls.append({
+                "id": f"fallback_{uuid.uuid4().hex[:8]}",
+                "name": tool_name,
+                "args": args,
+            })
+            accepted_spans.append((match.start(), match.end()))
+
+        if not tool_calls:
+            return [], content
+
+        # Remove only accepted spans (reverse order to preserve indices)
+        cleaned = content
+        for start, end in reversed(accepted_spans):
+            cleaned = cleaned[:start] + cleaned[end:]
+        # Remove line-anchored tool_call markers (e.g. "minimax:tool_call")
+        cleaned = self._RE_TOOL_CALL_MARKER.sub("", cleaned)
+        cleaned = cleaned.strip()
+
+        logger.info(
+            "[FALLBACK_TOOL_CALL] Extracted %d XML tool call(s) from content "
+            "(model=%s): %s",
+            len(tool_calls), self.model_name,
+            [tc["name"] for tc in tool_calls],
+        )
+        return tool_calls, cleaned
+
+    # -- JSON extraction --------------------------------------------------- #
+
+    @staticmethod
+    def _find_json_objects(text: str) -> list[tuple[int, int, dict]]:
+        """Find top-level JSON objects in *text* via brace-depth scanning.
+
+        Returns list of ``(start, end, parsed_dict)`` tuples.
+        Uses ``str.find`` to skip non-brace characters efficiently.
+        """
+        results: list[tuple[int, int, dict]] = []
+        i = 0
+        length = len(text)
+        while i < length:
+            next_brace = text.find('{', i)
+            if next_brace == -1:
+                break
+            i = next_brace
+            depth = 0
+            end = i
+            for j in range(i, length):
+                if text[j] == '{':
+                    depth += 1
+                elif text[j] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = j + 1
+                        break
+            if depth == 0 and end > i:
+                try:
+                    obj = json.loads(text[i:end])
+                    if isinstance(obj, dict):
+                        results.append((i, end, obj))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                i = end
+            else:
+                i += 1
+        return results
+
+    _RE_CODE_FENCE = re.compile(r'```(?:json)?\s*\n?\s*```', re.MULTILINE)
+
+    def _try_extract_json_tool_call(
+        self, content: str, valid_names: frozenset[str],
+    ) -> tuple[list[dict], str]:
+        """Try to extract JSON tool call objects from *content*.
+
+        Recognises objects like ``{"name": "tool", "arguments": {...}}``.
+        """
+        tool_calls: list[dict] = []
+        spans_to_remove: list[tuple[int, int]] = []
+
+        for start, end, obj in self._find_json_objects(content):
+            name = obj.get("name", "")
+            arguments = obj.get("arguments")
+
+            if not name or name not in valid_names:
+                continue
+            if not isinstance(arguments, dict):
+                continue
+
+            tool_calls.append({
+                "id": f"fallback_{uuid.uuid4().hex[:8]}",
+                "name": name,
+                "args": arguments,
+            })
+            spans_to_remove.append((start, end))
+
+        if not tool_calls:
+            return [], content
+
+        # Remove matched JSON spans (reverse order to preserve indices)
+        cleaned = content
+        for start, end in reversed(spans_to_remove):
+            cleaned = cleaned[:start] + cleaned[end:]
+        # Strip leftover empty code fences
+        cleaned = self._RE_CODE_FENCE.sub('', cleaned)
+        cleaned = cleaned.strip()
+
+        logger.info(
+            "[FALLBACK_TOOL_CALL] Extracted %d JSON tool call(s) from content "
+            "(model=%s): %s",
+            len(tool_calls), self.model_name,
+            [tc["name"] for tc in tool_calls],
+        )
+        return tool_calls, cleaned
+
     # ---- LangChain interface: _generate (sync) --------------------------- #
 
     def _generate(
@@ -206,8 +422,15 @@ class ActusChatModel(BaseChatModel):
         if stop:
             params["stop"] = stop
 
-        logger.info("ActusChatModel._agenerate: model=%s, tools=%d",
-                     self.model_name, len(all_tools))
+        # 统计多模态内容块数量用于调试
+        multimodal_count = sum(
+            1 for m in openai_messages
+            if m.get("role") == "user" and isinstance(m.get("content"), list)
+        )
+        logger.info(
+            "ActusChatModel._agenerate: model=%s, tools=%d, multimodal_messages=%d",
+            self.model_name, len(all_tools), multimodal_count,
+        )
 
         response = await client.chat.completions.create(**params)
 
@@ -216,6 +439,10 @@ class ActusChatModel(BaseChatModel):
         message = choice.message
         content = message.content or ""
         tool_calls = self._parse_tool_calls(message.tool_calls)
+
+        # Fallback: if no structured tool_calls, try extracting from content
+        if not tool_calls and content:
+            tool_calls, content = self._extract_tool_calls_from_content(content)
 
         ai_message = AIMessage(content=content, tool_calls=tool_calls)
         return ChatResult(generations=[ChatGeneration(message=ai_message)])
@@ -261,7 +488,14 @@ class ActusChatModel(BaseChatModel):
         if stop:
             params["stop"] = stop
 
-        logger.info("ActusChatModel._astream: model=%s", self.model_name)
+        multimodal_count = sum(
+            1 for m in openai_messages
+            if m.get("role") == "user" and isinstance(m.get("content"), list)
+        )
+        logger.info(
+            "ActusChatModel._astream: model=%s, multimodal_messages=%d",
+            self.model_name, multimodal_count,
+        )
 
         response = client.chat.completions.create(**params)
         # AsyncOpenAI with stream=True returns an awaitable that resolves to
@@ -324,4 +558,9 @@ class ActusChatModel(BaseChatModel):
             supports_response_format=self.supports_response_format,
         )
         new_model._bound_tools = converted
+        new_model._bound_tool_names = frozenset(
+            t["function"]["name"]
+            for t in converted
+            if t.get("function", {}).get("name")
+        )
         return new_model

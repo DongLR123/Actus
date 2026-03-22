@@ -39,7 +39,7 @@ from app.domain.models.plan import ExecutionStatus, Plan, Step
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.flows.base import FlowStatus
 
-from .message_utils import dedup_messages
+from .message_utils import build_multimodal_content, dedup_messages, format_attachments_text
 from .state import MainGraphState
 
 logger = logging.getLogger(__name__)
@@ -54,9 +54,22 @@ def _compact_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
     Mirrors the main-branch Memory.compact() behaviour:
     - Replace browser tool results with short summaries
     - Truncate very long tool results
+    - Strip multimodal image blocks from HumanMessage to avoid re-sending
+      large base64 payloads on every subsequent step
     """
     compacted: list[BaseMessage] = []
     for msg in messages:
+        # Strip multimodal image content blocks — images were already "seen" in step 1,
+        # subsequent steps only need the text portion to avoid bloating context with base64.
+        if isinstance(msg, HumanMessage) and isinstance(msg.content, list):
+            text_parts = [
+                block.get("text", "")
+                for block in msg.content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            text_only = "\n".join(text_parts) if text_parts else str(msg.content)
+            compacted.append(HumanMessage(content=text_only))
+            continue
         if isinstance(msg, ToolMessage) and isinstance(msg.content, str) and msg.name in _BROWSER_COMPACT_TOOLS:
             # Extract title and short preview from HTML content
             content = msg.content
@@ -115,9 +128,10 @@ def build_main_graph(
     async def planner_node(state: MainGraphState) -> dict:
         """Call planner LLM to create a plan from user message."""
         attachments = state.get("attachments", [])
+        image_blocks = state.get("image_content_blocks", [])
         prompt = CREATE_PLAN_PROMPT.format(
             message=state["message"],
-            attachments=", ".join(attachments) if attachments else "无",
+            attachments=format_attachments_text(attachments, has_image_blocks=bool(image_blocks)),
         )
 
         # Build system prompt with optional tool summary and conversation summaries
@@ -136,9 +150,11 @@ def build_main_graph(
             system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(conversation_summaries)
 
         # Use structured output via LangChain BaseChatModel
+        # Include image content blocks for multimodal understanding
+        prompt_content = build_multimodal_content(prompt, image_blocks)
         messages = [
             SystemMessage(content=system_content),
-            HumanMessage(content=prompt),
+            HumanMessage(content=prompt_content),
         ]
         structured_llm = planner_llm.with_structured_output(PlanResponse)
 
@@ -206,6 +222,18 @@ def build_main_graph(
                 "messages": state.get("messages", []),
             }
 
+        # Phase 3: 获取当前 step 的编译后 react_graph（渐进式 Skill 加载）
+        # 传递步骤描述，使 provider 能按步骤选择相关 Skill 工具
+        react_graph_provider = (config.get("configurable") or {}).get("react_graph_provider")
+        if react_graph_provider:
+            try:
+                step_react = await react_graph_provider(step.description)
+            except Exception:
+                logger.warning("react_graph_provider 失败，使用默认（无动态Skill工具）")
+                step_react = react_graph
+        else:
+            step_react = react_graph
+
         resume_value = state.get("resume_value")
 
         # Emit StepEvent(STARTED) — skip on resume to avoid duplicate events
@@ -214,6 +242,7 @@ def build_main_graph(
 
         # Build initial messages with system prompt + execution prompt
         attachments = state.get("attachments", [])
+        image_blocks = state.get("image_content_blocks", [])
         language = state.get("language", "zh")
         skill_context = state.get("skill_context", "")
 
@@ -250,6 +279,7 @@ def build_main_graph(
             initial_messages = saved_messages + [HumanMessage(content=resume_hint)]
         elif saved_messages:
             # 非首步/有历史：更新 system prompt 为最新版本，追加新 execution prompt
+            # 图片已在首步消息中（已被 compact 剥离），无需重复添加
             first = saved_messages[0]
             updated_first = SystemMessage(content=system_content) if isinstance(first, SystemMessage) else first
             initial_messages = [
@@ -257,21 +287,28 @@ def build_main_graph(
                 *saved_messages[1:],
                 HumanMessage(content=EXECUTION_PROMPT.format(
                     message=state["message"],
-                    attachments=", ".join(attachments) if attachments else "无",
+                    attachments=format_attachments_text(attachments),
                     language=language,
                     step=step.description,
                 )),
             ]
         else:
-            # 首步/无历史：干净的 system + execution prompt
+            # 首步/无历史：干净的 system + execution prompt（含图片多模态内容）
+            attachments_text = format_attachments_text(attachments, has_image_blocks=bool(image_blocks))
+            execution_text = EXECUTION_PROMPT.format(
+                message=state["message"],
+                attachments=attachments_text,
+                language=language,
+                step=step.description,
+            )
+            print(f"[DEBUG-IMG] executor_node: image_blocks={len(image_blocks)}, attachments={attachments}", flush=True)
+            prompt_content = build_multimodal_content(execution_text, image_blocks)
+            print(f"[DEBUG-IMG] executor_node: prompt_content type={type(prompt_content).__name__}, "
+                  f"is_list={isinstance(prompt_content, list)}, "
+                  f"len={len(prompt_content) if isinstance(prompt_content, list) else 'N/A'}", flush=True)
             initial_messages = [
                 SystemMessage(content=system_content),
-                HumanMessage(content=EXECUTION_PROMPT.format(
-                    message=state["message"],
-                    attachments=", ".join(attachments) if attachments else "无",
-                    language=language,
-                    step=step.description,
-                )),
+                HumanMessage(content=prompt_content),
             ]
 
         # Build react_graph input
@@ -281,6 +318,7 @@ def build_main_graph(
             "original_request": state.get("original_request", ""),
             "language": language,
             "attachments": attachments,
+            "image_content_blocks": image_blocks,
             "events": [],
             "should_interrupt": False,
             "soft_hint_sent": False,
@@ -289,13 +327,16 @@ def build_main_graph(
         }
 
         # Stream react_graph — emit events in real-time.
-        # ReactGraphState.messages uses add_messages reducer, so astream
-        # (default stream_mode="updates") yields only NEW messages per chunk,
-        # not the full history. We accumulate them manually here.
+        # IMPORTANT: Must use stream_mode="updates" explicitly.
+        # LangGraph 1.0.x defaults to "values" (full state per chunk), but we
+        # need "updates" ({node_name: state_update} per chunk) so that we can
+        # accumulate only NEW messages from each node and emit events in order.
         react_final: dict[str, Any] = {}
         all_react_messages: list = []
         seen_interrupt = False
-        async for chunk in react_graph.astream(react_input):
+        async for chunk in step_react.astream(
+            react_input, config=config, stream_mode="updates",
+        ):
             for _node_name, node_output in chunk.items():
                 if not isinstance(node_output, dict):
                     continue
@@ -459,11 +500,23 @@ def build_main_graph(
 
         # 3. Find next step
         next_step = plan.get_next_step()
+
+        # Phase 3: 根据下一步描述刷新 skill context
+        new_skill_context = state.get("skill_context", "")
+        if next_step:
+            refresher = (config.get("configurable") or {}).get("skill_context_refresher")
+            if refresher:
+                try:
+                    new_skill_context = await refresher(next_step.description)
+                except Exception as exc:
+                    logger.warning("Step-level skill refresh 失败: %s", exc)
+
         if not next_step:
             return {
                 "plan": plan,
                 "current_step": None,
                 "flow_status": FlowStatus.SUMMARIZING.value,
+                "skill_context": new_skill_context,
                 "events": events,
             }
 
@@ -471,6 +524,7 @@ def build_main_graph(
             "plan": plan,
             "current_step": next_step,
             "flow_status": FlowStatus.EXECUTING.value,
+            "skill_context": new_skill_context,
             "events": events,
         }
 

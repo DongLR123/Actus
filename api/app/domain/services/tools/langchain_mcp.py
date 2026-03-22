@@ -114,7 +114,9 @@ def _make_mcp_coroutine(mcp_tool: MCPTool, tool_name: str):
         if hasattr(result, "message") and result.message:
             return result.message
         if hasattr(result, "data") and result.data:
-            return json.dumps(result.data)
+            # Return string data as-is; only JSON-encode non-string data
+            # (dicts, lists) to avoid double-encoding strings with json.dumps
+            return result.data if isinstance(result.data, str) else json.dumps(result.data)
         return str(result)
 
     return _invoke
