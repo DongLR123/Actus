@@ -300,7 +300,7 @@ class PlannerReActFlow(BaseFlow):
         # 使用字符估算 token（粗略：1 token ≈ 3-4 字符中英混合）
         total_chars = sum(len(str(m.get("content", ""))) for m in memory.messages)
         estimated_tokens = int(total_chars / 3 * self._overflow_config.token_safety_factor)
-        window = resolve_context_window("", self._overflow_config)
+        window = resolve_context_window(self._overflow_config.model_name, self._overflow_config)
         hard_limit = int(window * self._overflow_config.hard_trigger_ratio)
         if estimated_tokens > hard_limit:
             logger.warning(f"上下文溢出: ~{estimated_tokens} tokens > hard_limit {hard_limit}, 执行硬压缩")

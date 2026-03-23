@@ -18,6 +18,7 @@ class ContextOverflowConfig(BaseModel):
     token_estimator: Literal["hybrid", "char", "provider_api"] = "hybrid"
     token_safety_factor: float = Field(1.15, ge=1.0)
     unknown_model_context_window: int = Field(32768, ge=1024)
+    model_name: str = ""
 
     @classmethod
     def from_llm_config(cls, llm_config: LLMConfig) -> "ContextOverflowConfig":
@@ -33,4 +34,5 @@ class ContextOverflowConfig(BaseModel):
             token_estimator=llm_config.token_estimator,
             token_safety_factor=llm_config.token_safety_factor,
             unknown_model_context_window=llm_config.unknown_model_context_window,
+            model_name=llm_config.model_name,
         )

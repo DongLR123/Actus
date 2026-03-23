@@ -16,6 +16,8 @@ from app.interfaces.service_dependencies import get_agent_service
 from core.config import get_settings
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # 加载配置信息
 settings = get_settings()
@@ -124,14 +126,34 @@ app = FastAPI(
 )
 
 # 配置CORS中间件，解决跨域问题
+_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 允许所有来源
+    allow_origins=_origins,
     allow_credentials=True,
-    allow_methods=["*"],  # 允许所有方法
-    allow_headers=["*"],  # 允许所有头部
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def limit_request_body(request: Request, call_next):
+    """请求体大小限制中间件"""
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > settings.max_request_body_size:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": "Request body too large"},
+        )
+    if request.method in ("POST", "PUT", "PATCH"):
+        body = await request.body()
+        if len(body) > settings.max_request_body_size:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "Request body too large"},
+            )
+    return await call_next(request)
 
 # 注册全局异常处理器
 register_exception_handlers(app)

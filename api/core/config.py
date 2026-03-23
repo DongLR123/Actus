@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     env: str = "development"  # 应用环境，默认为'development'
     log_level: str = "INFO"  # 日志级别，默认为'INFO'
     app_config_filepath: str = "config.yaml"  # 应用配置文件路径
+    cors_origins: str = "http://localhost:3000,http://localhost"  # 逗号分隔的允许来源列表
+    max_request_body_size: int = 500 * 1024 * 1024  # 500MB 请求体限制
 
     # 数据库配置
     sqlalchemy_database_url: str = (
