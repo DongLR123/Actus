@@ -122,6 +122,13 @@ class PlannerReActFlow(BaseFlow):
         # 用于 get_skill_guide 工具按需加载完整 SKILL.md。
         # 使用 callable 而非直接列表引用，避免 runner 重新赋值后 stale。
         self._skill_pool_getter: Callable[[], list] | None = None
+        self._file_listings_getter: Callable[[], dict[str, list[str]]] | None = None
+        self._sandbox_skill_root: str = "/home/ubuntu/workspace/.skills"
+
+        # MCP progressive loading (set by AgentTaskRunner in run())
+        self._mcp_tool_ref: Callable | None = None
+        self._activated_mcp_tools_ref: Callable[[], set[str]] | None = None
+        self._mcp_always_bind_names: set[str] = set()
 
     async def _get_checkpointer(self):
         """Lazy-initialize checkpointer. Returns injected checkpointer (test) or AsyncPostgresSaver (prod).
@@ -165,7 +172,18 @@ class PlannerReActFlow(BaseFlow):
             sandbox=self._sandbox, browser=self._browser,
             search_engine=self._search_engine,
         )
-        lc_tools.extend(create_mcp_langchain_tools(self._mcp_tool))
+        # MCP: only bind always_bind tools (progressive loading)
+        if self._mcp_always_bind_names:
+            lc_tools.extend(create_mcp_langchain_tools(
+                self._mcp_tool, tool_names=self._mcp_always_bind_names,
+            ))
+        # MCP discovery tools (only when MCP refs are fully wired by AgentTaskRunner)
+        if self._mcp_tool_ref is not None and self._activated_mcp_tools_ref is not None:
+            from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
+            lc_tools.extend(create_mcp_discovery_tools(
+                mcp_tool_ref=self._mcp_tool_ref,
+                activated_tools_ref=self._activated_mcp_tools_ref,
+            ))
         lc_tools.extend(create_a2a_langchain_tools(self._a2a_tool))
         lc_tools.extend(create_skill_langchain_tools(
             brainstorm_skill_tool=self._brainstorm_skill_tool,
@@ -177,6 +195,8 @@ class PlannerReActFlow(BaseFlow):
         if self._skill_pool_getter is not None:
             lc_tools.append(create_skill_guide_tool(
                 skill_pool_ref=self._skill_pool_getter,
+                file_listings_ref=self._file_listings_getter,
+                sandbox_skill_root=self._sandbox_skill_root,
             ))
 
         has_guide_tool = self._skill_pool_getter is not None

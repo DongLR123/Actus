@@ -171,6 +171,10 @@ class MCPServerConfig(BaseModel):
     url: Optional[str] = None  # MCP服务URL地址
     headers: Optional[Dict[str, Any]] = None  # MCP服务请求头
 
+    # 渐进加载: 始终 bind 到 LLM 的工具名（短名，不含 mcp_ 前缀）
+    # None = 全走发现模式；["tool_a", "tool_b"] = 这些工具始终 bind
+    always_bind: Optional[List[str]] = None
+
     model_config = ConfigDict(extra="allow")
 
     @model_validator(mode="after")

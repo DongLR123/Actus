@@ -260,6 +260,7 @@ class AgentTaskRunner(TaskRunner):
         self._current_embedding_scores: list[float] | None = None
         self._tier2_preloaded_skill_ids: set[str] = set()
         self._last_skill_context: str = ""
+        self._activated_mcp_tools: set[str] = set()
         self._file_storage = file_storage
         self._overflow_config = overflow_config or ContextOverflowConfig()
         # self._file_repository = file_repository
@@ -1013,35 +1014,29 @@ class AgentTaskRunner(TaskRunner):
                 + ", ".join(creator_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
             )
 
-        # MCP 工具
-        mcp_tools: list[str] = []
+        # MCP 工具（渐进加载模式）
+        always_bind_names = list(self._get_always_bind_tool_names())
+        mcp_all_names: list[str] = []
         try:
-            raw_mcp = self._mcp_tool.get_tools()
-            logger.info(
-                "[ToolSummary] MCP get_tools() 返回 %d 项, initialized=%s, manager=%s",
-                len(raw_mcp),
-                getattr(self._mcp_tool, "_initialized", "?"),
-                self._mcp_tool._manager is not None if hasattr(self._mcp_tool, "_manager") else "?",
-            )
-            for schema in raw_mcp:
-                if not isinstance(schema, dict):
-                    logger.debug("[ToolSummary] MCP schema 非dict: %s", type(schema))
-                    continue
-                function_info = schema.get("function")
-                if not isinstance(function_info, dict):
-                    logger.debug("[ToolSummary] MCP function 非dict: %s", type(function_info))
-                    continue
-                tool_name = function_info.get("name")
-                if isinstance(tool_name, str) and tool_name:
-                    mcp_tools.append(tool_name)
-        except Exception as exc:
-            logger.warning("读取MCP工具摘要失败，降级为空: %s", exc, exc_info=True)
-            mcp_tools = []
-        logger.info("[ToolSummary] 最终 mcp_tools=%s", mcp_tools)
-        if mcp_tools:
+            for schema in self._mcp_tool.get_tools():
+                fn = schema.get("function", {})
+                name = fn.get("name", "")
+                if name:
+                    mcp_all_names.append(name)
+        except Exception:
+            pass
+        mcp_discovery_names = [n for n in mcp_all_names if n not in set(always_bind_names)]
+        if always_bind_names or mcp_discovery_names:
+            lines.append("- mcp discovery: list_mcp_tools, get_mcp_tool")
+        if always_bind_names:
             lines.append(
-                "- mcp tools: "
-                + ", ".join(mcp_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
+                "- mcp always-bind: "
+                + ", ".join(always_bind_names[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
+            )
+        if mcp_discovery_names:
+            lines.append(
+                "- mcp available (use get_mcp_tool to activate): "
+                + ", ".join(mcp_discovery_names[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
             )
 
         # A2A 工具（仅在 manager 存在时才有 LangChain 工具绑定到 LLM）
@@ -1114,6 +1109,19 @@ class AgentTaskRunner(TaskRunner):
         self._last_skill_context = context
         return context
 
+    def _get_always_bind_tool_names(self) -> set[str]:
+        """从 MCPConfig 提取所有 always_bind 工具名，组装完整前缀名。"""
+        if not self._mcp_config or not self._mcp_config.mcpServers:
+            return set()
+        names: set[str] = set()
+        for server_name, config in self._mcp_config.mcpServers.items():
+            if not config.enabled or not config.always_bind:
+                continue
+            prefix = server_name if server_name.startswith("mcp_") else f"mcp_{server_name}"
+            for tool_short_name in config.always_bind:
+                names.add(f"{prefix}_{tool_short_name}")
+        return names
+
     async def _build_step_react_graph(self, step_description: str = ""):
         """Phase 3: 渐进式构建 react_graph — 按步骤描述选择相关 Skill 工具。
 
@@ -1138,7 +1146,17 @@ class AgentTaskRunner(TaskRunner):
             sandbox=self._sandbox, browser=self._browser,
             search_engine=self._search_engine,
         )
-        lc_tools.extend(create_mcp_langchain_tools(self._mcp_tool))
+        # MCP: only bind always_bind + activated tools (progressive loading)
+        # Activations accumulate across steps within a message, reset per message
+        mcp_bind_names = self._get_always_bind_tool_names() | self._activated_mcp_tools
+        lc_tools.extend(create_mcp_langchain_tools(self._mcp_tool, tool_names=mcp_bind_names))
+        # MCP discovery tools (only when MCP is configured and has tools)
+        if self._mcp_tool.get_tools():
+            from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
+            lc_tools.extend(create_mcp_discovery_tools(
+                mcp_tool_ref=lambda: self._mcp_tool,
+                activated_tools_ref=lambda: self._activated_mcp_tools,
+            ))
         lc_tools.extend(create_a2a_langchain_tools(self._a2a_tool))
         lc_tools.extend(create_skill_langchain_tools(
             brainstorm_skill_tool=self._brainstorm_skill_tool,
@@ -1153,6 +1171,8 @@ class AgentTaskRunner(TaskRunner):
         from app.domain.services.tools.langchain_skill_tools import create_skill_guide_tool
         lc_tools.append(create_skill_guide_tool(
             skill_pool_ref=lambda: self._session_skill_pool,
+            file_listings_ref=lambda: self._skill_bundle_sync.get_file_listing_all(),
+            sandbox_skill_root=self._skill_bundle_sync.sandbox_skill_root,
         ))
 
         skill_tool_names = [t.name for t in dynamic_tools]
@@ -1694,9 +1714,17 @@ class AgentTaskRunner(TaskRunner):
             self._set_runtime_system_context(initial_skills)
             self._skill_bundle_sync.start_background_sync()
 
-            # 传递 skill pool getter 给 flow，用于 get_skill_guide 按需加载
+            # 传递 skill pool getter 和 file listings getter 给 flow，用于 get_skill_guide 按需加载
+            # 使用 hasattr duck-typing guard，兼容测试中的 mock flow
             if hasattr(self._flow, '_skill_pool_getter'):
                 self._flow._skill_pool_getter = lambda: self._session_skill_pool
+                self._flow._file_listings_getter = lambda: self._skill_bundle_sync.get_file_listing_all()
+                self._flow._sandbox_skill_root = self._skill_bundle_sync.sandbox_skill_root
+            # MCP progressive loading: pass discovery dependencies to flow
+            if hasattr(self._flow, '_mcp_tool_ref'):
+                self._flow._mcp_tool_ref = lambda: self._mcp_tool
+                self._flow._activated_mcp_tools_ref = lambda: self._activated_mcp_tools
+                self._flow._mcp_always_bind_names = self._get_always_bind_tool_names()
 
             # 3.循环读取任务中的输入消息队列
             while not await task.input_stream.is_empty():
@@ -1752,6 +1780,7 @@ class AgentTaskRunner(TaskRunner):
                 self._current_message_selected_skills = list(selected_skills)
                 self._step_skill_state = None
                 self._last_virtual_step_id = ""
+                self._activated_mcp_tools.clear()  # Reset MCP activation per message
                 await self._initialize_skill_tool_if_needed(selected_skills)
                 self._set_runtime_system_context(selected_skills, scores=self._current_embedding_scores)
 

@@ -121,8 +121,33 @@ def _extract_guide_body(skill: "Skill") -> str:
     return body or (skill.description or "").strip() or "No guide content available."
 
 
+def _build_resources_section(
+    skill: "Skill",
+    file_listings_ref: Callable[[], dict[str, list[str]]] | None,
+    sandbox_skill_root: str,
+) -> str:
+    """Build the Skill Resources section with sandbox path and file listing."""
+    if file_listings_ref is None:
+        return ""
+    listings = file_listings_ref()
+    files = listings.get(skill.id)
+    if not files:
+        return ""
+    sandbox_path = f"{sandbox_skill_root}/{skill.id}/"
+    file_list = ", ".join(f"`{f}`" for f in files)
+    return (
+        "---\n"
+        "## Skill Resources\n"
+        f"- **Sandbox path**: `{sandbox_path}`\n"
+        f"- **Files**: {file_list}\n\n"
+        "Use `file_read` to read any file, or `shell_execute` to run scripts."
+    )
+
+
 def create_skill_guide_tool(
     skill_pool_ref: Callable[[], list["Skill"]],
+    file_listings_ref: Callable[[], dict[str, list[str]]] | None = None,
+    sandbox_skill_root: str = "/home/ubuntu/workspace/.skills",
 ) -> StructuredTool:
     """Create a ``get_skill_guide`` tool for on-demand SKILL.md loading.
 
@@ -134,25 +159,31 @@ def create_skill_guide_tool(
     ----------
     skill_pool_ref :
         A callable that returns the current session skill pool.
-        Using a callable (rather than a direct list) ensures the tool
-        always reads the latest pool state.
+    file_listings_ref :
+        Optional callable returning {skill_id: [relative_paths]} for resource discovery.
+    sandbox_skill_root :
+        Base path for skill bundles in the sandbox.
     """
+
+    def _format_result(skill: "Skill", guide: str) -> str:
+        resources = _build_resources_section(skill, file_listings_ref, sandbox_skill_root)
+        base = f"# {skill.name}\n\n{guide}"
+        return f"{base}\n\n{resources}" if resources else base
 
     async def _get_skill_guide(skill_slug: str) -> str:
         pool = skill_pool_ref()
-        # Match by slug (primary) or name (fallback)
         slug_lower = skill_slug.strip().lower()
         for skill in pool:
             if (skill.slug or "").lower() == slug_lower:
                 guide = _extract_guide_body(skill)
                 logger.info("[SkillGuide] Loaded guide for '%s' (%d chars)", skill.slug, len(guide))
-                return f"# {skill.name}\n\n{guide}"
+                return _format_result(skill, guide)
         # Fallback: match by name
         for skill in pool:
             if (skill.name or "").lower() == slug_lower:
                 guide = _extract_guide_body(skill)
                 logger.info("[SkillGuide] Loaded guide for '%s' (by name, %d chars)", skill.name, len(guide))
-                return f"# {skill.name}\n\n{guide}"
+                return _format_result(skill, guide)
         available = [s.slug for s in pool if s.slug]
         available_str = ", ".join(available) if available else "(none)"
         return f"Skill '{skill_slug}' not found. Available skills: {available_str}"

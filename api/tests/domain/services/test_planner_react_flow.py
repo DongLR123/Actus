@@ -203,17 +203,20 @@ async def test_ensure_graphs_builds_tools_lazily(mock_llm, mock_uow):
     flow = _make_flow(mock_llm, mock_uow,
                       mcp_tool=mock_mcp, a2a_tool=mock_a2a)
 
+    # Configure always_bind so MCP tools are queried during _ensure_graphs
+    flow._mcp_always_bind_names = {"notion_search"}
+
     # Before _ensure_graphs: no graphs
     assert flow._graphs_built is False
     assert flow._react_graph is None
 
-    # Call _ensure_graphs: should pick up MCP tools
+    # Call _ensure_graphs: should pick up MCP tools (filtered by always_bind)
     await flow._ensure_graphs()
 
     assert flow._graphs_built is True
     assert flow._react_graph is not None
     assert flow._main_graph is not None
-    # Verify MCP tools were queried
+    # Verify MCP tools were queried (for always_bind filtering)
     mock_mcp.get_tools.assert_called()
 
 

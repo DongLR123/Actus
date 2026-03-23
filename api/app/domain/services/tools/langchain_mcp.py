@@ -122,8 +122,17 @@ def _make_mcp_coroutine(mcp_tool: MCPTool, tool_name: str):
     return _invoke
 
 
-def create_mcp_langchain_tools(mcp_tool: MCPTool) -> list[StructuredTool]:
-    """Convert MCPTool's registered tools into LangChain StructuredTool instances."""
+def create_mcp_langchain_tools(
+    mcp_tool: MCPTool,
+    tool_names: set[str] | None = None,
+) -> list[StructuredTool]:
+    """Convert MCPTool's registered tools into LangChain StructuredTool instances.
+
+    Parameters
+    ----------
+    tool_names : optional set of tool names to include.
+        None means all tools (backward compat); empty set means no tools.
+    """
     tools: list[StructuredTool] = []
 
     for schema in mcp_tool.get_tools():
@@ -133,6 +142,8 @@ def create_mcp_langchain_tools(mcp_tool: MCPTool) -> list[StructuredTool]:
         parameters = fn_def.get("parameters", {})
 
         if not name:
+            continue
+        if tool_names is not None and name not in tool_names:
             continue
 
         args_schema = _json_schema_to_pydantic(name, parameters)
