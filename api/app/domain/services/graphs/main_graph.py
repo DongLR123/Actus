@@ -16,11 +16,14 @@ import uuid
 from typing import Any, Callable, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.runnables import RunnableConfig
-from langgraph.graph import END, START, StateGraph
-from langgraph.types import RetryPolicy, interrupt
-
 from langchain_core.language_models import BaseChatModel
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command, RetryPolicy, interrupt
+
+from app.domain.models.app_config import AgentConfig
 
 from app.application.errors.exceptions import ServerRequestsError
 from app.domain.models.file import File
@@ -102,14 +105,13 @@ def _compact_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
 
 def build_main_graph(
     planner_llm: BaseChatModel,
-    react_graph: Any,  # compiled react_graph
+    react_graph: CompiledStateGraph,
     summary_llm: BaseChatModel,
     uow_factory: Callable[[], IUnitOfWork],
     session_id: str,
-    agent_config: Any = None,
-    prompts: Any = None,
-    checkpointer: Any = None,
-) -> Any:
+    agent_config: AgentConfig | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
+) -> CompiledStateGraph:
     """Build and compile the main orchestration graph.
 
     Parameters
@@ -197,7 +199,9 @@ def build_main_graph(
             "events": events,
         }
 
-    async def executor_node(state: MainGraphState, config: RunnableConfig) -> dict:
+    async def executor_node(
+        state: MainGraphState, config: RunnableConfig,
+    ) -> Command[Literal["updater_node", "summarizer_node", "interrupt_node"]]:
         """Execute current step via react_graph sub-graph.
 
         Streams react events to the event_queue in real-time so the frontend
@@ -216,11 +220,15 @@ def build_main_graph(
 
         step = state["current_step"]
         if not step:
-            return {
-                "flow_status": FlowStatus.SUMMARIZING.value,
-                "events": [],
-                "messages": state.get("messages", []),
-            }
+            logger.warning("executor_node: current_step is None, routing to summarizer")
+            return Command(
+                update={
+                    "flow_status": FlowStatus.SUMMARIZING.value,
+                    "events": [],
+                    "messages": state.get("messages", []),
+                },
+                goto="summarizer_node",
+            )
 
         # Phase 3: 获取当前 step 的编译后 react_graph（渐进式 Skill 加载）
         # 传递步骤描述，使 provider 能按步骤选择相关 Skill 工具
@@ -301,11 +309,9 @@ def build_main_graph(
                 language=language,
                 step=step.description,
             )
-            print(f"[DEBUG-IMG] executor_node: image_blocks={len(image_blocks)}, attachments={attachments}", flush=True)
+            logger.debug("[IMG] executor_node: image_blocks=%d, attachments=%s", len(image_blocks), attachments)
             prompt_content = build_multimodal_content(execution_text, image_blocks)
-            print(f"[DEBUG-IMG] executor_node: prompt_content type={type(prompt_content).__name__}, "
-                  f"is_list={isinstance(prompt_content, list)}, "
-                  f"len={len(prompt_content) if isinstance(prompt_content, list) else 'N/A'}", flush=True)
+            logger.debug("[IMG] executor_node: prompt_content type=%s, is_list=%s", type(prompt_content).__name__, isinstance(prompt_content, list))
             initial_messages = [
                 SystemMessage(content=system_content),
                 HumanMessage(content=prompt_content),
@@ -378,16 +384,19 @@ def build_main_graph(
         if should_interrupt:
             # 中断的步骤不标记为 COMPLETED，保留 RUNNING 状态
             await _emit(WaitEvent())
-            return {
-                "messages": final_messages,
-                "current_step": step,
-                "execution_summary": summary,
-                "should_interrupt": True,
-                "resume_value": None,
-                "flow_status": FlowStatus.EXECUTING.value,
-                "original_request": state.get("original_request", ""),
-                "events": [],  # WaitEvent 已通过 _emit 发送，避免重复
-            }
+            return Command(
+                update={
+                    "messages": final_messages,
+                    "current_step": step,
+                    "execution_summary": summary,
+                    "should_interrupt": True,
+                    "resume_value": None,
+                    "flow_status": FlowStatus.EXECUTING.value,
+                    "original_request": state.get("original_request", ""),
+                    "events": [],  # WaitEvent 已通过 _emit 发送，避免重复
+                },
+                goto="interrupt_node",
+            )
 
         # 通过 model_copy 创建新对象避免直接变异 state 对象
         # （LangGraph 要求节点返回 partial update dict，不可直接修改 state）
@@ -398,16 +407,21 @@ def build_main_graph(
         })
         await _emit(StepEvent(step=step, status=StepEventStatus.COMPLETED))
 
-        return {
-            "messages": final_messages,
-            "current_step": step,
-            "execution_summary": summary,
-            "resume_value": None,
-            "flow_status": FlowStatus.UPDATING.value,
-            "events": [],  # already emitted via queue
-        }
+        return Command(
+            update={
+                "messages": final_messages,
+                "current_step": step,
+                "execution_summary": summary,
+                "resume_value": None,
+                "flow_status": FlowStatus.UPDATING.value,
+                "events": [],  # already emitted via queue
+            },
+            goto="updater_node",
+        )
 
-    async def updater_node(state: MainGraphState, config: RunnableConfig) -> dict:
+    async def updater_node(
+        state: MainGraphState, config: RunnableConfig,
+    ) -> Command[Literal["executor_node", "summarizer_node"]]:
         """Update the plan after step execution — mark step done, call planner
         to update remaining steps with execution context, then get next step.
 
@@ -423,7 +437,10 @@ def build_main_graph(
 
         plan = state["plan"]
         if not plan:
-            return {"flow_status": FlowStatus.SUMMARIZING.value, "events": []}
+            return Command(
+                update={"flow_status": FlowStatus.SUMMARIZING.value, "events": []},
+                goto="summarizer_node",
+            )
 
         # 1. Sync completed step back into plan.steps
         completed_step = state.get("current_step")
@@ -512,21 +529,27 @@ def build_main_graph(
                     logger.warning("Step-level skill refresh 失败: %s", exc)
 
         if not next_step:
-            return {
+            return Command(
+                update={
+                    "plan": plan,
+                    "current_step": None,
+                    "flow_status": FlowStatus.SUMMARIZING.value,
+                    "skill_context": new_skill_context,
+                    "events": events,
+                },
+                goto="summarizer_node",
+            )
+
+        return Command(
+            update={
                 "plan": plan,
-                "current_step": None,
-                "flow_status": FlowStatus.SUMMARIZING.value,
+                "current_step": next_step,
+                "flow_status": FlowStatus.EXECUTING.value,
                 "skill_context": new_skill_context,
                 "events": events,
-            }
-
-        return {
-            "plan": plan,
-            "current_step": next_step,
-            "flow_status": FlowStatus.EXECUTING.value,
-            "skill_context": new_skill_context,
-            "events": events,
-        }
+            },
+            goto="executor_node",
+        )
 
     async def summarizer_node(state: MainGraphState, config: RunnableConfig) -> dict:
         """Generate final summary with streaming and emit completion events.
@@ -666,26 +689,6 @@ def build_main_graph(
             return "updater_node"
         return "summarizer_node"
 
-    def route_after_executor(state: MainGraphState) -> str:
-        """Route after step execution."""
-        if state.get("should_interrupt"):
-            return "interrupt_node"
-        status = state.get("flow_status", "")
-        if status == FlowStatus.UPDATING.value:
-            return "updater_node"
-        if status == FlowStatus.SUMMARIZING.value:
-            return "summarizer_node"
-        return END
-
-    def route_after_updater(state: MainGraphState) -> str:
-        """Route after plan update."""
-        status = state.get("flow_status", "")
-        if status == FlowStatus.EXECUTING.value:
-            return "executor_node"
-        if status == FlowStatus.SUMMARIZING.value:
-            return "summarizer_node"
-        return END
-
     # ---- Build Graph --------------------------------------------------- #
 
     g: StateGraph = StateGraph(MainGraphState)
@@ -706,9 +709,9 @@ def build_main_graph(
 
     g.add_conditional_edges(START, route_entry)
     g.add_edge("planner_node", "executor_node")
-    g.add_conditional_edges("executor_node", route_after_executor)
+    # executor_node and updater_node use Command(goto=...) for routing —
+    # no conditional edges needed. Command handles all outgoing transitions.
     g.add_edge("interrupt_node", "executor_node")
-    g.add_conditional_edges("updater_node", route_after_updater)
     g.add_edge("summarizer_node", END)
 
     return g.compile(checkpointer=checkpointer)

@@ -172,18 +172,25 @@ class PlannerReActFlow(BaseFlow):
             sandbox=self._sandbox, browser=self._browser,
             search_engine=self._search_engine,
         )
-        # MCP: only bind always_bind tools (progressive loading)
-        if self._mcp_always_bind_names:
-            lc_tools.extend(create_mcp_langchain_tools(
-                self._mcp_tool, tool_names=self._mcp_always_bind_names,
-            ))
-        # MCP discovery tools (only when MCP refs are fully wired by AgentTaskRunner)
-        if self._mcp_tool_ref is not None and self._activated_mcp_tools_ref is not None:
-            from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
-            lc_tools.extend(create_mcp_discovery_tools(
-                mcp_tool_ref=self._mcp_tool_ref,
-                activated_tools_ref=self._activated_mcp_tools_ref,
-            ))
+        # MCP: progressive loading with auto-bind threshold
+        MCP_AUTO_BIND_THRESHOLD = 15
+        all_mcp_tools = self._mcp_tool.get_tools() if self._mcp_tool else []
+        if len(all_mcp_tools) <= MCP_AUTO_BIND_THRESHOLD:
+            # Small tool set: bind all directly, no discovery needed
+            lc_tools.extend(create_mcp_langchain_tools(self._mcp_tool, tool_names=None))
+        else:
+            # Large tool set: only bind always_bind tools
+            if self._mcp_always_bind_names:
+                lc_tools.extend(create_mcp_langchain_tools(
+                    self._mcp_tool, tool_names=self._mcp_always_bind_names,
+                ))
+            # Discovery tools only needed for large tool sets
+            if self._mcp_tool_ref is not None and self._activated_mcp_tools_ref is not None:
+                from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
+                lc_tools.extend(create_mcp_discovery_tools(
+                    mcp_tool_ref=self._mcp_tool_ref,
+                    activated_tools_ref=self._activated_mcp_tools_ref,
+                ))
         lc_tools.extend(create_a2a_langchain_tools(self._a2a_tool))
         lc_tools.extend(create_skill_langchain_tools(
             brainstorm_skill_tool=self._brainstorm_skill_tool,
@@ -356,11 +363,24 @@ class PlannerReActFlow(BaseFlow):
                 brainstorm_tool=self._brainstorm_skill_tool,
                 create_skill_tool=self._create_skill_tool,
             )
-            new_state, events = await graph.run(
-                state=graph_state,
-                action=action,
-                original_request=graph_state.original_request,
-            )
+            try:
+                new_state, events = await graph.run(
+                    state=graph_state,
+                    action=action,
+                    original_request=graph_state.original_request,
+                )
+            except Exception as exc:
+                # graph.run() 抛出未捕获异常时，保留原始 graph_state 不清除，
+                # 确保下次重试时仍能恢复 blueprint/original_request
+                logger.error(
+                    "Skill 子图执行异常（原始状态已保留，可重试）: %s", exc,
+                    exc_info=True,
+                )
+                yield MessageEvent(
+                    role="assistant",
+                    message="Skill 创建遇到错误，请重试或取消。",
+                )
+                return
             # 关键：先持久化状态，再 yield 事件。
             ok = await self._persist_skill_graph_state(new_state)
             if not ok:
@@ -412,11 +432,19 @@ class PlannerReActFlow(BaseFlow):
             brainstorm_tool=self._brainstorm_skill_tool,
             create_skill_tool=self._create_skill_tool,
         )
-        new_state, events = await graph.run(
-            state=None,
-            action=None,
-            original_request=message.message,
-        )
+        try:
+            new_state, events = await graph.run(
+                state=None,
+                action=None,
+                original_request=message.message,
+            )
+        except Exception as exc:
+            logger.error("Skill 初始子图执行异常: %s", exc, exc_info=True)
+            yield MessageEvent(
+                role="assistant",
+                message="Skill 蓝图生成失败，请重新发起创建请求。",
+            )
+            return
         # 关键：先持久化状态，再 yield 事件。
         # 如果持久化失败，不展示蓝图（避免用户确认后找不到状态）。
         ok = await self._persist_skill_graph_state(new_state)
@@ -445,7 +473,7 @@ class PlannerReActFlow(BaseFlow):
 
         attachments = getattr(message, "attachments", [])
         image_blocks = getattr(message, "image_content_blocks", [])
-        print(f"[DEBUG-IMG] _run_planner_for_detection: image_blocks={len(image_blocks)}, attachments={attachments}", flush=True)
+        logger.debug("[IMG] _run_planner_for_detection: image_blocks=%d, attachments=%s", len(image_blocks), attachments)
         prompt = CREATE_PLAN_PROMPT.format(
             message=message.message,
             attachments=format_attachments_text(attachments, has_image_blocks=bool(image_blocks)),

@@ -1014,8 +1014,8 @@ class AgentTaskRunner(TaskRunner):
                 + ", ".join(creator_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
             )
 
-        # MCP 工具（渐进加载模式）
-        always_bind_names = list(self._get_always_bind_tool_names())
+        # MCP 工具
+        MCP_AUTO_BIND_THRESHOLD = 15
         mcp_all_names: list[str] = []
         try:
             for schema in self._mcp_tool.get_tools():
@@ -1025,19 +1025,28 @@ class AgentTaskRunner(TaskRunner):
                     mcp_all_names.append(name)
         except Exception:
             pass
-        mcp_discovery_names = [n for n in mcp_all_names if n not in set(always_bind_names)]
-        if always_bind_names or mcp_discovery_names:
-            lines.append("- mcp discovery: list_mcp_tools, get_mcp_tool")
-        if always_bind_names:
-            lines.append(
-                "- mcp always-bind: "
-                + ", ".join(always_bind_names[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
-            )
-        if mcp_discovery_names:
-            lines.append(
-                "- mcp available (use get_mcp_tool to activate): "
-                + ", ".join(mcp_discovery_names[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
-            )
+        if mcp_all_names:
+            if len(mcp_all_names) <= MCP_AUTO_BIND_THRESHOLD:
+                # Small set: all tools directly bound
+                lines.append(
+                    "- mcp tools: "
+                    + ", ".join(mcp_all_names[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
+                )
+            else:
+                # Large set: discovery mode
+                always_bind_names = list(self._get_always_bind_tool_names())
+                mcp_discovery_names = [n for n in mcp_all_names if n not in set(always_bind_names)]
+                lines.append("- mcp discovery: list_mcp_tools, get_mcp_tool")
+                if always_bind_names:
+                    lines.append(
+                        "- mcp always-bind: "
+                        + ", ".join(always_bind_names[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
+                    )
+                if mcp_discovery_names:
+                    lines.append(
+                        "- mcp available (use get_mcp_tool to activate): "
+                        + ", ".join(mcp_discovery_names[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
+                    )
 
         # A2A 工具（仅在 manager 存在时才有 LangChain 工具绑定到 LLM）
         a2a_tools: list[str] = []
@@ -1146,12 +1155,19 @@ class AgentTaskRunner(TaskRunner):
             sandbox=self._sandbox, browser=self._browser,
             search_engine=self._search_engine,
         )
-        # MCP: only bind always_bind + activated tools (progressive loading)
-        # Activations accumulate across steps within a message, reset per message
-        mcp_bind_names = self._get_always_bind_tool_names() | self._activated_mcp_tools
-        lc_tools.extend(create_mcp_langchain_tools(self._mcp_tool, tool_names=mcp_bind_names))
-        # MCP discovery tools (only when MCP is configured and has tools)
-        if self._mcp_tool.get_tools():
+        # MCP: progressive loading with auto-bind threshold
+        # When total MCP tools ≤ threshold, bind all directly (skip discovery overhead)
+        # When > threshold, only bind always_bind + activated tools
+        MCP_AUTO_BIND_THRESHOLD = 15
+        all_mcp_tools = self._mcp_tool.get_tools()
+        if len(all_mcp_tools) <= MCP_AUTO_BIND_THRESHOLD:
+            # Small tool set: bind all directly, no discovery needed
+            lc_tools.extend(create_mcp_langchain_tools(self._mcp_tool, tool_names=None))
+        else:
+            # Large tool set: progressive loading
+            mcp_bind_names = self._get_always_bind_tool_names() | self._activated_mcp_tools
+            lc_tools.extend(create_mcp_langchain_tools(self._mcp_tool, tool_names=mcp_bind_names))
+            # Discovery tools only needed for large tool sets
             from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
             lc_tools.extend(create_mcp_discovery_tools(
                 mcp_tool_ref=lambda: self._mcp_tool,

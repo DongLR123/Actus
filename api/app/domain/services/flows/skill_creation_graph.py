@@ -348,7 +348,22 @@ class SkillCreationGraph:
         elif blueprint_json:
             kwargs["blueprint_json"] = blueprint_json
 
-        result: ToolResult = await self._create_skill_tool.generate_skill(**kwargs)
+        try:
+            result: ToolResult = await self._create_skill_tool.generate_skill(**kwargs)
+        except Exception as exc:
+            # 捕获未处理异常（ConnectionError、Timeout 等），确保状态不丢失
+            logger.error("generate_node: generate_skill 抛出异常: %s", exc, exc_info=True)
+            return {
+                "status": "error",
+                "last_error": f"[generating] 生成失败: {type(exc).__name__}",
+                "pending_action": "generate",
+                "events": [
+                    MessageEvent(
+                        role="assistant",
+                        message="Skill 生成失败，可选择重试、修改蓝图或取消。",
+                    ),
+                ],
+            }
 
         if result.success:
             data = result.data or {}

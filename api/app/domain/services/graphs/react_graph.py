@@ -13,12 +13,16 @@ import json
 import logging
 from typing import Any
 
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import RetryPolicy
 
 from app.application.errors.exceptions import ServerRequestsError
+from app.domain.models.app_config import AgentConfig
 from app.domain.models.event import (
     MessageEvent,
     ToolEvent,
@@ -60,17 +64,21 @@ def _classify_tool_name(tool_name: str) -> str:
     return tool_name
 
 
-def build_react_graph(llm: Any, tools: list, agent_config: Any = None) -> Any:
+def build_react_graph(
+    llm: BaseChatModel,
+    tools: list[BaseTool],
+    agent_config: AgentConfig | None = None,
+) -> CompiledStateGraph:
     """Build and compile the inner ReAct loop graph.
 
     Parameters
     ----------
-    llm : LangChain BaseChatModel (or LLMAdapter) — must support bind_tools.
+    llm : LangChain BaseChatModel — must support bind_tools.
     tools : List of LangChain tools.
     agent_config : Optional AgentConfig for iteration limits etc.
     """
     # Build tool lookup
-    tool_map: dict[str, Any] = {t.name: t for t in tools}
+    tool_map: dict[str, BaseTool] = {t.name: t for t in tools}
 
     # Bind tools to LLM
     llm_with_tools = llm.bind_tools(tools) if tools else llm
