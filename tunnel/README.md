@@ -37,8 +37,10 @@ TUNNEL_SSH_KEY_PATH=./tunnel/id_rsa
 
 ### 5. Start
 
+`tunnel` 服务默认是可选的，只有显式启用 profile 才会启动。
+
 ```bash
-docker compose up -d tunnel
+docker compose --profile tunnel up -d tunnel
 ```
 
 ### 6. Verify

@@ -151,12 +151,14 @@ services:
   tunnel:
     image: alpine:3.20
     restart: unless-stopped
+    profiles:
+      - tunnel
     depends_on:
       api:
         condition: service_healthy
     environment:
       TZ: ${TZ:-Asia/Shanghai}
-      TUNNEL_REMOTE_HOST: ${TUNNEL_REMOTE_HOST:?TUNNEL_REMOTE_HOST is required - cloud server IP}
+      TUNNEL_REMOTE_HOST: ${TUNNEL_REMOTE_HOST:-}
       TUNNEL_REMOTE_PORT: ${TUNNEL_REMOTE_PORT:-18082}
       TUNNEL_SSH_USER: ${TUNNEL_SSH_USER:-root}
       TUNNEL_SSH_PORT: ${TUNNEL_SSH_PORT:-22}
