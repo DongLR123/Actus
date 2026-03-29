@@ -610,8 +610,8 @@ def build_main_graph(
                 if full_text:
                     try:
                         parsed = SummarizerOutput.model_validate_json(full_text)
-                        if parsed.message:
-                            summary_text = parsed.message
+                        if parsed.text:
+                            summary_text = parsed.text
                         summary_attachments = [
                             a for a in parsed.attachments
                             if isinstance(a, str) and a.strip()

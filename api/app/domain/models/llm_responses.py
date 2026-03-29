@@ -30,10 +30,19 @@ class PlanUpdateResponse(BaseModel):
 
 
 class SummarizerOutput(BaseModel):
-    """summarizer_node 的 LLM 返回（用户最终交付：message + attachments）。"""
+    """summarizer_node 的 LLM 返回（用户最终交付：message + attachments）。
+
+    Some LLMs return ``result`` instead of ``message``; we accept both.
+    """
     model_config = ConfigDict(extra="ignore")
     message: str = ""
+    result: str = ""
     attachments: list[str] = []
+
+    @property
+    def text(self) -> str:
+        """Return whichever of message/result was populated."""
+        return self.message or self.result
 
 
 class ConversationSummaryResponse(BaseModel):

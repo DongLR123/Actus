@@ -365,7 +365,8 @@ function renderEventItem(
     }
 
     // 提取嵌入的结构化 JSON 结果（如 skill/a2a 工具返回的 {"success","result","attachments"}）
-    const extracted = isPartial ? null : extractEmbeddedJsonResult(message);
+    // 对 partial 消息也尝试提取——不完整的 JSON 会安全地回退为原文
+    const extracted = extractEmbeddedJsonResult(message);
     const displayMessage = extracted ? extracted.text : message;
     const embeddedAttachments = extracted?.embeddedAttachments || [];
 
@@ -380,7 +381,7 @@ function renderEventItem(
         </div>
         <div className="rounded-2xl border border-border bg-card px-4 py-3 text-sm text-foreground/85 shadow-[var(--shadow-subtle)]">
           {isPartial ? (
-            <p className="whitespace-pre-wrap leading-7">{stripXmlTags(message) || "（空消息）"}</p>
+            <p className="whitespace-pre-wrap leading-7">{stripXmlTags(displayMessage) || "（空消息）"}</p>
           ) : (
             <MarkdownRenderer content={displayMessage || "（空消息）"} />
           )}
