@@ -65,6 +65,8 @@ class ActusResponsesModel(BaseChatModel):
 
     # Tools bound via bind_tools() -- None means no tools bound
     _bound_tools: Optional[list] = None
+    # tool_choice bound via bind_tools() — critical for with_structured_output
+    _bound_tool_choice: Optional[Any] = None
 
     # ---- Properties ------------------------------------------------------ #
 
@@ -285,6 +287,8 @@ class ActusResponsesModel(BaseChatModel):
         - type="function_call": tool call
         """
         dumped = response.model_dump() if hasattr(response, "model_dump") else response
+        if not isinstance(dumped, dict):
+            dumped = {"output": []}
         output_items = dumped.get("output", [])
 
         content_text = ""
@@ -395,8 +399,8 @@ class ActusResponsesModel(BaseChatModel):
         else:
             logger.info("调用Responses API未携带工具: %s", self.model_name)
 
-        # tool_choice from kwargs
-        tool_choice = kwargs.get("tool_choice")
+        # tool_choice: per-call kwarg > bound value from bind_tools
+        tool_choice = kwargs.get("tool_choice") or self._bound_tool_choice
         if tool_choice is not None:
             params["tool_choice"] = tool_choice
 
@@ -404,6 +408,17 @@ class ActusResponsesModel(BaseChatModel):
                      self.model_name, len(all_tools))
 
         response = await client.responses.create(**params)
+
+        # Validate response — proxies may return strings, ints, or other
+        # non-object types instead of a proper Responses API object.
+        if not hasattr(response, "model_dump") and not isinstance(response, dict):
+            from app.application.errors.exceptions import ServerRequestsError
+
+            raw = str(response)[:200]
+            raise ServerRequestsError(
+                f"LLM ({self.model_name}) returned unexpected response "
+                f"(type={type(response).__name__}): {raw}"
+            )
 
         # Normalize Responses API output to Chat Completions-compatible dict
         normalized = self._normalize_response(response)
@@ -474,4 +489,7 @@ class ActusResponsesModel(BaseChatModel):
             max_tokens=self.max_tokens,
         )
         new_model._bound_tools = responses_format
+        # Preserve tool_choice from kwargs (critical for with_structured_output)
+        if "tool_choice" in kwargs:
+            new_model._bound_tool_choice = kwargs["tool_choice"]
         return new_model

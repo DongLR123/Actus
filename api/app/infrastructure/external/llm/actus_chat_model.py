@@ -63,6 +63,8 @@ class ActusChatModel(BaseChatModel):
     _bound_tools: Optional[list[dict[str, Any]]] = None
     # Cached tool names from _bound_tools (computed once in bind_tools)
     _bound_tool_names: frozenset[str] = frozenset()
+    # tool_choice bound via bind_tools() — critical for with_structured_output
+    _bound_tool_choice: Optional[Any] = None
 
     # ---- Properties ------------------------------------------------------ #
 
@@ -143,14 +145,25 @@ class ActusChatModel(BaseChatModel):
             # Handle both object and dict formats
             if hasattr(tc, "function"):
                 fn = tc.function
-                fn_name = fn.name if hasattr(fn, "name") else fn.get("name", "")
-                fn_args = fn.arguments if hasattr(fn, "arguments") else fn.get("arguments", "{}")
+                # Guard: some providers return function as a string
+                if isinstance(fn, str):
+                    fn_name = fn
+                    fn_args = "{}"
+                else:
+                    fn_name = fn.name if hasattr(fn, "name") else fn.get("name", "")
+                    fn_args = fn.arguments if hasattr(fn, "arguments") else fn.get("arguments", "{}")
                 tc_id = tc.id if hasattr(tc, "id") else tc.get("id", "")
-            else:
+            elif isinstance(tc, dict):
                 fn = tc.get("function", {})
-                fn_name = fn.get("name", "")
-                fn_args = fn.get("arguments", "{}")
+                if isinstance(fn, str):
+                    fn_name = fn
+                    fn_args = "{}"
+                else:
+                    fn_name = fn.get("name", "")
+                    fn_args = fn.get("arguments", "{}")
                 tc_id = tc.get("id", "")
+            else:
+                continue
 
             # Deserialize JSON arguments
             if isinstance(fn_args, str):
@@ -408,8 +421,8 @@ class ActusChatModel(BaseChatModel):
         if all_tools:
             params["tools"] = all_tools
 
-        # tool_choice from kwargs
-        tool_choice = kwargs.get("tool_choice")
+        # tool_choice: per-call kwarg > bound value from bind_tools
+        tool_choice = kwargs.get("tool_choice") or self._bound_tool_choice
         if tool_choice is not None:
             params["tool_choice"] = tool_choice
 
@@ -428,11 +441,23 @@ class ActusChatModel(BaseChatModel):
             if m.get("role") == "user" and isinstance(m.get("content"), list)
         )
         logger.info(
-            "ActusChatModel._agenerate: model=%s, tools=%d, multimodal_messages=%d",
-            self.model_name, len(all_tools), multimodal_count,
+            "ActusChatModel._agenerate: model=%s, tools=%d, tool_choice=%s, multimodal_messages=%d",
+            self.model_name, len(all_tools), tool_choice, multimodal_count,
         )
 
         response = await client.chat.completions.create(**params)
+
+        # Validate response — some OpenAI-compatible proxies may return raw
+        # strings (e.g. error text with 200 status).  Raise ServerRequestsError
+        # so LangGraph's RetryPolicy can retry the call automatically.
+        if not hasattr(response, "choices") or not response.choices:
+            from app.application.errors.exceptions import ServerRequestsError
+
+            raw = str(response)[:200]
+            raise ServerRequestsError(
+                f"LLM ({self.model_name}) returned unexpected response "
+                f"(type={type(response).__name__}): {raw}"
+            )
 
         # Extract message from response
         choice = response.choices[0]
@@ -477,7 +502,8 @@ class ActusChatModel(BaseChatModel):
         if all_tools:
             params["tools"] = all_tools
 
-        tool_choice = kwargs.get("tool_choice")
+        # tool_choice: per-call kwarg > bound value from bind_tools
+        tool_choice = kwargs.get("tool_choice") or self._bound_tool_choice
         if tool_choice is not None:
             params["tool_choice"] = tool_choice
 
@@ -506,7 +532,8 @@ class ActusChatModel(BaseChatModel):
             stream = await response
 
         async for chunk in stream:
-            if not chunk.choices:
+            # Guard against proxies yielding raw strings or malformed chunks
+            if not hasattr(chunk, "choices") or not chunk.choices:
                 continue
 
             delta = chunk.choices[0].delta
@@ -563,4 +590,7 @@ class ActusChatModel(BaseChatModel):
             for t in converted
             if t.get("function", {}).get("name")
         )
+        # Preserve tool_choice from kwargs (critical for with_structured_output)
+        if "tool_choice" in kwargs:
+            new_model._bound_tool_choice = kwargs["tool_choice"]
         return new_model

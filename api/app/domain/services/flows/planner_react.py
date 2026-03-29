@@ -25,7 +25,7 @@ from app.domain.models.event import (
     TitleEvent,
     WaitEvent,
 )
-from app.domain.models.llm_responses import ConversationSummaryResponse, PlanResponse
+from app.domain.models.llm_responses import ConversationSummaryResponse, PlanResponse, StepDef
 from app.domain.models.memory import Memory
 from app.domain.models.message import Message
 from app.domain.models.plan import ExecutionStatus, Plan, Step
@@ -531,14 +531,18 @@ class PlannerReActFlow(BaseFlow):
             HumanMessage(content=prompt_content),
         ]
         structured = self._llm.with_structured_output(PlanResponse)
-        parsed: PlanResponse | None = await structured.ainvoke(messages)
+        try:
+            parsed: PlanResponse | None = await structured.ainvoke(messages)
+        except Exception:
+            logger.warning("Planner structured output failed in detection, using fallback plan")
+            parsed = None
 
         if parsed is None:
             parsed = PlanResponse(
                 title="Task",
                 goal=message.message,
                 language=getattr(message, "language", "zh"),
-                steps=[],
+                steps=[StepDef(description=message.message)],
                 message="好的，我来帮你处理。",
             )
 

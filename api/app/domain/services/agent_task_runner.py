@@ -930,24 +930,31 @@ class AgentTaskRunner(TaskRunner):
 
         return "\n\n".join(sections)
 
+    def _get_native_tool_names_by_category(self) -> dict[str, list[str]]:
+        """从 create_native_tools 动态派生原生工具名，确保摘要与实际绑定一致。"""
+        if hasattr(self, "_cached_native_tool_names"):
+            return self._cached_native_tool_names
+        from app.domain.services.tools.langchain_tools import create_native_tools
+
+        tools = create_native_tools(
+            sandbox=self._sandbox,
+            browser=self._browser,
+            search_engine=self._search_engine,
+        )
+        groups: dict[str, list[str]] = {}
+        for tool in tools:
+            prefix = tool.name.split("_")[0]
+            groups.setdefault(prefix, []).append(tool.name)
+        self._cached_native_tool_names = groups
+        return groups
+
     def _build_available_tool_summary(self) -> str:
         """构建可用工具摘要，减少模型对工具可用性的错觉。"""
         budget_tokens = self._skill_selection_policy.available_tool_summary_token_budget
         char_budget = max(400, budget_tokens * 4)
 
-        shell_tools = [
-            "shell_exec",
-            "shell_write_to_process",
-            "shell_kill_process",
-            "shell_list_processes",
-        ]
-        browser_tools = [
-            "browser_navigate",
-            "browser_click",
-            "browser_input",
-            "browser_snapshot",
-        ]
-        message_tools = ["message_notify_user", "message_ask_user"]
+        # 从实际工具注册表动态获取，防止硬编码名称与实际绑定漂移
+        native_groups = self._get_native_tool_names_by_category()
 
         skill_tools: list[str] = []
         try:
@@ -993,12 +1000,13 @@ class AgentTaskRunner(TaskRunner):
             except Exception as exc:
                 logger.debug("读取Brainstorm工具摘要失败，降级为空: %s", exc)
 
-        lines = [
-            "## Available Tool Summary",
-            f"- shell: {', '.join(shell_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])}",
-            f"- browser: {', '.join(browser_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])}",
-            f"- message: {', '.join(message_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])}",
-        ]
+        lines = ["## Available Tool Summary"]
+        # 按固定顺序输出原生工具分组，名称从实际注册表派生
+        # native tools 数量固定且总量小（~531 chars），不截断，保证与实际绑定完全一致
+        for category in ("shell", "file", "browser", "message", "search"):
+            names = native_groups.get(category, [])
+            if names:
+                lines.append(f"- {category}: {', '.join(names)}")
         if skill_tools:
             lines.append(
                 "- active skill tools: "
@@ -1020,7 +1028,11 @@ class AgentTaskRunner(TaskRunner):
         mcp_all_names: list[str] = []
         try:
             for schema in self._mcp_tool.get_tools():
-                fn = schema.get("function", {})
+                if not isinstance(schema, dict):
+                    continue
+                fn = schema.get("function")
+                if not isinstance(fn, dict):
+                    continue
                 name = fn.get("name", "")
                 if name:
                     mcp_all_names.append(name)
