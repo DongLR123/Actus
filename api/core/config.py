@@ -77,6 +77,11 @@ class Settings(BaseSettings):
     # Skill 创建子图灰度配置
     skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶
 
+    # Checkpointer 连接池配置
+    checkpointer_pool_min_size: int = 2
+    checkpointer_pool_max_size: int = 10
+    checkpointer_pool_timeout: float = 30.0
+
     # JWT 配置
     jwt_secret_key: str = "change-me-in-env"
     jwt_algorithm: str = "HS256"

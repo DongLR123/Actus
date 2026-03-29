@@ -90,6 +90,9 @@ class _DummyFlow:
         if False:
             yield message
 
+    async def close(self) -> None:
+        pass
+
 
 class _CapturingFlow:
     def __init__(self, **kwargs) -> None:
@@ -102,6 +105,9 @@ class _CapturingFlow:
     async def invoke(self, message):
         if False:
             yield message
+
+    async def close(self) -> None:
+        pass
 
 
 class _ControlRequestedFlow:
@@ -119,6 +125,9 @@ class _ControlRequestedFlow:
             source=ControlSource.AGENT,
         )
 
+    async def close(self) -> None:
+        pass
+
 
 class _WaitFlow:
     def __init__(self, **kwargs) -> None:
@@ -130,6 +139,9 @@ class _WaitFlow:
 
     async def invoke(self, message):
         yield WaitEvent()
+
+    async def close(self) -> None:
+        pass
 
 
 class _UnknownBurstFlow:
@@ -159,6 +171,9 @@ class _UnknownBurstFlow:
         yield StepEvent(step=step, status=StepEventStatus.COMPLETED)
         yield MessageEvent(role="assistant", message="done")
 
+    async def close(self) -> None:
+        pass
+
 
 class _ToolOnlyFlow:
     def __init__(self, **kwargs) -> None:
@@ -178,6 +193,9 @@ class _ToolOnlyFlow:
             status=ToolEventStatus.CALLED,
         )
         yield MessageEvent(role="assistant", message="ok")
+
+    async def close(self) -> None:
+        pass
 
 
 class _EmptyInputStream:

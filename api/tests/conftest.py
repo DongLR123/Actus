@@ -5,6 +5,12 @@ from app.main import app
 from fastapi.testclient import TestClient
 
 
+@pytest.fixture
+def anyio_backend():
+    """Pin anyio tests to asyncio only (trio is not installed)."""
+    return "asyncio"
+
+
 @pytest.fixture(scope="session")
 def client() -> Generator[TestClient, None, None]:
     """

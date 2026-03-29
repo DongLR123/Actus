@@ -41,7 +41,8 @@ from app.infrastructure.storage.redis import RedisClient, get_redis
 
 # from app.interfaces.repository_dependencies import get_db_session_repository
 from core.config import get_settings
-from fastapi import Depends
+from fastapi import Depends, Request
+from psycopg_pool import AsyncConnectionPool
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # from functools import lru_cache
@@ -167,10 +168,16 @@ def get_skill_creator_service() -> SkillCreatorService:
     )
 
 
+def get_checkpointer_pool(request: Request) -> AsyncConnectionPool:
+    """Extract the checkpointer connection pool from app state."""
+    return request.app.state.checkpointer_pool.pool
+
+
 # @lru_cache()
 def get_agent_service(
     minio_store: MinioStore = Depends(get_minio),
     redis_client: RedisClient = Depends(get_redis),
+    checkpointer_pool: AsyncConnectionPool = Depends(get_checkpointer_pool),
 ) -> AgentService:
     # 1.获取应用配置信息(读取配置需要实时获取,所以不配置缓存)
     app_config = _load_app_config()
@@ -212,6 +219,7 @@ def get_agent_service(
         redis_client=redis_client,
         skill_creator_service=skill_creator_service,
         summary_llm=summary_llm,
+        checkpointer_pool=checkpointer_pool,
         # file_repository=file_repository,
     )
 

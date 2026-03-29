@@ -178,6 +178,7 @@ class AgentTaskRunner(TaskRunner):
         skill_risk_policy: SkillRiskPolicy | None = None,  # skill风险策略
         overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
         summary_llm: BaseChatModel | None = None,  # 摘要生成模型
+        checkpointer_pool: object | None = None,  # checkpointer 连接池
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         self._agent_config = agent_config
@@ -283,7 +284,7 @@ class AgentTaskRunner(TaskRunner):
             summary_llm=summary_llm,
             user_id=self._user_id or "",
             skill_graph_canary_percent=settings.skill_graph_canary_percent,
-            db_url=settings.sqlalchemy_database_url,
+            checkpointer_pool=checkpointer_pool,
         )
 
     async def _put_and_add_event(
@@ -1915,15 +1916,28 @@ class AgentTaskRunner(TaskRunner):
             await self._cleanup_tools()
 
     async def destroy(self) -> None:
-        """销毁任务运行器并释放资源"""
-        # 1.清除沙箱
-        logger.info(f"开始清除销毁AgentTaskRunner资源")
-        if self._sandbox:
-            logger.info("销毁AgentTaskRunner中的沙箱环境")
-            await self._sandbox.destroy()
+        """销毁任务运行器并释放资源（best-effort：每步独立 try/except，确保后续清理不被跳过）"""
+        logger.info("开始清除销毁AgentTaskRunner资源")
+        try:
+            # 1.清除沙箱
+            if self._sandbox:
+                logger.info("销毁AgentTaskRunner中的沙箱环境")
+                await self._sandbox.destroy()
+        except Exception as exc:
+            logger.warning("sandbox.destroy() 失败（继续清理）: %s", exc)
 
-        # 2.清除mcp和a2a工具（幂等操作，如果invoke()中已清理则不会重复执行）
-        await self._cleanup_tools()
+        try:
+            # 2.清除mcp和a2a工具（幂等操作，如果invoke()中已清理则不会重复执行）
+            await self._cleanup_tools()
+        except Exception as exc:
+            logger.warning("_cleanup_tools() 失败（继续清理）: %s", exc)
+
+        try:
+            # 3.清理 checkpointer 引用
+            if hasattr(self._flow, "close"):
+                await self._flow.close()
+        except Exception as exc:
+            logger.warning("flow.close() 失败: %s", exc)
 
     async def on_done(self, task: Task) -> None:
         """任务结束时执行的回调函数"""

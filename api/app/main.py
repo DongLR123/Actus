@@ -96,12 +96,25 @@ async def lifespan(app: FastAPI):
     await minio_client.init()
     logger.info("MinIO 客户端初始化完成")
 
+    # 5. 初始化 Checkpointer 连接池（在 try 内，确保失败时已初始化的基础设施能被清理）
+    checkpointer_pool = None
     try:
-        # 3.lifespan分界点
+        logger.info("开始初始化 Checkpointer 连接池")
+        from app.infrastructure.checkpointer_pool import CheckpointerPool
+        checkpointer_pool = CheckpointerPool(
+            db_url=settings.sqlalchemy_database_url,
+            min_size=settings.checkpointer_pool_min_size,
+            max_size=settings.checkpointer_pool_max_size,
+            timeout=settings.checkpointer_pool_timeout,
+        )
+        await checkpointer_pool.open()
+        app.state.checkpointer_pool = checkpointer_pool
+        logger.info("Checkpointer 连接池初始化完成")
+
+        # lifespan分界点
         yield
     finally:
         try:
-            # 4.等待agent服务关闭
             logger.info("Manus应用正在关闭")
             await asyncio.wait_for(get_agent_service().shutdown(), timeout=30.0)
             logger.info("Agent服务成功关闭")
@@ -110,7 +123,9 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Agent服务关闭期间出现错误: {str(e)}")
 
-        # 5. 应用关闭前的清理工作
+        # 应用关闭前的清理工作
+        if checkpointer_pool is not None:
+            await checkpointer_pool.close()
         await redis_client.shutdown()
         await postgres_client.shutdown()
         await minio_client.shutdown()

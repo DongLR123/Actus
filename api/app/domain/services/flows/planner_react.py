@@ -77,7 +77,7 @@ class PlannerReActFlow(BaseFlow):
         summary_llm: BaseChatModel | None = None,
         user_id: str = "",
         skill_graph_canary_percent: int = 0,
-        db_url: str = "",
+        checkpointer_pool: object | None = None,
         checkpointer: Any = None,
     ) -> None:
         self._uow_factory = uow_factory
@@ -111,7 +111,7 @@ class PlannerReActFlow(BaseFlow):
 
         # LangGraph checkpointer — 跨 graph 重建复用，支持 interrupt/resume
         self._checkpointer = checkpointer  # None = lazy-init AsyncPostgresSaver
-        self._db_url = db_url
+        self._checkpointer_pool = checkpointer_pool
 
         # Phase 3: 动态 skill 切换回调（由 AgentTaskRunner 在 invoke 前设置）
         self._skill_context_refresher = None
@@ -131,28 +131,99 @@ class PlannerReActFlow(BaseFlow):
         self._mcp_always_bind_names: set[str] = set()
 
     async def _get_checkpointer(self):
-        """Lazy-initialize checkpointer. Returns injected checkpointer (test) or AsyncPostgresSaver (prod).
+        """Lazy-initialize checkpointer.
 
-        Note: The lazy import of AsyncPostgresSaver in the domain layer is a pragmatic
-        DDD compromise — the checkpointer is injected in tests, and only falls back to
-        infrastructure-level initialization when no checkpointer is provided.
+        Returns injected checkpointer (test via MemorySaver) or creates
+        AsyncPostgresSaver backed by the shared connection pool (prod).
+
+        Note: AsyncPostgresSaver(pool) must be called in an async context
+        because its __init__ calls asyncio.get_running_loop().
         """
         if self._checkpointer is not None:
             return self._checkpointer
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-        from psycopg import AsyncConnection
 
-        conn_string = self._db_url.replace("+asyncpg", "")
-        conn = await AsyncConnection.connect(
-            conn_string, autocommit=True, prepare_threshold=0,
-        )
-        self._checkpointer = AsyncPostgresSaver(conn=conn)
-        await self._checkpointer.setup()
+        self._checkpointer = AsyncPostgresSaver(self._checkpointer_pool)
         return self._checkpointer
+
+    async def close(self) -> None:
+        """Release checkpointer reference. Pool connections are managed by the pool."""
+        self._checkpointer = None
 
     def set_skill_context(self, skill_context: str) -> None:
         """Set activated skill context for this round."""
         self._skill_context = skill_context
+
+    # -- Tool collection sub-methods ------------------------------------------
+
+    def _collect_native_tools(self) -> list:
+        """Collect sandbox/browser/search tools."""
+        return create_native_tools(
+            sandbox=self._sandbox, browser=self._browser,
+            search_engine=self._search_engine,
+        )
+
+    async def _collect_mcp_tools(self) -> list:
+        """Collect MCP tools with progressive loading.
+
+        Small tool set (<=15): bind all directly.
+        Large tool set (>15): only always_bind + discovery tools.
+        """
+        if not self._mcp_tool:
+            return []
+        MCP_AUTO_BIND_THRESHOLD = 15
+        all_mcp_tools = self._mcp_tool.get_tools()
+        tools: list = []
+        if len(all_mcp_tools) <= MCP_AUTO_BIND_THRESHOLD:
+            tools.extend(create_mcp_langchain_tools(self._mcp_tool, tool_names=None))
+        else:
+            if self._mcp_always_bind_names:
+                tools.extend(create_mcp_langchain_tools(
+                    self._mcp_tool, tool_names=self._mcp_always_bind_names,
+                ))
+            if self._mcp_tool_ref is not None and self._activated_mcp_tools_ref is not None:
+                from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
+                tools.extend(create_mcp_discovery_tools(
+                    mcp_tool_ref=self._mcp_tool_ref,
+                    activated_tools_ref=self._activated_mcp_tools_ref,
+                ))
+        return tools
+
+    def _collect_a2a_tools(self) -> list:
+        """Collect A2A remote agent tools."""
+        from app.domain.services.tools.langchain_a2a import create_a2a_langchain_tools
+        return create_a2a_langchain_tools(self._a2a_tool)
+
+    def _collect_skill_creation_tools(self) -> list:
+        """Collect skill creation tools + conditional get_skill_guide."""
+        tools = create_skill_langchain_tools(
+            brainstorm_skill_tool=self._brainstorm_skill_tool,
+            create_skill_tool=self._create_skill_tool,
+        )
+        if self._skill_pool_getter is not None:
+            from app.domain.services.tools.langchain_skill_tools import create_skill_guide_tool
+            tools.append(create_skill_guide_tool(
+                skill_pool_ref=self._skill_pool_getter,
+                file_listings_ref=self._file_listings_getter,
+                sandbox_skill_root=self._sandbox_skill_root,
+            ))
+        return tools
+
+    async def _collect_all_tools(self) -> list:
+        """Aggregate all tool categories for initial graph build.
+
+        Order: native -> MCP -> A2A -> skill creation.
+        Dynamic Skill tools are NOT included here — they are injected
+        per-step by react_graph_provider.
+        """
+        tools: list = []
+        tools.extend(self._collect_native_tools())
+        tools.extend(await self._collect_mcp_tools())
+        tools.extend(self._collect_a2a_tools())
+        tools.extend(self._collect_skill_creation_tools())
+        return tools
+
+    # -- Graph construction ---------------------------------------------------
 
     async def _ensure_graphs(self) -> None:
         """延迟构建工具列表和 LangGraph 图。
@@ -166,45 +237,7 @@ class PlannerReActFlow(BaseFlow):
         Planner 和 Executor 通过 skill_context（名称+描述）了解可用 Skill。
         """
         checkpointer = await self._get_checkpointer()
-        from app.domain.services.tools.langchain_a2a import create_a2a_langchain_tools
-
-        lc_tools = create_native_tools(
-            sandbox=self._sandbox, browser=self._browser,
-            search_engine=self._search_engine,
-        )
-        # MCP: progressive loading with auto-bind threshold
-        MCP_AUTO_BIND_THRESHOLD = 15
-        all_mcp_tools = self._mcp_tool.get_tools() if self._mcp_tool else []
-        if len(all_mcp_tools) <= MCP_AUTO_BIND_THRESHOLD:
-            # Small tool set: bind all directly, no discovery needed
-            lc_tools.extend(create_mcp_langchain_tools(self._mcp_tool, tool_names=None))
-        else:
-            # Large tool set: only bind always_bind tools
-            if self._mcp_always_bind_names:
-                lc_tools.extend(create_mcp_langchain_tools(
-                    self._mcp_tool, tool_names=self._mcp_always_bind_names,
-                ))
-            # Discovery tools only needed for large tool sets
-            if self._mcp_tool_ref is not None and self._activated_mcp_tools_ref is not None:
-                from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
-                lc_tools.extend(create_mcp_discovery_tools(
-                    mcp_tool_ref=self._mcp_tool_ref,
-                    activated_tools_ref=self._activated_mcp_tools_ref,
-                ))
-        lc_tools.extend(create_a2a_langchain_tools(self._a2a_tool))
-        lc_tools.extend(create_skill_langchain_tools(
-            brainstorm_skill_tool=self._brainstorm_skill_tool,
-            create_skill_tool=self._create_skill_tool,
-        ))
-        # 动态 Skill 工具不在此绑定 — 由 react_graph_provider 按步骤渐进式注入
-        # 但提供 get_skill_guide 工具，让 LLM 能按需获取完整 SKILL.md 指南
-        from app.domain.services.tools.langchain_skill_tools import create_skill_guide_tool
-        if self._skill_pool_getter is not None:
-            lc_tools.append(create_skill_guide_tool(
-                skill_pool_ref=self._skill_pool_getter,
-                file_listings_ref=self._file_listings_getter,
-                sandbox_skill_root=self._sandbox_skill_root,
-            ))
+        lc_tools = await self._collect_all_tools()
 
         has_guide_tool = self._skill_pool_getter is not None
         tool_names = [t.name for t in lc_tools]
