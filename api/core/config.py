@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     sandbox_ttl_minutes: Optional[int] = 60
     sandbox_network: Optional[str] = None
     sandbox_chrome_args: Optional[str] = ""
+    sandbox_mem_limit: str = "4g"  # Docker 容器内存上限，防止 Chromium OOM
     sandbox_https_proxy: Optional[str] = None
     sandbox_http_proxy: Optional[str] = None
     sandbox_no_proxy: Optional[str] = None

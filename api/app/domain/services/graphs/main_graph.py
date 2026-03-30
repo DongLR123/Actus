@@ -16,6 +16,8 @@ import uuid
 from typing import Any, Callable, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+
+from .message_utils import truncate_tool_content
 from langchain_core.language_models import BaseChatModel
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -92,9 +94,9 @@ def _compact_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
                 name=msg.name,
             ))
         elif isinstance(msg, ToolMessage) and isinstance(msg.content, str) and len(msg.content) > 2000:
-            # Truncate very long tool results to keep context manageable
+            # Tier 2: 截断超长工具结果，压缩跨 step 存储
             compacted.append(ToolMessage(
-                content=msg.content[:2000] + "\n...(已截断)",
+                content=truncate_tool_content(msg.content, 2000),
                 tool_call_id=msg.tool_call_id,
                 name=msg.name,
             ))

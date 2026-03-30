@@ -220,6 +220,24 @@ async def test_ensure_graphs_builds_tools_lazily(mock_llm, mock_uow):
     mock_mcp.get_tools.assert_called()
 
 
+async def test_ensure_graphs_passes_tool_result_max_chars(mock_llm, mock_uow):
+    """_ensure_graphs should forward overflow_config.tool_result_max_chars to build_react_graph."""
+    from app.domain.models.context_overflow_config import ContextOverflowConfig
+
+    overflow = ContextOverflowConfig(tool_result_max_chars=4000)
+    flow = _make_flow(mock_llm, mock_uow, overflow_config=overflow)
+
+    with patch(
+        "app.domain.services.flows.planner_react.build_react_graph",
+        return_value=MagicMock(),
+    ) as mock_build:
+        await flow._ensure_graphs()
+
+    mock_build.assert_called_once()
+    _, kwargs = mock_build.call_args
+    assert kwargs["tool_result_max_chars"] == 4000
+
+
 async def test_generator_early_close_still_persists(
     mock_llm, mock_uow,
 ):

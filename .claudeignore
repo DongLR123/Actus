@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+__pycache__/
+*.pyc
+
+# Build outputs
+.next/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Git worktrees
+.worktrees/
+
+# Secrets & sensitive config
+.env
+tunnel/id_rsa*
+api/config.yaml
+config.yaml
+
+# Large/binary files
+*.whl
+*.tar.gz
+*.zip
+
+# Logs & cache
+*.log
+logs/
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/

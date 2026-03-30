@@ -248,6 +248,10 @@ class PlannerReActFlow(BaseFlow):
 
         self._react_graph = build_react_graph(
             llm=self._llm, tools=lc_tools, agent_config=self._agent_config,
+            tool_result_max_chars=(
+                self._overflow_config.tool_result_max_chars
+                if self._overflow_config else 8000
+            ),
         )
         self._main_graph = build_main_graph(
             planner_llm=self._llm,

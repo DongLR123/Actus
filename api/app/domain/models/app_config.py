@@ -46,6 +46,9 @@ class LLMConfig(BaseModel):
     unknown_model_context_window: int = Field(
         32768, ge=1024
     )  # 未知模型的上下文窗口兜底值
+    tool_result_max_chars: int = Field(
+        8000, ge=100
+    )  # 工具结果截断阈值（字符数），Tier 1 守卫
 
     @model_validator(mode="after")
     def validate_context_budget_ratio(self):

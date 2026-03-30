@@ -957,3 +957,34 @@ class TestCompactMessages:
         assert compacted[0].content == "system prompt"
         assert compacted[1].content == "user message"
         assert compacted[2].content == "assistant response"
+
+
+class TestCompactMessagesTruncation:
+    """Verify Tier 2 truncation uses head+tail instead of head-only."""
+
+    def test_compact_messages_head_tail_truncation(self):
+        """ToolMessage > 2000 chars should be truncated with head+tail, not head-only."""
+        from app.domain.services.graphs.main_graph import _compact_messages
+        from langchain_core.messages import ToolMessage
+
+        content = "H" * 1500 + "M" * 1500 + "T" * 1500  # 4500 chars
+        msg = ToolMessage(content=content, tool_call_id="c1", name="shell_execute")
+        result = _compact_messages([msg])
+
+        assert len(result) == 1
+        truncated = result[0].content
+        assert len(truncated) < 4500
+        assert "已截断" in truncated
+
+    def test_compact_messages_preserves_tail(self):
+        """After truncation, the tail portion of the original content should be preserved."""
+        from app.domain.services.graphs.main_graph import _compact_messages
+        from langchain_core.messages import ToolMessage
+
+        tail_marker = "TAIL_END_MARKER"
+        content = "X" * 4000 + tail_marker  # > 2000 chars
+        msg = ToolMessage(content=content, tool_call_id="c1", name="shell_execute")
+        result = _compact_messages([msg])
+
+        truncated = result[0].content
+        assert tail_marker in truncated, "Tail content should be preserved in head+tail truncation"

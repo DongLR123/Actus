@@ -174,3 +174,20 @@ def messages_to_dicts(messages: list[BaseMessage]) -> list[dict[str, Any]]:
         else:
             dicts.append({"role": "user", "content": str(msg.content)})
     return dicts
+
+
+def truncate_tool_content(content: str, max_chars: int = 8000) -> str:
+    """对超长工具结果执行 head+tail 截断，保证返回长度 <= max_chars。
+
+    当 len(content) <= max_chars 时原样返回。
+    超限时先扣除截断标记开销，再将剩余预算均分给 head 和 tail。
+    """
+    if len(content) <= max_chars:
+        return content
+    # 用 len(content) 作为被截断字符数的上界，确保标记位数足够
+    marker_overhead = len(f"\n...(已截断 {len(content)} 字符)\n")
+    budget = max(0, max_chars - marker_overhead)
+    head = budget // 2
+    tail = budget - head
+    removed = len(content) - head - tail
+    return f"{content[:head]}\n...(已截断 {removed} 字符)\n{content[-tail:]}"

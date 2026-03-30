@@ -30,6 +30,7 @@ from app.domain.models.event import (
 )
 from app.domain.models.tool_result import ToolResult
 
+from .message_utils import truncate_tool_content
 from .state import ReactGraphState
 
 logger = logging.getLogger(__name__)
@@ -68,6 +69,7 @@ def build_react_graph(
     llm: BaseChatModel,
     tools: list[BaseTool],
     agent_config: AgentConfig | None = None,
+    tool_result_max_chars: int = 8000,
 ) -> CompiledStateGraph:
     """Build and compile the inner ReAct loop graph.
 
@@ -204,6 +206,10 @@ def build_react_graph(
                 guide = guide_injector(tool_name)
                 if guide:
                     content = f"{content}\n\n---\n[Skill Guide]\n{guide}"
+
+            # Tier 1: 截断超长工具结果，保护 ReAct 循环期间上下文窗口
+            content = truncate_tool_content(content, tool_result_max_chars)
+            result_str = truncate_tool_content(result_str, tool_result_max_chars)
 
             new_messages.append(ToolMessage(
                 content=content,

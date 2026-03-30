@@ -1215,6 +1215,10 @@ class AgentTaskRunner(TaskRunner):
 
         return build_react_graph(
             llm=self._llm, tools=lc_tools, agent_config=self._agent_config,
+            tool_result_max_chars=(
+                self._flow._overflow_config.tool_result_max_chars
+                if self._flow._overflow_config else 8000
+            ),
         )
 
     async def _initialize_skill_tool_if_needed(self, skills: list[Skill]) -> None:
