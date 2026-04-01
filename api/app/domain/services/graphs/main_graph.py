@@ -137,9 +137,11 @@ def build_main_graph(
         """Call planner LLM to create a plan from user message."""
         attachments = state.get("attachments", [])
         image_blocks = state.get("image_content_blocks", [])
+        # Planner 不传图片，因此 has_image_blocks 必须为 False，
+        # 否则附件文本会追加"你可以直接看到图片"的提示，诱导 LLM 幻觉图片内容
         prompt = CREATE_PLAN_PROMPT.format(
             message=state["message"],
-            attachments=format_attachments_text(attachments, has_image_blocks=bool(image_blocks)),
+            attachments=format_attachments_text(attachments, has_image_blocks=False),
         )
 
         # Build system prompt with optional tool summary and conversation summaries
