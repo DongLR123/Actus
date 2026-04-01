@@ -33,6 +33,8 @@ from app.domain.models.event import (
     A2AToolContent,
     BaseEvent,
     BrowserToolContent,
+    CompactionEvent,
+    ContextStatusEvent,
     ControlAction,
     ControlEvent,
     DoneEvent,
@@ -262,6 +264,7 @@ class AgentTaskRunner(TaskRunner):
         self._tier2_preloaded_skill_ids: set[str] = set()
         self._last_skill_context: str = ""
         self._activated_mcp_tools: set[str] = set()
+        self._image_url_map: dict[str, str] = {}  # sandbox filepath → presigned URL
         self._file_storage = file_storage
         self._overflow_config = overflow_config or ContextOverflowConfig()
         # self._file_repository = file_repository
@@ -432,6 +435,7 @@ class AgentTaskRunner(TaskRunner):
             OpenAI Chat Completions image_url content block 列表。
         """
         blocks: list[dict] = []
+        self._image_url_map.clear()
         for attachment in attachments:
             if not isinstance(attachment, File):
                 continue
@@ -449,6 +453,10 @@ class AgentTaskRunner(TaskRunner):
                             "detail": "high",
                         },
                     })
+                    # 记录 sandbox filepath → presigned URL 映射，
+                    # 供 MCP 工具调用时使用（MCP 服务无法访问沙箱文件系统）
+                    if attachment.filepath:
+                        self._image_url_map[attachment.filepath] = presigned_url
                     print(f"[DEBUG-IMG] 使用 presigned URL: file={attachment.filename}, "
                           f"url_prefix={presigned_url[:80]}...", flush=True)
                     continue
@@ -1641,6 +1649,41 @@ class AgentTaskRunner(TaskRunner):
             # 5.将事件直接返回
             yield event
 
+        # 6.流消费完毕后，读取压缩结果并发送上下文状态/压缩事件（B3）
+        compaction_result = getattr(self._flow, "_last_compaction_result", None)
+        if compaction_result is not None:
+            overflow_config = getattr(self._flow, "_overflow_config", None)
+            context_window = 0
+            if overflow_config is not None:
+                try:
+                    from app.domain.services.context.model_context_window import resolve_context_window
+                    context_window = resolve_context_window(
+                        overflow_config.model_name, overflow_config
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to resolve context window for SSE event: %s", exc)
+                    context_window = overflow_config.context_window or 0
+
+            soft_threshold = overflow_config.soft_trigger_ratio if overflow_config else 0.85
+            hard_threshold = overflow_config.hard_trigger_ratio if overflow_config else 0.95
+
+            yield ContextStatusEvent(
+                used_tokens=compaction_result.tokens_after,
+                context_window=context_window,
+                usage_ratio=compaction_result.usage_ratio_after,
+                soft_threshold=soft_threshold,
+                hard_threshold=hard_threshold,
+            )
+
+            if compaction_result.level_applied > 0:
+                yield CompactionEvent(
+                    level=compaction_result.level_applied,
+                    tokens_before=compaction_result.tokens_before,
+                    tokens_after=compaction_result.tokens_after,
+                    messages_removed=compaction_result.messages_removed,
+                    usage_ratio_after=compaction_result.usage_ratio_after,
+                )
+
     async def _cleanup_tools(self) -> None:
         """清理MCP和A2A工具资源，确保在同一任务上下文中释放
 
@@ -1791,13 +1834,21 @@ class AgentTaskRunner(TaskRunner):
                     )
 
                 # 6.将消息事件转换称消息对象
+                # 附件路径附带外部可访问 URL（MCP 工具无法访问沙箱文件系统）
+                attachment_paths: list[str] = []
+                if isinstance(event, MessageEvent):
+                    for att in event.attachments:
+                        path = att.filepath
+                        url = self._image_url_map.get(path)
+                        if url:
+                            attachment_paths.append(
+                                f"{path} (external_url: {url})"
+                            )
+                        else:
+                            attachment_paths.append(path)
                 message_obj = Message(
                     message=message,
-                    attachments=(
-                        [attachment.filepath for attachment in event.attachments]
-                        if isinstance(event, MessageEvent)
-                        else []
-                    ),
+                    attachments=attachment_paths,
                     image_content_blocks=image_content_blocks,
                     skill_confirmation_action=(
                         event.skill_confirmation_action

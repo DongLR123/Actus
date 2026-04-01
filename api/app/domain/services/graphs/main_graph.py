@@ -157,12 +157,12 @@ def build_main_graph(
         if conversation_summaries:
             system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(conversation_summaries)
 
-        # Use structured output via LangChain BaseChatModel
-        # Include image content blocks for multimodal understanding
-        prompt_content = build_multimodal_content(prompt, image_blocks)
+        # Planner 不传图片：planner 识图不可靠，容易幻觉图片内容并写入 step description，
+        # 导致 executor 被错误的描述误导。图片分析留给 executor 通过 MCP 工具完成。
+        # 附件文本信息（路径、URL）仍保留，让 planner 知道有附件存在。
         messages = [
             SystemMessage(content=system_content),
-            HumanMessage(content=prompt_content),
+            HumanMessage(content=prompt),
         ]
         structured_llm = planner_llm.with_structured_output(PlanResponse)
 

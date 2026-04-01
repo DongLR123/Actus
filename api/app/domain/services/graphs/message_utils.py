@@ -20,6 +20,8 @@ from langchain_core.messages import (
 _IMAGE_VISION_HINT = (
     '\n\n【多模态识图提示】上述附件中的图片已直接嵌入本消息中，你可以直接看到图片内容。'
     '请基于你直接看到的图片进行分析，无需使用 file_read、浏览器或其他工具来查看或打开图片。'
+    '\n【MCP工具注意】如需将图片传递给 MCP 工具，必须使用附件中标注的 external_url（而非沙箱路径），'
+    '因为 MCP 服务运行在沙箱外部，无法访问沙箱文件系统。'
 )
 
 

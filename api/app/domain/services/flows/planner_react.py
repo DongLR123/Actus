@@ -35,12 +35,12 @@ from langgraph.types import Command
 from app.domain.services.graphs.event_bridge import GraphEventBridge
 from app.domain.services.graphs.main_graph import build_main_graph
 from app.domain.services.graphs.message_utils import (
-    build_multimodal_content,
     dicts_to_messages,
     format_attachments_text,
     messages_to_dicts,
 )
 from app.domain.services.graphs.react_graph import build_react_graph
+from app.domain.services.graphs.compaction import CompactionResult, GradualCompactor
 from app.domain.services.graphs.token_estimator import TokenEstimator
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.base import BaseTool
@@ -92,6 +92,15 @@ class PlannerReActFlow(BaseFlow):
             strategy=self._overflow_config.token_estimator,
             model_name=self._overflow_config.model_name,
         ) if self._overflow_config else TokenEstimator()
+        self._compactor = GradualCompactor(
+            token_estimator=self._token_estimator,
+            soft_trigger_ratio=self._overflow_config.soft_trigger_ratio,
+            hard_trigger_ratio=self._overflow_config.hard_trigger_ratio,
+            target_ratio=self._overflow_config.target_ratio,
+            summary_max_chars=self._overflow_config.summary_max_chars,
+            token_safety_factor=self._overflow_config.token_safety_factor,
+        ) if self._overflow_config else None
+        self._last_compaction_result: CompactionResult | None = None
         self._skill_context = ""
 
         # Skill creation subgraph
@@ -358,24 +367,33 @@ class PlannerReActFlow(BaseFlow):
             unresolved=parsed.unresolved,
         )
 
-    async def _check_overflow(self, memory: Memory) -> None:
-        """检测上下文溢出，超过硬阈值时做激进压缩。"""
+    async def _check_overflow(self, memory: Memory) -> CompactionResult | None:
+        """检测上下文溢出，根据水位触发渐进压缩。"""
         if not self._overflow_config or not self._overflow_config.context_overflow_guard_enabled:
-            return
+            return None
+        # _compactor is always non-None when _overflow_config is non-None (see __init__)
         from app.domain.services.context.model_context_window import resolve_context_window
         msgs = dicts_to_messages(memory.messages)
-        raw_tokens = self._token_estimator.estimate_messages(msgs)
-        estimated_tokens = int(raw_tokens * self._overflow_config.token_safety_factor)
         window = resolve_context_window(self._overflow_config.model_name, self._overflow_config)
-        hard_limit = int(window * self._overflow_config.hard_trigger_ratio)
-        if estimated_tokens > hard_limit:
-            logger.warning(f"上下文溢出: ~{estimated_tokens} tokens > hard_limit {hard_limit}, 执行硬压缩")
-            memory.compact(keep_summary=False)
-            # 保留系统消息 + 最近 N 条
-            if len(memory.messages) > 20:
-                memory.messages = memory.messages[:1] + memory.messages[-19:]
+
+        result = await self._compactor.try_compact(
+            messages=msgs,
+            context_window=window,
+            summary_llm=self._summary_llm,
+        )
+
+        if result.level_applied > 0:
+            memory.messages = messages_to_dicts(result.messages)
             async with self._uow_factory() as uow:
                 await uow.session.save_memory(self._session_id, "react", memory)
+            logger.info(
+                "compaction level=%d, %d→%d tokens, removed %d msgs",
+                result.level_applied, result.tokens_before,
+                result.tokens_after, result.messages_removed,
+            )
+
+        self._last_compaction_result = result
+        return result
 
     def _is_skill_graph_active(self) -> bool:
         return is_skill_graph_enabled(self._user_id, self._skill_graph_canary_percent)
@@ -539,7 +557,6 @@ class PlannerReActFlow(BaseFlow):
 
         attachments = getattr(message, "attachments", [])
         image_blocks = getattr(message, "image_content_blocks", [])
-        logger.debug("[IMG] _run_planner_for_detection: image_blocks=%d, attachments=%s", len(image_blocks), attachments)
         prompt = CREATE_PLAN_PROMPT.format(
             message=message.message,
             attachments=format_attachments_text(attachments, has_image_blocks=bool(image_blocks)),
@@ -557,11 +574,10 @@ class PlannerReActFlow(BaseFlow):
         if summary_texts:
             system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(summary_texts)
 
-        # Build multimodal prompt if image attachments exist
-        prompt_content = build_multimodal_content(prompt, image_blocks)
+        # Planner 不传图片（同 main_graph.planner_node），避免幻觉图片内容
         messages = [
             SystemMessage(content=system_content),
-            HumanMessage(content=prompt_content),
+            HumanMessage(content=prompt),
         ]
         structured = self._llm.with_structured_output(PlanResponse)
         try:

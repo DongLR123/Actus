@@ -205,6 +205,28 @@ class ErrorEvent(BaseEvent):
     error: str = ""  # 错误信息
 
 
+class ContextStatusEvent(BaseEvent):
+    """上下文水位状态事件"""
+
+    type: Literal["context_status"] = "context_status"
+    used_tokens: int = 0
+    context_window: int = 0
+    usage_ratio: float = 0.0
+    soft_threshold: float = 0.85
+    hard_threshold: float = 0.95
+
+
+class CompactionEvent(BaseEvent):
+    """上下文压缩事件"""
+
+    type: Literal["compaction"] = "compaction"
+    level: int = 0
+    tokens_before: int = 0
+    tokens_after: int = 0
+    messages_removed: int = 0
+    usage_ratio_after: float = 0.0
+
+
 class DoneEvent(BaseEvent):
     """结束事件类型"""
 
@@ -222,6 +244,8 @@ Event = Annotated[
         WaitEvent,
         ControlEvent,
         ErrorEvent,
+        ContextStatusEvent,
+        CompactionEvent,
         DoneEvent,
     ],
     Field(discriminator="type"),

@@ -21,6 +21,8 @@ class ContextOverflowConfig(BaseModel):
     model_name: str = ""
     tool_result_max_chars: int = Field(8000, ge=100)
     tool_compress_trigger_ratio: float = Field(0.75, gt=0, le=1)
+    target_ratio: float = Field(0.65, gt=0, le=1)
+    summary_max_chars: int = Field(16_000, ge=1000)
 
     @classmethod
     def from_llm_config(cls, llm_config: LLMConfig) -> "ContextOverflowConfig":
