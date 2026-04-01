@@ -136,7 +136,7 @@ class MemoryConfig(BaseModel):
     summary_model: Optional[str] = None
     summary_max_rounds: int = Field(5, ge=1, le=20)
     summary_token_budget: int = Field(2000, ge=200, le=10000)
-    summary_min_steps: int = Field(2, ge=1, le=10)
+    summary_min_steps: int = Field(1, ge=1, le=10)
     context_anchor_enabled: bool = True
     compact_keep_summary: bool = True
 

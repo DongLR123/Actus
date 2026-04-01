@@ -93,7 +93,7 @@ def test_agent_config_has_default_memory_config() -> None:
     assert config.memory.summary_model is None
     assert config.memory.summary_max_rounds == 5
     assert config.memory.summary_token_budget == 2000
-    assert config.memory.summary_min_steps == 2
+    assert config.memory.summary_min_steps == 1
     assert config.memory.context_anchor_enabled is True
     assert config.memory.compact_keep_summary is True
 
