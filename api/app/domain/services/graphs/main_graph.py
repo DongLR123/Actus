@@ -13,7 +13,7 @@ import asyncio
 import logging
 import re
 import uuid
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, TYPE_CHECKING
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
@@ -46,6 +46,9 @@ from app.domain.services.flows.base import FlowStatus
 
 from .message_utils import build_multimodal_content, dedup_messages, format_attachments_text
 from .state import MainGraphState
+
+if TYPE_CHECKING:
+    from .context_assembler import ContextAssembler
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +116,7 @@ def build_main_graph(
     session_id: str,
     agent_config: AgentConfig | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
+    assembler: ContextAssembler | None = None,
 ) -> CompiledStateGraph:
     """Build and compile the main orchestration graph.
 
@@ -333,6 +337,13 @@ def build_main_graph(
             "attempt_count": 0,
             "failure_count": 0,
         }
+
+        # ── Cross-step context assembly ──
+        if assembler is not None and resume_value is None:
+            asm_result = assembler.assemble(react_input["messages"])
+            react_input["messages"] = asm_result.messages
+            if asm_result.actions:
+                logger.info("context_assembler(cross-step): %s", asm_result.actions)
 
         # Stream react_graph — emit events in real-time.
         # IMPORTANT: Must use stream_mode="updates" explicitly.

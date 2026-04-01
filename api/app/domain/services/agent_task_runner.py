@@ -1219,6 +1219,7 @@ class AgentTaskRunner(TaskRunner):
                 self._flow._overflow_config.tool_result_max_chars
                 if self._flow._overflow_config else 8000
             ),
+            assembler=getattr(self._flow, '_assembler', None),
         )
 
     async def _initialize_skill_tool_if_needed(self, skills: list[Skill]) -> None:

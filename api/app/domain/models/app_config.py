@@ -49,6 +49,9 @@ class LLMConfig(BaseModel):
     tool_result_max_chars: int = Field(
         8000, ge=100
     )  # 工具结果截断阈值（字符数），Tier 1 守卫
+    tool_compress_trigger_ratio: float = Field(
+        0.75, gt=0, le=1
+    )  # Phase 1 工具结果压缩触发比例（占预算百分比）
 
     @model_validator(mode="after")
     def validate_context_budget_ratio(self):

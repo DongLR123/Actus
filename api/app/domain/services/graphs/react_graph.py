@@ -1,8 +1,8 @@
 """react_graph — inner ReAct loop as a LangGraph StateGraph.
 
 Replaces BaseAgent.invoke() and ReActAgent.execute_step().
-Nodes: llm_node, tool_node
-Edges: START → llm_node → route_after_llm → (tool_node → llm_node) | END
+Nodes: pre_llm_node, llm_node, tool_node
+Edges: START → pre_llm_node → llm_node → route_after_llm → (tool_node → pre_llm_node) | END
 
 Reference: docs/plans/2026-03-10-langchain-langgraph-migration-design.md §4.3-4.4
 """
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, ToolMessage
@@ -32,6 +32,9 @@ from app.domain.models.tool_result import ToolResult
 
 from .message_utils import truncate_tool_content
 from .state import ReactGraphState
+
+if TYPE_CHECKING:
+    from .context_assembler import ContextAssembler
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +73,7 @@ def build_react_graph(
     tools: list[BaseTool],
     agent_config: AgentConfig | None = None,
     tool_result_max_chars: int = 8000,
+    assembler: ContextAssembler | None = None,
 ) -> CompiledStateGraph:
     """Build and compile the inner ReAct loop graph.
 
@@ -87,9 +91,18 @@ def build_react_graph(
 
     # ---- Nodes --------------------------------------------------------- #
 
+    async def pre_llm_node(state: ReactGraphState) -> dict:
+        """Trim messages for LLM input. state['messages'] is unchanged."""
+        if assembler is None:
+            return {"llm_input_messages": list(state["messages"])}
+        result = assembler.assemble(list(state["messages"]))
+        if result.actions:
+            logger.info("context_assembler(in-step): %s", result.actions)
+        return {"llm_input_messages": result.messages}
+
     async def llm_node(state: ReactGraphState) -> dict:
         """Call the LLM with current messages."""
-        messages = state["messages"]
+        messages = state.get("llm_input_messages") or state["messages"]
 
         # 诊断日志：检查多模态内容是否到达 react_graph
         multimodal_msgs = [
@@ -267,7 +280,7 @@ def build_react_graph(
             return END
         if state.get("attempt_count", 0) >= MAX_ITERATIONS:
             return END
-        return "llm_node"
+        return "pre_llm_node"
 
     # ---- Build Graph --------------------------------------------------- #
 
@@ -281,10 +294,12 @@ def build_react_graph(
         retry_on=ServerRequestsError,
     )
 
+    g.add_node("pre_llm_node", pre_llm_node)
     g.add_node("llm_node", llm_node, retry_policy=llm_retry)
     g.add_node("tool_node", tool_node)
 
-    g.add_edge(START, "llm_node")
+    g.add_edge(START, "pre_llm_node")
+    g.add_edge("pre_llm_node", "llm_node")
     g.add_conditional_edges("llm_node", route_after_llm)
     g.add_conditional_edges("tool_node", route_after_tool)
 

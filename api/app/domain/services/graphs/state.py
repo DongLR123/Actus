@@ -62,6 +62,11 @@ class ReactGraphState(TypedDict):
     # Conversation — LangChain BaseMessage list (append via add_messages reducer)
     messages: Annotated[list[BaseMessage], add_messages]
 
+    # Context assembler output — trimmed messages for LLM input.
+    # No reducer (overwrite semantics). Written by pre_llm_node, read by llm_node.
+    # react_graph has no checkpointer, so this is not persisted within the loop.
+    llm_input_messages: list[BaseMessage]
+
     # Step context
     step_description: str
     original_request: str

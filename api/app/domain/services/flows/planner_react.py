@@ -41,6 +41,7 @@ from app.domain.services.graphs.message_utils import (
     messages_to_dicts,
 )
 from app.domain.services.graphs.react_graph import build_react_graph
+from app.domain.services.graphs.token_estimator import TokenEstimator
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.base import BaseTool
 from app.domain.services.tools.langchain_mcp import create_mcp_langchain_tools
@@ -87,6 +88,10 @@ class PlannerReActFlow(BaseFlow):
         self.plan: Optional[Plan] = None
         self._memory_config = agent_config.memory
         self._overflow_config = overflow_config
+        self._token_estimator = TokenEstimator(
+            strategy=self._overflow_config.token_estimator,
+            model_name=self._overflow_config.model_name,
+        ) if self._overflow_config else TokenEstimator()
         self._skill_context = ""
 
         # Skill creation subgraph
@@ -112,6 +117,7 @@ class PlannerReActFlow(BaseFlow):
         # LangGraph checkpointer — 跨 graph 重建复用，支持 interrupt/resume
         self._checkpointer = checkpointer  # None = lazy-init AsyncPostgresSaver
         self._checkpointer_pool = checkpointer_pool
+        self._assembler = None
 
         # Phase 3: 动态 skill 切换回调（由 AgentTaskRunner 在 invoke 前设置）
         self._skill_context_refresher = None
@@ -246,12 +252,34 @@ class PlannerReActFlow(BaseFlow):
             len(lc_tools), has_guide_tool, tool_names,
         )
 
+        # Context assembler (B2)
+        from app.domain.services.graphs.context_assembler import ContextAssembler
+        from app.domain.services.context.model_context_window import resolve_context_window
+
+        assembler = None
+        if self._overflow_config:
+            context_window = resolve_context_window(
+                self._overflow_config.model_name, self._overflow_config,
+            )
+            assembler = ContextAssembler(
+                estimator=TokenEstimator(
+                    strategy=self._overflow_config.token_estimator,
+                    model_name=self._overflow_config.model_name,
+                ),
+                context_window=context_window,
+                reserved_output_tokens=self._overflow_config.reserved_output_tokens,
+                safety_factor=self._overflow_config.token_safety_factor,
+                tool_compress_trigger_ratio=self._overflow_config.tool_compress_trigger_ratio,
+            )
+        self._assembler = assembler
+
         self._react_graph = build_react_graph(
             llm=self._llm, tools=lc_tools, agent_config=self._agent_config,
             tool_result_max_chars=(
                 self._overflow_config.tool_result_max_chars
                 if self._overflow_config else 8000
             ),
+            assembler=assembler,
         )
         self._main_graph = build_main_graph(
             planner_llm=self._llm,
@@ -261,6 +289,7 @@ class PlannerReActFlow(BaseFlow):
             session_id=self._session_id,
             agent_config=self._agent_config,
             checkpointer=checkpointer,
+            assembler=assembler,
         )
         self._graphs_built = True
 
@@ -334,9 +363,9 @@ class PlannerReActFlow(BaseFlow):
         if not self._overflow_config or not self._overflow_config.context_overflow_guard_enabled:
             return
         from app.domain.services.context.model_context_window import resolve_context_window
-        # 使用字符估算 token（粗略：1 token ≈ 3-4 字符中英混合）
-        total_chars = sum(len(str(m.get("content", ""))) for m in memory.messages)
-        estimated_tokens = int(total_chars / 3 * self._overflow_config.token_safety_factor)
+        msgs = dicts_to_messages(memory.messages)
+        raw_tokens = self._token_estimator.estimate_messages(msgs)
+        estimated_tokens = int(raw_tokens * self._overflow_config.token_safety_factor)
         window = resolve_context_window(self._overflow_config.model_name, self._overflow_config)
         hard_limit = int(window * self._overflow_config.hard_trigger_ratio)
         if estimated_tokens > hard_limit:
