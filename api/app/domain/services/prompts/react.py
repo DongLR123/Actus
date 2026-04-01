@@ -66,7 +66,7 @@ JSON 输出示例：
 """
 
 # 执行子步骤提示词模板 — 仅包含动态内容，静态指令已移至 REACT_SYSTEM_PROMPT
-EXECUTION_PROMPT = “””
+EXECUTION_PROMPT = """
 你正在执行任务：
 {step}
 
@@ -80,7 +80,7 @@ EXECUTION_PROMPT = “””
 {language}
 
 提醒：工具返回的分析结果优先于任务描述；按系统提示中的 JSON 格式返回结果。
-“””
+"""
 
 # 汇总总结提示词模板，将历史信息进行相应的总结
 SUMMARIZE_PROMPT = """
