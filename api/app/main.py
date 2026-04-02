@@ -111,6 +111,18 @@ async def lifespan(app: FastAPI):
         app.state.checkpointer_pool = checkpointer_pool
         logger.info("Checkpointer 连接池初始化完成")
 
+        # 6. 初始化 MemoryFlushService（C5.0 记忆刷写调度器）
+        from app.application.services.memory_flush_service import MemoryFlushService
+        from app.interfaces.service_dependencies import _load_app_config
+        _app_config = _load_app_config()
+        _memory_cfg = _app_config.agent_config.memory
+        flush_service = MemoryFlushService(
+            max_retries=_memory_cfg.flush_max_retries,
+            circuit_breaker_threshold=_memory_cfg.flush_circuit_breaker_threshold,
+        )
+        app.state.flush_service = flush_service
+        logger.info("MemoryFlushService 初始化完成")
+
         # lifespan分界点
         yield
     finally:
@@ -122,6 +134,15 @@ async def lifespan(app: FastAPI):
             logger.warning("Agent服务关闭超时, 强制关闭, 部分任务将被释放")
         except Exception as e:
             logger.error(f"Agent服务关闭期间出现错误: {str(e)}")
+
+        # 关闭 MemoryFlushService（等待后台 flush 任务完成）
+        flush_service = getattr(app.state, "flush_service", None)
+        if flush_service:
+            try:
+                await flush_service.shutdown()
+                logger.info("MemoryFlushService 关闭成功")
+            except Exception as e:
+                logger.warning(f"MemoryFlushService 关闭时出错: {e}")
 
         # 应用关闭前的清理工作
         if checkpointer_pool is not None:

@@ -19,11 +19,15 @@ class FakeLookup:
         return None
 
 
-def _make_sandbox_mock(mime_output: str = "image/png"):
+def _make_sandbox_mock(mime_output: str = "image/png", returncode: int = 0, success: bool = True):
     sandbox = AsyncMock()
     mock_result = MagicMock()
+    mock_result.success = success
+    mock_result.data = {
+        "returncode": returncode,
+        "output": mime_output,
+    }
     mock_result.__str__ = lambda self: mime_output
-    mock_result.success = True
     sandbox.exec_command = AsyncMock(return_value=mock_result)
     return sandbox
 
@@ -67,6 +71,41 @@ class TestFileViewTool:
         )
         # Extension .jpg maps to image/jpeg → FakeLookup matches image/ prefix
         assert isinstance(result, FileProcessResult)
+
+    def test_file_view_returncode_127_falls_back_to_extension(self):
+        """When `file` command is not installed (returncode 127), fall back to extension."""
+        import pytest
+        from app.domain.services.tools.langchain_tools import _make_file_view_tools
+
+        sandbox = _make_sandbox_mock(
+            mime_output="/bin/bash: file: 未找到命令\n",
+            returncode=127,
+        )
+        tools = _make_file_view_tools(sandbox, FakeLookup(), supports_vision=True)
+        file_view = tools[0]
+
+        result = asyncio.get_event_loop().run_until_complete(
+            file_view.ainvoke({"filepath": "/home/ubuntu/upload/photo.png"})
+        )
+        # .png → image/png → FakeLookup matches image/ prefix
+        assert isinstance(result, FileProcessResult)
+
+    def test_file_view_nonzero_returncode_raises_on_real_error(self):
+        """When `file` fails for a real reason (e.g. path not found), raise instead of guessing."""
+        import pytest
+        from app.domain.services.tools.langchain_tools import _make_file_view_tools
+
+        sandbox = _make_sandbox_mock(
+            mime_output="cannot open `/no/such/file` (No such file or directory)\n",
+            returncode=1,
+        )
+        tools = _make_file_view_tools(sandbox, FakeLookup(), supports_vision=True)
+        file_view = tools[0]
+
+        with pytest.raises(RuntimeError, match="Cannot detect file type"):
+            asyncio.get_event_loop().run_until_complete(
+                file_view.ainvoke({"filepath": "/no/such/file.png"})
+            )
 
     def test_create_native_tools_includes_file_view(self):
         from app.domain.services.tools.langchain_tools import create_native_tools

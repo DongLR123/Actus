@@ -29,6 +29,7 @@ class Memory(BaseModel):
     """记忆类，定义Agent的记忆基础信息"""
 
     messages: List[Dict[str, Any]] = Field(default_factory=list)
+    flush_cursor: int = 0
 
     @classmethod
     def get_message_role(cls, message: Dict[str, Any]) -> str:

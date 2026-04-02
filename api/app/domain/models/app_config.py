@@ -140,6 +140,13 @@ class MemoryConfig(BaseModel):
     summary_min_steps: int = Field(1, ge=1, le=10)
     context_anchor_enabled: bool = True
     compact_keep_summary: bool = True
+    # Flush 调度
+    flush_enabled: bool = False
+    flush_min_steps: int = Field(2, ge=1, le=10)
+    flush_min_new_tokens: int = Field(3000, ge=500, le=20000)
+    # Flush 容错
+    flush_max_retries: int = Field(3, ge=0, le=10)
+    flush_circuit_breaker_threshold: int = Field(3, ge=1, le=10)
 
 
 class AgentConfig(BaseModel):

@@ -15,6 +15,7 @@ from app.application.errors.exceptions import (
 from langchain_core.language_models import BaseChatModel
 
 from app.domain.external.file_storage import FileStorage
+from app.domain.external.memory_flusher import MemoryFlusher
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 from app.domain.external.task import Task
@@ -77,9 +78,11 @@ class AgentService:
         supports_vision: bool = True,
         file_understanding_config=None,
         vision_fallback_model=None,
+        memory_flusher: MemoryFlusher | None = None,
         # file_repository: FileRepository,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
+        self._memory_flusher = memory_flusher
         self._supports_vision = supports_vision
         self._file_understanding_config = file_understanding_config
         self._vision_fallback_model = vision_fallback_model
@@ -184,6 +187,7 @@ class AgentService:
             checkpointer_pool=self._checkpointer_pool,
             supports_vision=self._supports_vision,
             file_processor_lookup=file_processor_lookup,
+            memory_flusher=self._memory_flusher,
         )
 
         # 6.创建任务Task并更新会话中的信息

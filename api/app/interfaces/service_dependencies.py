@@ -173,11 +173,17 @@ def get_checkpointer_pool(request: Request) -> AsyncConnectionPool:
     return request.app.state.checkpointer_pool.pool
 
 
+def get_flush_service(request: Request):
+    """Extract the MemoryFlushService from app state (may be None)."""
+    return getattr(request.app.state, "flush_service", None)
+
+
 # @lru_cache()
 def get_agent_service(
     minio_store: MinioStore = Depends(get_minio),
     redis_client: RedisClient = Depends(get_redis),
     checkpointer_pool: AsyncConnectionPool = Depends(get_checkpointer_pool),
+    flush_service=Depends(get_flush_service),
 ) -> AgentService:
     # 1.获取应用配置信息(读取配置需要实时获取,所以不配置缓存)
     app_config = _load_app_config()
@@ -235,6 +241,7 @@ def get_agent_service(
         supports_vision=app_config.llm_config.supports_vision,
         file_understanding_config=app_config.file_understanding,
         vision_fallback_model=vision_fallback_model,
+        memory_flusher=flush_service,
         # file_repository=file_repository,
     )
 

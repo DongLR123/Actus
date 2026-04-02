@@ -4,11 +4,13 @@ This module preserves the same public interface (constructor, invoke, done)
 so that AgentTaskRunner requires minimal changes.
 """
 
+import hashlib
 import logging
-from typing import Any, AsyncGenerator, Callable, Optional
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator, Callable, Optional, Sequence
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from app.domain.external.browser import Browser
 from app.domain.external.sandbox import Sandbox
@@ -27,6 +29,7 @@ from app.domain.models.event import (
 )
 from app.domain.models.llm_responses import ConversationSummaryResponse, PlanResponse, StepDef
 from app.domain.models.memory import Memory
+from app.domain.models.memory_chunk import FlushBatch, RawChunk
 from app.domain.models.message import Message
 from app.domain.models.plan import ExecutionStatus, Plan, Step
 from app.domain.repositories.uow import IUnitOfWork
@@ -148,6 +151,10 @@ class PlannerReActFlow(BaseFlow):
         self._mcp_tool_ref: Callable | None = None
         self._activated_mcp_tools_ref: Callable[[], set[str]] | None = None
         self._mcp_always_bind_names: set[str] = set()
+
+        # Flush scheduling: cursor + pending batch
+        self._flush_cursor: int = 0
+        self._pending_flush_batch: FlushBatch | None = None
 
     async def _get_checkpointer(self):
         """Lazy-initialize checkpointer.
@@ -710,6 +717,14 @@ class PlannerReActFlow(BaseFlow):
         async with self._uow_factory() as uow:
             summaries = await uow.session.get_summary(self._session_id)
 
+        # Load flush_cursor from persisted Memory (needed for both resume and new task)
+        try:
+            async with self._uow_factory() as uow:
+                _memory_for_cursor = await uow.session.get_memory(self._session_id, "react")
+                self._flush_cursor = _memory_for_cursor.flush_cursor
+        except Exception:
+            self._flush_cursor = 0
+
         # Detect pending interrupt via checkpointer state
         is_resume = False
         try:
@@ -870,6 +885,12 @@ class PlannerReActFlow(BaseFlow):
             logger.warning("messages_to_dicts 转换失败，使用空消息列表: %s", exc)
             dict_messages = []
 
+        # Evaluate flush gate BEFORE Memory construction (uses raw_messages)
+        try:
+            self._evaluate_flush_gate(raw_messages, final.get("plan") or self.plan)
+        except Exception as exc:
+            logger.warning("flush gate 评估失败: %s", exc)
+
         if final.get("should_interrupt"):
             # Checkpointer has automatically saved full graph state for Command(resume=...).
             # Only persist Memory (for context anchors) and update flow status.
@@ -882,7 +903,7 @@ class PlannerReActFlow(BaseFlow):
                 self.plan.title if self.plan else "<none>",
             )
 
-            memory = Memory(messages=list(dict_messages))
+            memory = Memory(messages=list(dict_messages), flush_cursor=self._flush_cursor)
             memory.compact(keep_summary=self._memory_config.compact_keep_summary)
             try:
                 async with self._uow_factory() as uow:
@@ -891,7 +912,7 @@ class PlannerReActFlow(BaseFlow):
                 logger.warning(f"中断时保存 Memory 失败: {e}")
         else:
             # === After Graph: 记忆压缩、保存、摘要生成 ===
-            memory = Memory(messages=list(dict_messages))
+            memory = Memory(messages=list(dict_messages), flush_cursor=self._flush_cursor)
             memory.compact(keep_summary=self._memory_config.compact_keep_summary)
 
             try:
@@ -923,6 +944,327 @@ class PlannerReActFlow(BaseFlow):
 
             # 正常完成：重置状态
             self.status = FlowStatus.IDLE
+
+    # ── Flush scheduling: gate + chunking ────────────────────────────────────
+
+    def _evaluate_flush_gate(
+        self,
+        raw_messages: Sequence[BaseMessage],
+        plan: Any,
+    ) -> None:
+        """Evaluate whether to produce a FlushBatch for background flushing.
+
+        Side-effects:
+        - Always clears ``_pending_flush_batch`` at entry.
+        - Sets ``_pending_flush_batch`` if the gate passes.
+        - May reset ``_flush_cursor`` on compaction shrink.
+        """
+        self._pending_flush_batch = None
+
+        if not self._memory_config.flush_enabled:
+            return
+
+        current_len = len(raw_messages)
+
+        # Compaction shrink: context was compacted and now shorter than cursor
+        if current_len < self._flush_cursor:
+            self._flush_cursor = current_len
+            return
+
+        # No new messages since last flush
+        if current_len == self._flush_cursor:
+            return
+
+        # Count completed steps
+        steps_completed = 0
+        if plan is not None and hasattr(plan, "steps"):
+            steps_completed = sum(
+                1 for s in plan.steps
+                if s.status == ExecutionStatus.COMPLETED
+            )
+
+        if steps_completed < self._memory_config.flush_min_steps:
+            return
+
+        # Estimate new tokens since last cursor
+        new_messages = raw_messages[self._flush_cursor:]
+        new_token_count = self._token_estimator.estimate_messages(new_messages)
+
+        if new_token_count < self._memory_config.flush_min_new_tokens:
+            return
+
+        # Gate passes — build chunks and FlushBatch
+        chunks = self._chunk_messages(list(new_messages), plan=plan)
+        if not chunks:
+            return
+
+        self._pending_flush_batch = FlushBatch(
+            session_id=self._session_id,
+            user_id=self._user_id,
+            from_cursor=self._flush_cursor,
+            target_cursor=current_len,
+            chunks=tuple(chunks),
+        )
+
+    def _chunk_messages(
+        self,
+        messages: list[BaseMessage],
+        plan: Any = None,
+    ) -> list[RawChunk]:
+        """Convert a sequence of LangChain messages into RawChunks.
+
+        Phases:
+        1. Group messages (skip SystemMessage, merge AIMessage+ToolMessage groups)
+        2. Merge short text groups (<50 tokens)
+        3. Split oversized groups (>500 tokens) with paragraph overlap
+        4. Build RawChunks with metadata
+        """
+        # Phase 1: Group messages
+        groups: list[dict[str, Any]] = []
+        current_group: dict[str, Any] | None = None
+
+        for idx, msg in enumerate(messages):
+            if isinstance(msg, SystemMessage):
+                continue
+
+            text = self._message_to_text(msg)
+            msg_type = type(msg).__name__
+
+            if isinstance(msg, ToolMessage):
+                # Merge ToolMessage into the preceding AIMessage group
+                if current_group is not None:
+                    current_group["texts"].append(text)
+                    current_group["message_types"].add(msg_type)
+                    tool_name = getattr(msg, "name", "") or ""
+                    if tool_name:
+                        current_group["tool_names"].add(tool_name)
+                else:
+                    # Orphaned ToolMessage — start a new group
+                    current_group = {
+                        "texts": [text],
+                        "message_types": {msg_type},
+                        "tool_names": {getattr(msg, "name", "") or ""},
+                        "turn_index": idx,
+                    }
+                    groups.append(current_group)
+                continue
+
+            if isinstance(msg, AIMessage) and current_group is not None:
+                # Check if this AI message has tool_calls — extend the group
+                tool_calls = msg.additional_kwargs.get("tool_calls", [])
+                if tool_calls:
+                    current_group["texts"].append(text)
+                    current_group["message_types"].add(msg_type)
+                    for tc in tool_calls:
+                        fn = tc.get("function", {})
+                        name = fn.get("name", "")
+                        if name:
+                            current_group["tool_names"].add(name)
+                    continue
+
+            # Start a new group (HumanMessage or AIMessage without pending tool_calls)
+            if current_group is not None:
+                pass  # Already appended
+            current_group = {
+                "texts": [text],
+                "message_types": {msg_type},
+                "tool_names": set(),
+                "turn_index": idx,
+            }
+            groups.append(current_group)
+
+        if not groups:
+            return []
+
+        # Phase 2: Merge short groups (<50 tokens)
+        merged_groups: list[dict[str, Any]] = []
+        buffer: dict[str, Any] | None = None
+
+        for group in groups:
+            group_text = "\n".join(group["texts"])
+            token_count = self._token_estimator.estimate(group_text)
+
+            if buffer is None:
+                buffer = {
+                    "texts": list(group["texts"]),
+                    "message_types": set(group["message_types"]),
+                    "tool_names": set(group["tool_names"]),
+                    "turn_index": group["turn_index"],
+                    "token_count": token_count,
+                }
+            elif buffer["token_count"] < 50:
+                # Buffer is short (<50 tokens) — merge with current group
+                buffer["texts"].extend(group["texts"])
+                buffer["message_types"].update(group["message_types"])
+                buffer["tool_names"].update(group["tool_names"])
+                buffer["token_count"] += token_count
+            else:
+                merged_groups.append(buffer)
+                buffer = {
+                    "texts": list(group["texts"]),
+                    "message_types": set(group["message_types"]),
+                    "tool_names": set(group["tool_names"]),
+                    "turn_index": group["turn_index"],
+                    "token_count": token_count,
+                }
+
+        if buffer is not None:
+            merged_groups.append(buffer)
+
+        # Phase 3 & 4: Split oversized + build RawChunks
+        chunks: list[RawChunk] = []
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Extract step title from plan if available
+        step_title = ""
+        if plan is not None and hasattr(plan, "steps") and plan.steps:
+            # Use the first completed step's description as context
+            for s in plan.steps:
+                if s.status == ExecutionStatus.COMPLETED:
+                    step_title = s.description
+                    break
+
+        for group in merged_groups:
+            content = "\n".join(group["texts"])
+            token_count = group.get("token_count") or self._token_estimator.estimate(content)
+
+            if token_count > 500:
+                # Split oversized
+                parts = self._split_with_overlap(content, target_tokens=250)
+            else:
+                parts = [content]
+
+            for part in parts:
+                if not part.strip():
+                    continue
+                content_hash = hashlib.sha256(part.encode("utf-8")).hexdigest()
+                meta: dict[str, Any] = {
+                    "turn_index": group["turn_index"],
+                    "message_types": sorted(group["message_types"]),
+                    "created_at": now_iso,
+                }
+                if step_title:
+                    meta["step_title"] = step_title
+                tool_names = group.get("tool_names", set())
+                if tool_names:
+                    meta["tool_names"] = sorted(tool_names)
+
+                chunks.append(RawChunk(
+                    content=part,
+                    session_id=self._session_id,
+                    user_id=self._user_id,
+                    source="session_flush",
+                    metadata=meta,
+                    content_hash=content_hash,
+                ))
+
+        return chunks
+
+    def _split_with_overlap(self, text: str, target_tokens: int = 250) -> list[str]:
+        """Split text on paragraph boundaries with ~50 token overlap.
+
+        Returns a list of text segments. Short texts are returned as-is.
+        """
+        estimated_tokens = self._token_estimator.estimate(text)
+        if estimated_tokens <= target_tokens:
+            return [text]
+
+        paragraphs = text.split("\n\n")
+        if len(paragraphs) <= 1:
+            # No paragraph boundaries — fall back to character-level splitting
+            return self._split_by_chars(text, target_tokens)
+
+        OVERLAP_TOKENS = 50
+        segments: list[str] = []
+        current_parts: list[str] = []
+        current_tokens = 0
+
+        for para in paragraphs:
+            para_tokens = self._token_estimator.estimate(para)
+
+            # If a single paragraph exceeds target, sub-split it first
+            if para_tokens > target_tokens:
+                # Flush current buffer before sub-splitting
+                if current_parts:
+                    segments.append("\n\n".join(current_parts))
+                    current_parts = []
+                    current_tokens = 0
+                # Sub-split the oversized paragraph by characters
+                sub_parts = self._split_by_chars(para, target_tokens)
+                segments.extend(sub_parts)
+                continue
+
+            if current_tokens + para_tokens > target_tokens and current_parts:
+                segments.append("\n\n".join(current_parts))
+                # Overlap: keep last paragraph(s) worth ~50 tokens
+                overlap_parts: list[str] = []
+                overlap_tokens = 0
+                for p in reversed(current_parts):
+                    p_tok = self._token_estimator.estimate(p)
+                    if overlap_tokens + p_tok > OVERLAP_TOKENS:
+                        break
+                    overlap_parts.insert(0, p)
+                    overlap_tokens += p_tok
+                current_parts = overlap_parts
+                current_tokens = overlap_tokens
+
+            current_parts.append(para)
+            current_tokens += para_tokens
+
+        if current_parts:
+            segments.append("\n\n".join(current_parts))
+
+        return segments if segments else [text]
+
+    def _split_by_chars(self, text: str, target_tokens: int = 250) -> list[str]:
+        """Fallback split for text without paragraph boundaries.
+
+        Splits on newline or space boundaries, with ~50 token overlap.
+        """
+        # Estimate chars per target — rough heuristic
+        total_tokens = self._token_estimator.estimate(text)
+        if total_tokens <= target_tokens:
+            return [text]
+
+        chars_per_token = len(text) / max(total_tokens, 1)
+        target_chars = int(target_tokens * chars_per_token)
+        overlap_chars = int(50 * chars_per_token)
+
+        segments: list[str] = []
+        start = 0
+        while start < len(text):
+            end = start + target_chars
+            if end >= len(text):
+                segments.append(text[start:])
+                break
+
+            # Try to break at newline or space
+            break_at = text.rfind("\n", start + target_chars // 2, end)
+            if break_at == -1:
+                break_at = text.rfind(" ", start + target_chars // 2, end)
+            if break_at == -1:
+                break_at = end
+
+            segments.append(text[start:break_at].rstrip())
+            start = max(break_at - overlap_chars, start + 1)
+
+        return segments if segments else [text]
+
+    @staticmethod
+    def _message_to_text(msg: BaseMessage) -> str:
+        """Extract text content from a LangChain BaseMessage."""
+        content = msg.content
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            return " ".join(parts)
+        return ""
 
     @property
     def done(self) -> bool:

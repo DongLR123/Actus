@@ -19,6 +19,7 @@ from app.application.services.continuation_intent_classifier import (
 )
 from app.domain.external.browser import Browser
 from app.domain.external.file_storage import FileStorage
+from app.domain.external.memory_flusher import MemoryFlusher
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 from app.domain.external.task import Task, TaskRunner
@@ -183,8 +184,10 @@ class AgentTaskRunner(TaskRunner):
         checkpointer_pool: object | None = None,  # checkpointer 连接池
         supports_vision: bool = True,  # 模型是否支持视觉/多模态
         file_processor_lookup: object | None = None,  # FileProcessorLookup, file_view 工具的处理器
+        memory_flusher: MemoryFlusher | None = None,  # 记忆刷写调度器
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
+        self._memory_flusher = memory_flusher
         self._file_processor_lookup = file_processor_lookup
         self._agent_config = agent_config
         self._llm = llm
@@ -1754,6 +1757,11 @@ class AgentTaskRunner(TaskRunner):
                     messages_removed=compaction_result.messages_removed,
                     usage_ratio_after=compaction_result.usage_ratio_after,
                 )
+
+        # 7. 读取 flush batch 并提交到后台刷写队列（C5.0）
+        flush_batch = getattr(self._flow, "_pending_flush_batch", None)
+        if flush_batch and self._memory_flusher:
+            self._memory_flusher.submit(flush_batch)
 
     async def _cleanup_tools(self) -> None:
         """清理MCP和A2A工具资源，确保在同一任务上下文中释放

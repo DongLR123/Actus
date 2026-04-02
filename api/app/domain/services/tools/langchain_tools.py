@@ -323,9 +323,26 @@ def _make_file_view_tools(
         if hasattr(mime_result, "success") and not mime_result.success:
             raise RuntimeError(f"Cannot access file: {mime_result}")
 
-        mime_type = str(mime_result).strip()
+        # Extract the actual command output from ToolResult.data
+        # ToolResult.data is a dict with keys: returncode, output, etc.
+        mime_type = ""
+        if hasattr(mime_result, "data") and isinstance(mime_result.data, dict):
+            returncode = mime_result.data.get("returncode", -1)
+            output = mime_result.data.get("output", "")
+            if returncode == 0:
+                mime_type = output.strip()
+            elif returncode in {126, 127}:
+                # `file` command not found / not executable — fall through to extension
+                pass
+            else:
+                # Real command error (file not found, permission denied, etc.)
+                raise RuntimeError(
+                    f"Cannot detect file type: {output.strip() or mime_result}"
+                )
+        else:
+            mime_type = str(mime_result).strip()
 
-        # Fallback to extension when `file` returns generic/empty type
+        # Fallback to extension when `file` unavailable or returns generic/empty type
         if not mime_type or mime_type == "application/octet-stream":
             ext = "." + filepath.rsplit(".", 1)[-1].lower() if "." in filepath else ""
             mime_type = _EXT_MIME_MAP.get(ext, mime_type or "application/octet-stream")
