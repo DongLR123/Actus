@@ -3,6 +3,7 @@ import type {
   AgentConfig,
   A2AServersData,
   CreateA2AServerParams,
+  FileUnderstandingConfig,
   InstallSkillParams,
   LLMConfig,
   MCPConfig,
@@ -29,6 +30,14 @@ export const configApi = {
 
   updateAgentConfig: (config: AgentConfig): Promise<AgentConfig> => {
     return post<AgentConfig>("/app-config/agent", config);
+  },
+
+  getFileUnderstandingConfig: (): Promise<FileUnderstandingConfig> => {
+    return get<FileUnderstandingConfig>("/app-config/file-understanding");
+  },
+
+  updateFileUnderstandingConfig: (config: FileUnderstandingConfig): Promise<FileUnderstandingConfig> => {
+    return post<FileUnderstandingConfig>("/app-config/file-understanding", config);
   },
 
   getMCPServers: (): Promise<MCPServersData> => {

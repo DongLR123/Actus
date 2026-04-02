@@ -425,6 +425,17 @@ class ActusResponsesModel(BaseChatModel):
         content = normalized.get("content") or ""
         tool_calls = self._parse_tool_calls(normalized.get("tool_calls"))
 
+        # Validate: entirely empty response is almost always a provider-side
+        # error (e.g. 404 wrapped in 200, or empty output array).
+        # Raise ServerRequestsError so RetryPolicy / fallback can act on it.
+        if not content and not tool_calls:
+            from app.application.errors.exceptions import ServerRequestsError
+
+            raise ServerRequestsError(
+                f"LLM ({self.model_name}) returned empty response "
+                f"(no content, no tool_calls)"
+            )
+
         ai_message = AIMessage(content=content, tool_calls=tool_calls)
         return ChatResult(generations=[ChatGeneration(message=ai_message)])
 

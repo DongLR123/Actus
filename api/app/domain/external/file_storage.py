@@ -18,3 +18,9 @@ class FileStorage(Protocol):
     async def delete_file(self, file_id: str) -> None:
         """根据传递的文件id删除文件"""
         ...
+
+    async def get_presigned_url(
+        self, file: File, expiry_seconds: int = 86400
+    ) -> str | None:
+        """生成文件的预签名访问 URL。不支持时返回 None。"""
+        return None

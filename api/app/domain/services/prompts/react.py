@@ -1,3 +1,10 @@
+# file_view 工具提示（仅在 file_view 可用时注入 executor prompt）
+FILE_VIEW_HINT = (
+    "\n- **文件理解**：遇到图片等非文本文件时，**必须使用 `file_view` 工具**而非 `file_read`。"
+    "\n  `file_view` 会自动识别文件类型并返回你能理解的内容（图片直接展示给你查看等）。"
+    "\n  `file_read` 仅用于文本文件（代码、配置、日志等），对二进制文件会返回乱码。"
+)
+
 # ReActAgent系统提示词模板
 REACT_SYSTEM_PROMPT = """
 你是一个任务执行智能体（Agent）, 你需要按照以下步骤完成任务:

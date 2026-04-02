@@ -181,8 +181,11 @@ class AgentTaskRunner(TaskRunner):
         overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
         summary_llm: BaseChatModel | None = None,  # 摘要生成模型
         checkpointer_pool: object | None = None,  # checkpointer 连接池
+        supports_vision: bool = True,  # 模型是否支持视觉/多模态
+        file_processor_lookup=None,  # FileProcessorLookup | None, file_view 工具的处理器
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
+        self._file_processor_lookup = file_processor_lookup
         self._agent_config = agent_config
         self._llm = llm
         self._uow_factory = uow_factory
@@ -265,6 +268,7 @@ class AgentTaskRunner(TaskRunner):
         self._last_skill_context: str = ""
         self._activated_mcp_tools: set[str] = set()
         self._image_url_map: dict[str, str] = {}  # sandbox filepath → presigned URL
+        self._supports_vision = supports_vision
         self._file_storage = file_storage
         self._overflow_config = overflow_config or ContextOverflowConfig()
         # self._file_repository = file_repository
@@ -288,6 +292,8 @@ class AgentTaskRunner(TaskRunner):
             user_id=self._user_id or "",
             skill_graph_canary_percent=settings.skill_graph_canary_percent,
             checkpointer_pool=checkpointer_pool,
+            supports_vision=supports_vision,
+            file_processor_lookup=file_processor_lookup,
         )
 
     async def _put_and_add_event(
@@ -400,89 +406,139 @@ class AgentTaskRunner(TaskRunner):
 
     # 支持多模态识图的 MIME 类型前缀
     _IMAGE_MIME_PREFIXES = ("image/png", "image/jpeg", "image/gif", "image/webp")
-    # 跳过超过 20MB 的图片（base64 会放大 ~33%，避免过大 payload）
-    _MAX_IMAGE_SIZE = 20 * 1024 * 1024
+    # base64 fallback 大小阈值（对齐 5MB API 硬限，3.75MB raw ≈ 5MB base64）
+    _IMAGE_TARGET_RAW_SIZE = 3_932_160  # 3.75 MB
 
     async def _get_image_presigned_url(self, file: File) -> str | None:
-        """尝试为图片文件生成 presigned URL，供 LLM provider 直接拉取。
+        """Generate presigned URL via FileStorage protocol."""
+        return await self._file_storage.get_presigned_url(file)
 
-        Returns presigned URL string, or None if generation fails.
+    async def _upload_sandbox_file_for_mcp(self, sandbox_path: str) -> str | None:
+        """Download a file from sandbox and upload to storage, returning a presigned URL.
+
+        Used by MCP tool path resolver for agent-generated files (e.g. extracted from zip)
+        that don't have presigned URLs in _image_url_map.
         """
+        import os
+        from fastapi import UploadFile
+        from io import BytesIO
+
         try:
-            minio_store = getattr(self._file_storage, "minio_store", None)
-            bucket = getattr(self._file_storage, "bucket", None)
-            if minio_store and bucket and file.key:
-                url = await minio_store.presigned_get_url(
-                    bucket_name=bucket,
-                    object_name=file.key,
-                    expiry_seconds=24 * 60 * 60,
-                )
-                return url
+            filename = os.path.basename(sandbox_path)
+            # Read file from sandbox
+            result = await self._sandbox.download_file(sandbox_path)
+            if not result or not hasattr(result, "read"):
+                logger.warning("Failed to download sandbox file %s", sandbox_path)
+                return None
+            file_bytes = result.read() if hasattr(result, "read") else result
+
+            # Upload to storage as UploadFile
+            upload = UploadFile(
+                file=BytesIO(file_bytes),
+                filename=filename,
+                size=len(file_bytes),
+            )
+            file_obj = await self._file_storage.upload_file(upload)
+
+            # Get presigned URL
+            url = await self._file_storage.get_presigned_url(file_obj)
+            if url:
+                logger.info("Uploaded sandbox file %s → %s", sandbox_path, url[:80])
+            return url
         except Exception as e:
-            logger.debug("生成图片 presigned URL 失败: %s", e)
-        return None
+            logger.warning("Failed to upload sandbox file %s for MCP: %s", sandbox_path, e)
+            return None
 
     async def _build_image_content_blocks(self, attachments: list) -> list[dict]:
-        """为图片附件构建 OpenAI multimodal content blocks。
+        """为图片附件构建 OpenAI multimodal content blocks + 元数据注入。
 
-        优先使用 presigned URL（请求体更小，兼容性更好）；
-        如果 URL 不可用则回退为 base64 data URL。
-
-        Args:
-            attachments: 同步到沙箱后的 File 对象列表。
-
-        Returns:
-            OpenAI Chat Completions image_url content block 列表。
+        Vision mode (supports_vision=True): 嵌入图片 blocks + 元数据
+        Tool mode (supports_vision=False): 不嵌入图片 blocks，只记录 URL 映射供 MCP 工具使用
         """
         blocks: list[dict] = []
         self._image_url_map.clear()
+
         for attachment in attachments:
             if not isinstance(attachment, File):
                 continue
-            mime = attachment.mime_type or ""
-            if not any(mime.startswith(prefix) for prefix in self._IMAGE_MIME_PREFIXES):
+
+            # Three-state multimodal eligibility check
+            if attachment.multimodal_eligible is False:
                 continue
+            elif attachment.multimodal_eligible is True:
+                pass
+            else:
+                # None: non-image OR pre-migration image → fallback to mime_type
+                mime = attachment.mime_type or ""
+                if not any(mime.startswith(p) for p in self._IMAGE_MIME_PREFIXES):
+                    continue
+
             try:
-                # 优先尝试 presigned URL（不需要下载文件，请求体更小）
+                # Always capture URL mapping (needed for MCP path resolution in both modes)
                 presigned_url = await self._get_image_presigned_url(attachment)
+                if presigned_url and attachment.filepath:
+                    self._image_url_map[attachment.filepath] = presigned_url
+
+                # Tool mode (non-vision model): skip image blocks, only keep URL mapping
+                if not self._supports_vision:
+                    continue
+
+                # Vision mode: embed image blocks
+                w = attachment.width
+                h = attachment.height
+                if w and h and w <= 512 and h <= 512:
+                    detail = "low"
+                else:
+                    detail = "high"
+
                 if presigned_url:
                     blocks.append({
                         "type": "image_url",
+                        "image_url": {"url": presigned_url, "detail": detail},
+                    })
+                else:
+                    # Base64 fallback with tightened guard
+                    file_data, _ = await self._file_storage.download_file(
+                        attachment.id
+                    )
+                    with file_data:
+                        raw_bytes = file_data.read()
+                    if len(raw_bytes) > self._IMAGE_TARGET_RAW_SIZE:
+                        logger.warning(
+                            "图片 %s 过大 (%d bytes)，base64 路径跳过多模态编码",
+                            attachment.id,
+                            len(raw_bytes),
+                        )
+                        continue
+                    mime = attachment.mime_type or "image/png"
+                    b64_data = base64.b64encode(raw_bytes).decode("utf-8")
+                    blocks.append({
+                        "type": "image_url",
                         "image_url": {
-                            "url": presigned_url,
-                            "detail": "high",
+                            "url": f"data:{mime};base64,{b64_data}",
+                            "detail": detail,
                         },
                     })
-                    # 记录 sandbox filepath → presigned URL 映射，
-                    # 供 MCP 工具调用时使用（MCP 服务无法访问沙箱文件系统）
-                    if attachment.filepath:
-                        self._image_url_map[attachment.filepath] = presigned_url
-                    print(f"[DEBUG-IMG] 使用 presigned URL: file={attachment.filename}, "
-                          f"url_prefix={presigned_url[:80]}...", flush=True)
-                    continue
 
-                # 回退：下载文件并编码为 base64
-                file_data, _ = await self._file_storage.download_file(attachment.id)
-                with file_data:
-                    raw_bytes = file_data.read()
-                if len(raw_bytes) > self._MAX_IMAGE_SIZE:
-                    logger.warning(
-                        "图片附件 %s 过大 (%d bytes)，跳过多模态编码",
-                        attachment.id, len(raw_bytes),
-                    )
-                    continue
-                b64_data = base64.b64encode(raw_bytes).decode("utf-8")
-                blocks.append({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime};base64,{b64_data}",
-                        "detail": "high",
-                    },
-                })
-                print(f"[DEBUG-IMG] 使用 base64: file={attachment.filename}, "
-                      f"size={len(raw_bytes)} bytes", flush=True)
+                # Metadata injection (skip for pre-migration images without dimensions)
+                if w and h:
+                    ow = attachment.original_width or w
+                    oh = attachment.original_height or h
+                    source = attachment.filepath or attachment.filename
+                    if ow != w or oh != h:
+                        scale = round(ow / w, 2)
+                        meta_text = (
+                            f"[Image: source: {source}, original {ow}x{oh}, "
+                            f"displayed at {w}x{h}. "
+                            f"Multiply coordinates by {scale:.2f} to map to original image.]"
+                        )
+                    else:
+                        meta_text = f"[Image: source: {source}, {w}x{h}]"
+                    blocks.append({"type": "text", "text": meta_text})
+
             except Exception as e:
                 logger.warning("构建图片内容块失败 (file_id=%s): %s", attachment.id, e)
+
         return blocks
 
     @classmethod
@@ -948,6 +1004,8 @@ class AgentTaskRunner(TaskRunner):
             sandbox=self._sandbox,
             browser=self._browser,
             search_engine=self._search_engine,
+            processor_lookup=self._file_processor_lookup,
+            supports_vision=self._supports_vision,
         )
         groups: dict[str, list[str]] = {}
         for tool in tools:
@@ -1048,11 +1106,15 @@ class AgentTaskRunner(TaskRunner):
             pass
         if mcp_all_names:
             if len(mcp_all_names) <= MCP_AUTO_BIND_THRESHOLD:
-                # Small set: all tools directly bound
-                lines.append(
-                    "- mcp tools: "
-                    + ", ".join(mcp_all_names[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
-                )
+                # Small set: all tools directly bound — group by server for clarity
+                # Parse server name from tool name: mcp_{server}_{tool}
+                server_tools: dict[str, list[str]] = {}
+                for name in mcp_all_names:
+                    parts = name.split("_", 2)  # ["mcp", server, tool...]
+                    server = parts[1] if len(parts) >= 3 else "unknown"
+                    server_tools.setdefault(server, []).append(name)
+                for server, tools in server_tools.items():
+                    lines.append(f"- mcp ({server}): {', '.join(tools)}")
             else:
                 # Large set: discovery mode
                 always_bind_names = list(self._get_always_bind_tool_names())
@@ -1175,19 +1237,28 @@ class AgentTaskRunner(TaskRunner):
         lc_tools = create_native_tools(
             sandbox=self._sandbox, browser=self._browser,
             search_engine=self._search_engine,
+            processor_lookup=self._file_processor_lookup,
+            supports_vision=self._supports_vision,
         )
         # MCP: progressive loading with auto-bind threshold
         # When total MCP tools ≤ threshold, bind all directly (skip discovery overhead)
         # When > threshold, only bind always_bind + activated tools
         MCP_AUTO_BIND_THRESHOLD = 15
         all_mcp_tools = self._mcp_tool.get_tools()
+        # URL map ref + sandbox uploader: MCP tools auto-resolve sandbox paths → presigned URLs
+        _url_map_ref = lambda: self._image_url_map
+        _sandbox_uploader = self._upload_sandbox_file_for_mcp
         if len(all_mcp_tools) <= MCP_AUTO_BIND_THRESHOLD:
-            # Small tool set: bind all directly, no discovery needed
-            lc_tools.extend(create_mcp_langchain_tools(self._mcp_tool, tool_names=None))
+            lc_tools.extend(create_mcp_langchain_tools(
+                self._mcp_tool, tool_names=None,
+                url_map_ref=_url_map_ref, sandbox_file_uploader=_sandbox_uploader,
+            ))
         else:
-            # Large tool set: progressive loading
             mcp_bind_names = self._get_always_bind_tool_names() | self._activated_mcp_tools
-            lc_tools.extend(create_mcp_langchain_tools(self._mcp_tool, tool_names=mcp_bind_names))
+            lc_tools.extend(create_mcp_langchain_tools(
+                self._mcp_tool, tool_names=mcp_bind_names,
+                url_map_ref=_url_map_ref, sandbox_file_uploader=_sandbox_uploader,
+            ))
             # Discovery tools only needed for large tool sets
             from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
             lc_tools.extend(create_mcp_discovery_tools(

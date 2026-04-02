@@ -11,6 +11,7 @@ from app.domain.models.app_config import (
     A2AServerConfig,
     AgentConfig,
     AppConfig,
+    FileUnderstandingConfig,
     LLMConfig,
     MCPConfig,
     SkillRiskPolicy,
@@ -86,6 +87,25 @@ class AppConfigService:
         app_config.skill_risk_policy = policy
         self.app_config_repository.save(app_config)
         return app_config.skill_risk_policy
+
+    async def get_file_understanding_config(self) -> FileUnderstandingConfig:
+        """获取文件理解配置"""
+        app_config = await self._load_app_config()
+        return app_config.file_understanding
+
+    async def update_file_understanding_config(
+        self, config: FileUnderstandingConfig
+    ) -> FileUnderstandingConfig:
+        """更新文件理解配置"""
+        app_config = await self._load_app_config()
+        # 保留已有 api_key（前端提交空字符串表示不更新）
+        if not config.vision_fallback.api_key.strip():
+            config.vision_fallback.api_key = app_config.file_understanding.vision_fallback.api_key
+        if not config.audio.openai_api_key.strip():
+            config.audio.openai_api_key = app_config.file_understanding.audio.openai_api_key
+        app_config.file_understanding = config
+        self.app_config_repository.save(app_config)
+        return app_config.file_understanding
 
     async def update_agent_config(self, agent_config: AgentConfig) -> AgentConfig:
         """根据传递的agent_config更新Agent通用配置"""

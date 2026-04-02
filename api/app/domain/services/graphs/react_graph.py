@@ -14,7 +14,7 @@ import logging
 from typing import Any, TYPE_CHECKING
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool
 from langgraph.graph import END, START, StateGraph
@@ -22,6 +22,7 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import RetryPolicy
 
 from app.application.errors.exceptions import ServerRequestsError
+from app.domain.external.file_processor import FileProcessResult
 from app.domain.models.app_config import AgentConfig
 from app.domain.models.event import (
     MessageEvent,
@@ -40,6 +41,9 @@ logger = logging.getLogger(__name__)
 
 # Max ReAct iterations to prevent infinite loops
 MAX_ITERATIONS = 30
+
+# Max image blocks per file_view call injected into HumanMessage
+_MAX_FILE_VIEW_IMAGES = 10
 
 # Tool name → category mapping (mirrors agent_task_runner._classify_tool_name)
 _TOOL_CATEGORY_PREFIXES = {
@@ -135,9 +139,21 @@ def build_react_graph(
                 )
 
         # 最终回答（无 tool_calls 且有内容）发射 MessageEvent，使前端实时收到
+        # LLM 按 system prompt 要求返回 JSON 格式 {"success","result","attachments"}，
+        # 需要提取 result 字段作为用户可读消息，避免前端显示原始 JSON。
         if not response.tool_calls and response.content:
+            display_message = response.content
+            if isinstance(display_message, str):
+                try:
+                    parsed = json.loads(display_message)
+                    if isinstance(parsed, dict) and "result" in parsed:
+                        extracted = parsed["result"]
+                        if isinstance(extracted, str) and extracted.strip():
+                            display_message = extracted
+                except (json.JSONDecodeError, ValueError):
+                    pass
             new_events.append(
-                MessageEvent(role="assistant", message=response.content)
+                MessageEvent(role="assistant", message=display_message)
             )
 
         return {
@@ -170,6 +186,10 @@ def build_react_graph(
         new_events = []
         should_interrupt = False
         new_failures = 0
+        # Collect multimodal HumanMessages from file_view results.
+        # Appended AFTER all ToolMessages to preserve AIMessage → ToolMessage*
+        # pairing for group_messages() (context_assembler.py).
+        deferred_human_messages: list[HumanMessage] = []
 
         for tc in tool_calls:
             tool_name = tc["name"]
@@ -178,6 +198,7 @@ def build_react_graph(
 
             # ---- message_ask_user: SOFT_HINT gating ---- #
             tool_success = True
+            multimodal_blocks: tuple[dict, ...] = ()
             if tool_name == "message_ask_user":
                 suggest = str(args.get("suggest_user_takeover", "none")).strip().lower()
                 if suggest in {"browser", "shell"}:
@@ -201,15 +222,21 @@ def build_react_graph(
                     tool_success = False
                 else:
                     try:
-                        result_str = await tool_fn.ainvoke(args)
-                        if not isinstance(result_str, str):
-                            result_str = str(result_str)
+                        raw_result = await tool_fn.ainvoke(args)
+                        if isinstance(raw_result, FileProcessResult):
+                            result_str = raw_result.text
+                            multimodal_blocks = raw_result.image_blocks
+                        elif isinstance(raw_result, str):
+                            result_str = raw_result
+                        else:
+                            result_str = str(raw_result)
                     except Exception as exc:
                         result_str = f"Error executing {tool_name}: {exc}"
                         tool_success = False
 
             if not tool_success:
                 new_failures += 1
+                multimodal_blocks = ()
 
             # Prefix error messages so the LLM can clearly identify failures
             content = f"[TOOL_ERROR] {result_str}" if not tool_success else result_str
@@ -230,6 +257,21 @@ def build_react_graph(
                 name=tool_name,
             ))
 
+            # Collect deferred HumanMessage for file_view multimodal results
+            if multimodal_blocks:
+                blocks: list[dict] = list(multimodal_blocks[:_MAX_FILE_VIEW_IMAGES])
+                omitted = len(multimodal_blocks) - len(blocks)
+                # Must include a text block so _compact_messages() and
+                # _flatten_multimodal_content() can extract a meaningful summary
+                # instead of falling back to str(content) JSON garbage.
+                blocks.insert(0, {
+                    "type": "text",
+                    "text": f"[file_view: {tool_name} — {len(blocks)} image(s) loaded]",
+                })
+                if omitted > 0:
+                    blocks.append({"type": "text", "text": f"[... {omitted} more images omitted]"})
+                deferred_human_messages.append(HumanMessage(content=blocks))
+
             # Emit ToolEvent(CALLED) with correct success status
             new_events.append(
                 ToolEvent(
@@ -241,6 +283,10 @@ def build_react_graph(
                     status=ToolEventStatus.CALLED,
                 )
             )
+
+        # Append deferred HumanMessages AFTER all ToolMessages.
+        # Preserves AIMessage → ToolMessage* pairing for group_messages().
+        new_messages.extend(deferred_human_messages)
 
         result: dict = {
             "messages": new_messages,

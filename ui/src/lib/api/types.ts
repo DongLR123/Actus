@@ -86,6 +86,7 @@ export type LLMConfig = {
   base_url: string;
   api_key?: string;
   model_name: string;
+  supports_vision: boolean;
   api_type: "chat_completions" | "responses" | "auto";
   temperature: number;
   max_tokens: number;
@@ -105,6 +106,29 @@ export type AgentConfig = {
   max_iterations: number;
   max_retries: number;
   max_search_results: number;
+};
+
+export type VisionFallbackConfig = {
+  enabled: boolean;
+  base_url: string;
+  api_key?: string;
+  model_name: string;
+};
+
+export type AudioProcessorConfig = {
+  provider: "disabled" | "sandbox_whisper" | "openai_api";
+  openai_api_key?: string;
+};
+
+export type VideoProcessorConfig = {
+  max_keyframes: number;
+  extract_audio: boolean;
+};
+
+export type FileUnderstandingConfig = {
+  vision_fallback: VisionFallbackConfig;
+  audio: AudioProcessorConfig;
+  video: VideoProcessorConfig;
 };
 
 export type ListMCPServerItem = {

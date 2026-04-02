@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import DateTime, ForeignKey, Integer, PrimaryKeyConstraint, String, text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, PrimaryKeyConstraint, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from ...domain.models.file import File
@@ -57,6 +57,21 @@ class FileModel(Base):
         nullable=True,
         index=True,
     )  # 文件所属用户ID
+    width: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+    )  # 压缩后宽度
+    height: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+    )  # 压缩后高度
+    original_width: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+    )  # 原始宽度
+    original_height: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+    )  # 原始高度
+    multimodal_eligible: Mapped[Optional[bool]] = mapped_column(
+        Boolean, nullable=True,
+    )  # 多模态可用性标记
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
         nullable=False,

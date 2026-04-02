@@ -25,6 +25,7 @@ class LLMConfig(BaseModel):
         "chat_completions"  # API 类型: chat_completions / responses / auto（先 chat 失败回退 responses）
     )
     supports_response_format: bool = True  # 是否支持 response_format 参数，部分兼容 API 不支持需设为 False
+    supports_vision: bool = True  # 模型是否支持视觉/多模态输入（图片嵌入），关闭后强制使用 MCP 工具分析图片
     context_overflow_guard_enabled: bool = False  # 是否开启上下文超限治理
     overflow_retry_cap: int = Field(2, ge=0, le=10)  # 超限治理自动重试次数上限
     soft_trigger_ratio: float = Field(
@@ -250,6 +251,37 @@ class SkillRiskPolicy(BaseModel):
         return data
 
 
+class VisionFallbackConfig(BaseModel):
+    """视觉模型 fallback 配置（非多模态主模型时，用此模型描述图片/视频帧）"""
+
+    enabled: bool = False
+    base_url: str = ""
+    api_key: str = ""
+    model_name: str = ""
+
+
+class AudioProcessorConfig(BaseModel):
+    """音频转录处理器配置"""
+
+    provider: str = "disabled"  # sandbox_whisper | openai_api | disabled
+    openai_api_key: str = ""
+
+
+class VideoProcessorConfig(BaseModel):
+    """视频处理器配置"""
+
+    max_keyframes: int = 5
+    extract_audio: bool = True
+
+
+class FileUnderstandingConfig(BaseModel):
+    """文件理解配置（file_view 工具）"""
+
+    vision_fallback: VisionFallbackConfig = VisionFallbackConfig()
+    audio: AudioProcessorConfig = AudioProcessorConfig()
+    video: VideoProcessorConfig = VideoProcessorConfig()
+
+
 class AppConfig(BaseModel):
     """应用配置信息，包含Agent配置、LLM提供商配置、MCP配置、A2A配置"""
 
@@ -258,6 +290,7 @@ class AppConfig(BaseModel):
     mcp_config: MCPConfig  # MCP服务配置
     a2a_config: A2AConfig  # A2A服务配置
     skill_risk_policy: SkillRiskPolicy = SkillRiskPolicy()
+    file_understanding: FileUnderstandingConfig = FileUnderstandingConfig()
 
     # Pydantic配置，允许传递额外的字段初始化
     model_config = ConfigDict(extra="allow")

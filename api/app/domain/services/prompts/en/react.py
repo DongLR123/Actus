@@ -1,3 +1,10 @@
+# file_view tool hint (injected into executor prompt only when file_view is available)
+FILE_VIEW_HINT = (
+    "\n- **File understanding**: For image files, **use `file_view`** instead of `file_read`."
+    "\n  `file_view` automatically detects the file type and returns content you can understand."
+    "\n  `file_read` is only for text files (code, configs, logs) — it returns garbled output for binary files."
+)
+
 # ReActAgent系统提示词模板
 REACT_SYSTEM_PROMPT = """
 You are a task execution agent, and you need to complete the following steps:

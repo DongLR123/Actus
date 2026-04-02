@@ -15,3 +15,8 @@ class File(BaseModel):
     mime_type: str = ""  # mime-type类型
     size: int = 0  # 文件大小，单位为字节
     user_id: Optional[str] = None  # 文件所属用户ID
+    width: Optional[int] = None  # 压缩后宽度
+    height: Optional[int] = None  # 压缩后高度
+    original_width: Optional[int] = None  # 原始宽度
+    original_height: Optional[int] = None  # 原始高度
+    multimodal_eligible: Optional[bool] = None  # True=可多模态, False=坏图, None=非图片/旧图

@@ -10,6 +10,7 @@ llm_config:
   max_tokens: 8192
   # api_type: chat_completions            # API 类型: chat_completions / responses / auto
   # supports_response_format: true        # 部分兼容 API 不支持 response_format 参数，设为 false 可跳过
+  # supports_vision: true                 # 模型是否支持视觉/多模态（图片嵌入），非视觉模型设为 false 后强制使用 MCP 工具分析图片
   # context_overflow_guard_enabled: false  # 开启上下文超限治理
   # token_estimator: hybrid               # token 估算策略: char(最快) / hybrid(推荐) / provider_api(需安装 tiktoken)
   # token_safety_factor: 1.15             # token 估算安全系数
@@ -124,3 +125,17 @@ skill_risk_policy:
 #   api_key: ""
 #   model: "text-embedding-3-small"
 #   dimensions: 256
+
+# 文件理解配置（file_view 工具）
+# file_understanding:
+#   vision_fallback:                 # 非多模态主模型时的视觉 fallback（独立配置，可使用不同 provider）
+#     enabled: false
+#     base_url: ""                   # 留空则复用主 LLM 的 base_url
+#     api_key: ""                    # 留空则复用主 LLM 的 api_key
+#     model_name: ""                 # 如 gpt-4o-mini
+#   audio:
+#     provider: "disabled"           # sandbox_whisper | openai_api | disabled
+#     openai_api_key: ""
+#   video:
+#     max_keyframes: 5
+#     extract_audio: true

@@ -203,7 +203,19 @@ def get_agent_service(
         skill_service=_build_skill_service(),
     )
 
-    # 3.实例Agent服务并返回
+    # 3.构造 vision fallback model（非多模态主模型时用于描述图片/视频帧）
+    vision_fallback_model = None
+    vf = app_config.file_understanding.vision_fallback
+    if vf.enabled and vf.model_name:
+        from app.domain.models.app_config import LLMConfig as LLMConfigModel
+        vision_llm_config = LLMConfigModel(
+            base_url=vf.base_url or str(app_config.llm_config.base_url),
+            api_key=vf.api_key or app_config.llm_config.api_key,
+            model_name=vf.model_name,
+        )
+        vision_fallback_model = _build_llm(vision_llm_config)
+
+    # 4.实例Agent服务并返回
     return AgentService(
         uow_factory=get_uow,
         llm=llm,
@@ -220,6 +232,9 @@ def get_agent_service(
         skill_creator_service=skill_creator_service,
         summary_llm=summary_llm,
         checkpointer_pool=checkpointer_pool,
+        supports_vision=app_config.llm_config.supports_vision,
+        file_understanding_config=app_config.file_understanding,
+        vision_fallback_model=vision_fallback_model,
         # file_repository=file_repository,
     )
 

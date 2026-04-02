@@ -80,7 +80,11 @@ class PlannerReActFlow(BaseFlow):
         skill_graph_canary_percent: int = 0,
         checkpointer_pool: object | None = None,
         checkpointer: Any = None,
+        supports_vision: bool = True,
+        file_processor_lookup=None,
     ) -> None:
+        self._supports_vision = supports_vision
+        self._file_processor_lookup = file_processor_lookup
         self._uow_factory = uow_factory
         self._session_id = session_id
         self._summary_llm = summary_llm or llm
@@ -176,6 +180,8 @@ class PlannerReActFlow(BaseFlow):
         return create_native_tools(
             sandbox=self._sandbox, browser=self._browser,
             search_engine=self._search_engine,
+            processor_lookup=self._file_processor_lookup,
+            supports_vision=self._supports_vision,
         )
 
     async def _collect_mcp_tools(self) -> list:
@@ -299,6 +305,7 @@ class PlannerReActFlow(BaseFlow):
             agent_config=self._agent_config,
             checkpointer=checkpointer,
             assembler=assembler,
+            supports_vision=self._supports_vision,
         )
         self._graphs_built = True
 
@@ -320,6 +327,46 @@ class PlannerReActFlow(BaseFlow):
                 # 截取前 300 字符以控制 token 消耗
                 line += f"\n  执行结果: {s.result[:300]}"
             lines.append(line)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_fallback_context_from_memory(raw_messages: list[dict]) -> str:
+        """从 Memory 的原始消息中提取简要上下文，作为 summary 不可用时的兜底。
+
+        提取逻辑：取第一条 user 消息（原始需求）和最后一条 assistant 消息
+        （最终结果），拼接为简要回顾。
+        """
+        first_user = ""
+        last_assistant = ""
+        # 收集 tool 消息中提到的文件路径
+        file_paths: list[str] = []
+
+        for msg in raw_messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            if role == "user" and not first_user:
+                first_user = content[:300]
+            elif role == "assistant" and content.strip():
+                last_assistant = content[:300]
+            elif role == "tool" and content:
+                # 从工具结果中提取文件路径（启发式，容忍少量误报）
+                for token in content.split():
+                    cleaned = token.rstrip(",.;:)]}\"'")
+                    if cleaned.startswith("/home/") and "." in cleaned.rsplit("/", 1)[-1]:
+                        file_paths.append(cleaned[:200])
+
+        if not first_user:
+            return ""
+
+        lines = ["### 前一轮上下文（从记忆恢复）"]
+        lines.append(f"- 用户需求：{first_user}")
+        if last_assistant:
+            lines.append(f"- 最终结果：{last_assistant}")
+        if file_paths:
+            unique = list(dict.fromkeys(file_paths))[:10]
+            lines.append(f"- 涉及文件：{', '.join(unique)}")
         return "\n".join(lines)
 
     def _build_context_anchor(self, message: Message) -> str:
@@ -559,7 +606,10 @@ class PlannerReActFlow(BaseFlow):
         image_blocks = getattr(message, "image_content_blocks", [])
         prompt = CREATE_PLAN_PROMPT.format(
             message=message.message,
-            attachments=format_attachments_text(attachments, has_image_blocks=bool(image_blocks)),
+            attachments=format_attachments_text(
+                attachments, has_image_blocks=bool(image_blocks), for_planner=True,
+                supports_vision=self._supports_vision,
+            ),
         )
 
         system_content = PLANNER_SYSTEM_PROMPT
@@ -652,6 +702,7 @@ class PlannerReActFlow(BaseFlow):
                 "skill_context_refresher": self._skill_context_refresher,
                 "react_graph_provider": self._react_graph_provider,
                 "skill_guide_injector": self._skill_guide_injector,
+                "has_file_view": self._file_processor_lookup is not None,
             }
         }
 
@@ -698,6 +749,16 @@ class PlannerReActFlow(BaseFlow):
             # Convert Memory dict messages to LangChain BaseMessage
             raw_messages = memory.get_messages()
             lc_messages = dicts_to_messages(raw_messages) if raw_messages else []
+
+            # Fallback: 当 summary_texts 为空但 Memory 中有历史消息时，
+            # 从 raw messages 中提取简要上下文。这处理以下场景：
+            # - 新任务创建了新的 PlannerReActFlow（self.plan=None）
+            # - 且 DB summary 生成失败（例如 LLM 404）
+            # 此时 raw_messages 是唯一的历史上下文来源。
+            if not summary_texts and raw_messages:
+                fallback = self._build_fallback_context_from_memory(raw_messages)
+                if fallback:
+                    summary_texts.append(fallback)
 
             # 2. Planner-first routing: run planner, check for skill creation intent
             _skill_tools_available = (

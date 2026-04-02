@@ -9,11 +9,13 @@ Usage:
 
 from __future__ import annotations
 
+import shlex
 from typing import List, Literal, Optional, Union
 
 from langchain_core.tools import StructuredTool, tool as lc_tool
 
 from app.domain.external.browser import Browser
+from app.domain.external.file_processor import FileProcessorLookup, FileProcessResult
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 
@@ -284,6 +286,68 @@ def _make_search_tools(search_engine: SearchEngine) -> list[StructuredTool]:
 
 
 # --------------------------------------------------------------------------- #
+# File view tools (multimodal file understanding)
+# --------------------------------------------------------------------------- #
+
+# Extension → MIME fallback (when `file --mime-type` fails or returns generic type)
+_EXT_MIME_MAP = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp",
+    ".pdf": "application/pdf",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+    ".flac": "audio/flac", ".m4a": "audio/mp4",
+    ".mp4": "video/mp4", ".webm": "video/webm", ".avi": "video/x-msvideo",
+    ".mov": "video/quicktime", ".mkv": "video/x-matroska",
+}
+
+
+def _make_file_view_tools(
+    sandbox: Sandbox,
+    processor_lookup: FileProcessorLookup,
+    supports_vision: bool,
+) -> list[StructuredTool]:
+    """Create file_view tool for multimodal file understanding."""
+
+    @lc_tool
+    async def file_view(filepath: str) -> FileProcessResult | str:
+        """View and understand a file's content. Use this for images, PDFs,
+        audio, and video files instead of file_read.
+        Returns the file content in a format the model can understand."""
+
+        # 1. Detect MIME type (sandbox `file` command + extension fallback)
+        mime_result = await sandbox.exec_command(
+            "default", "", f"file --mime-type -b {shlex.quote(filepath)}"
+        )
+
+        # Check for execution failure (path not found, permission denied, etc.)
+        if hasattr(mime_result, "success") and not mime_result.success:
+            raise RuntimeError(f"Cannot access file: {mime_result}")
+
+        mime_type = str(mime_result).strip()
+
+        # Fallback to extension when `file` returns generic/empty type
+        if not mime_type or mime_type == "application/octet-stream":
+            ext = "." + filepath.rsplit(".", 1)[-1].lower() if "." in filepath else ""
+            mime_type = _EXT_MIME_MAP.get(ext, mime_type or "application/octet-stream")
+
+        # 2. Find processor
+        processor = processor_lookup.get_processor(mime_type)
+        if processor is None:
+            return f"Unsupported file type: {mime_type}. Use file_read for text files."
+
+        # 3. Process file — tool_node splits: text → ToolMessage, image_blocks → HumanMessage
+        filename = filepath.rsplit("/", 1)[-1]
+        return await processor.process(
+            sandbox_path=filepath,
+            filename=filename,
+            mime_type=mime_type,
+            supports_vision=supports_vision,
+        )
+
+    return [file_view]
+
+
+# --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
 
@@ -292,6 +356,8 @@ def create_native_tools(
     sandbox: Sandbox,
     browser: Browser,
     search_engine: SearchEngine,
+    processor_lookup: FileProcessorLookup | None = None,
+    supports_vision: bool = True,
 ) -> list[StructuredTool]:
     """Create all native LangChain tools.
 
@@ -300,6 +366,8 @@ def create_native_tools(
     tools: list[StructuredTool] = []
     tools.extend(_make_message_tools())
     tools.extend(_make_file_tools(sandbox))
+    if processor_lookup:
+        tools.extend(_make_file_view_tools(sandbox, processor_lookup, supports_vision))
     tools.extend(_make_shell_tools(sandbox))
     tools.extend(_make_browser_tools(browser))
     tools.extend(_make_search_tools(search_engine))

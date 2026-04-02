@@ -18,26 +18,56 @@ from langchain_core.messages import (
 
 
 _IMAGE_VISION_HINT = (
-    '\n\n【多模态识图提示】上述附件中的图片已直接嵌入本消息中，你可以直接看到图片内容。'
-    '请基于你直接看到的图片进行分析，无需使用 file_read、浏览器或其他工具来查看或打开图片。'
-    '\n【MCP工具注意】如需将图片传递给 MCP 工具，必须使用附件中标注的 external_url（而非沙箱路径），'
+    '\n\n【图片分析提示】上述附件中的图片已直接嵌入本消息中，你可以直接看到图片内容。'
+    '**请直接使用你的视觉能力分析图片**，无需调用任何外部图片分析工具（如 understand_image 等 MCP 工具）。'
+    '你的原生视觉能力足以理解图片内容，直接分析即可，这比通过工具转发更快更准确。'
+    '无需使用 file_read 或浏览器打开图片。'
+)
+
+_IMAGE_TOOL_MODE_HINT = (
+    '\n\n【图片分析提示】上述附件包含图片，但当前模型不支持直接查看图片。'
+    '**你必须使用 MCP 图片分析工具（如 understand_image）来分析图片内容。**'
+    '不要尝试自行描述或猜测图片内容，所有图片理解必须通过工具完成。'
+    '\n【MCP工具注意】将图片传递给 MCP 工具时，必须使用附件中标注的 external_url（而非沙箱路径），'
     '因为 MCP 服务运行在沙箱外部，无法访问沙箱文件系统。'
+    '\n如果没有可用的 MCP 图片分析工具，可使用终端工具（如 python3 + PIL）提取图片基本信息。'
+)
+
+_IMAGE_PLANNER_VISION_HINT = (
+    '\n\n【图片附件提示】上述附件包含图片，但你（规划者）无法直接查看图片内容。'
+    '执行者可以直接看到图片内容（模型原生多模态能力），无需借助外部工具。'
+    '请据此规划步骤：不要生成"等待用户描述图片"之类的步骤，'
+    '也不要在步骤中指定使用特定的图片分析工具（如 understand_image），执行者会自行读取图片。'
+)
+
+_IMAGE_PLANNER_TOOL_HINT = (
+    '\n\n【图片附件提示】上述附件包含图片，但你（规划者）无法直接查看图片内容。'
+    '执行者也无法直接查看图片，需通过 MCP 图片分析工具（如 understand_image）理解图片内容。'
+    '请据此规划步骤，不要生成"等待用户描述图片"之类的步骤。'
 )
 
 
 def format_attachments_text(
     attachments: list[str],
     has_image_blocks: bool = False,
+    for_planner: bool = False,
+    supports_vision: bool = True,
 ) -> str:
-    """Format attachments list as prompt text, with conditional image vision hint.
+    """Format attachments list as prompt text, with conditional image hint.
 
-    When image blocks are present, appends a hint telling the LLM that images
-    are directly embedded in the message and it should analyze them visually
-    instead of trying to open them with tools.
+    Args:
+        has_image_blocks: Whether image content blocks exist for this message.
+        for_planner: If True, use planner-specific hint.
+        supports_vision: If False, use tool-mode hint (model can't see images).
     """
     text = ", ".join(attachments) if attachments else "无"
     if has_image_blocks:
-        text += _IMAGE_VISION_HINT
+        if for_planner:
+            text += _IMAGE_PLANNER_VISION_HINT if supports_vision else _IMAGE_PLANNER_TOOL_HINT
+        elif supports_vision:
+            text += _IMAGE_VISION_HINT
+        else:
+            text += _IMAGE_TOOL_MODE_HINT
     return text
 
 

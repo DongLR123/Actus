@@ -74,9 +74,15 @@ class AgentService:
         skill_creator_service=None,
         summary_llm: BaseChatModel | None = None,
         checkpointer_pool: object | None = None,
+        supports_vision: bool = True,
+        file_understanding_config=None,
+        vision_fallback_model=None,
         # file_repository: FileRepository,
     ) -> None:
         """构造函数，完成Agent服务初始化"""
+        self._supports_vision = supports_vision
+        self._file_understanding_config = file_understanding_config
+        self._vision_fallback_model = vision_fallback_model
         self._uow_factory = uow_factory
         self._uow = uow_factory()
         self._llm = llm
@@ -132,7 +138,31 @@ class AgentService:
             logger.error(f"获取沙箱[{sandbox.id}]中的浏览器实例失败")
             raise RuntimeError(f"获取沙箱[{sandbox.id}]中的浏览器实例失败")
 
-        # 5.创建AgentTaskRunner
+        # 5.构造 file_view 处理器（延迟到此处，因为需要运行时 sandbox + file_storage）
+        file_processor_lookup = None
+        if self._file_understanding_config:
+            from app.infrastructure.external.file_processors.registry import FileProcessorRegistry
+
+            async def _upload_bytes(file_bytes: bytes, filename: str) -> str | None:
+                from io import BytesIO
+                from fastapi import UploadFile
+                try:
+                    upload = UploadFile(file=BytesIO(file_bytes), filename=filename, size=len(file_bytes))
+                    file_obj = await self._file_storage.upload_file(upload)
+                    return await self._file_storage.get_presigned_url(file_obj)
+                except Exception:
+                    logger.warning("file_uploader failed for %s", filename, exc_info=True)
+                    return None
+
+            file_processor_lookup = FileProcessorRegistry(
+                sandbox=sandbox,
+                file_uploader=_upload_bytes,
+                vision_model=self._vision_fallback_model,
+                audio_config=self._file_understanding_config.audio,
+                video_config=self._file_understanding_config.video,
+            )
+
+        # 6.创建AgentTaskRunner
         task_runner = AgentTaskRunner(
             uow_factory=self._uow_factory,
             llm=self._llm,
@@ -152,6 +182,8 @@ class AgentService:
             skill_creator_service=self._skill_creator_service,
             summary_llm=self._summary_llm,
             checkpointer_pool=self._checkpointer_pool,
+            supports_vision=self._supports_vision,
+            file_processor_lookup=file_processor_lookup,
         )
 
         # 6.创建任务Task并更新会话中的信息

@@ -469,6 +469,17 @@ class ActusChatModel(BaseChatModel):
         if not tool_calls and content:
             tool_calls, content = self._extract_tool_calls_from_content(content)
 
+        # Validate: entirely empty response (no content, no tool_calls) is
+        # almost always a provider-side error (e.g. 404 wrapped in 200).
+        # Raise ServerRequestsError so RetryPolicy / fallback can act on it.
+        if not content and not tool_calls:
+            from app.application.errors.exceptions import ServerRequestsError
+
+            raise ServerRequestsError(
+                f"LLM ({self.model_name}) returned empty response "
+                f"(no content, no tool_calls)"
+            )
+
         ai_message = AIMessage(content=content, tool_calls=tool_calls)
         return ChatResult(generations=[ChatGeneration(message=ai_message)])
 
@@ -531,6 +542,7 @@ class ActusChatModel(BaseChatModel):
         else:
             stream = await response
 
+        has_content = False
         async for chunk in stream:
             # Guard against proxies yielding raw strings or malformed chunks
             if not hasattr(chunk, "choices") or not chunk.choices:
@@ -553,6 +565,9 @@ class ActusChatModel(BaseChatModel):
                         "args": fn.arguments if fn and hasattr(fn, "arguments") else "",
                     })
 
+            if content or tool_call_chunks:
+                has_content = True
+
             ai_chunk = AIMessageChunk(
                 content=content,
                 tool_call_chunks=tool_call_chunks if tool_call_chunks else [],
@@ -563,6 +578,15 @@ class ActusChatModel(BaseChatModel):
                 await run_manager.on_llm_new_token(content, chunk=gen_chunk)
 
             yield gen_chunk
+
+        # Validate: stream produced zero useful chunks (same 404-in-200 scenario)
+        if not has_content:
+            from app.application.errors.exceptions import ServerRequestsError
+
+            raise ServerRequestsError(
+                f"LLM ({self.model_name}) stream returned empty response "
+                f"(no content, no tool_calls in any chunk)"
+            )
 
     # ---- bind_tools ------------------------------------------------------ #
 

@@ -117,6 +117,7 @@ def build_main_graph(
     agent_config: AgentConfig | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
     assembler: ContextAssembler | None = None,
+    supports_vision: bool = True,
 ) -> CompiledStateGraph:
     """Build and compile the main orchestration graph.
 
@@ -137,11 +138,13 @@ def build_main_graph(
         """Call planner LLM to create a plan from user message."""
         attachments = state.get("attachments", [])
         image_blocks = state.get("image_content_blocks", [])
-        # Planner 不传图片，因此 has_image_blocks 必须为 False，
-        # 否则附件文本会追加"你可以直接看到图片"的提示，诱导 LLM 幻觉图片内容
+        # Planner 不传图片但需要知道附件包含图片，使用 planner 专用提示
         prompt = CREATE_PLAN_PROMPT.format(
             message=state["message"],
-            attachments=format_attachments_text(attachments, has_image_blocks=False),
+            attachments=format_attachments_text(
+                attachments, has_image_blocks=bool(image_blocks), for_planner=True,
+                supports_vision=supports_vision,
+            ),
         )
 
         # Build system prompt with optional tool summary and conversation summaries
@@ -263,6 +266,13 @@ def build_main_graph(
         skill_context = state.get("skill_context", "")
 
         system_content = REACT_SYSTEM_PROMPT
+
+        # Inject file_view hint when the tool is available
+        has_file_view = (config.get("configurable") or {}).get("has_file_view", False)
+        if has_file_view:
+            from app.domain.services.prompts.react import FILE_VIEW_HINT
+            system_content += FILE_VIEW_HINT
+
         if skill_context:
             system_content += f"\n\n{skill_context}"
 
@@ -310,7 +320,10 @@ def build_main_graph(
             ]
         else:
             # 首步/无历史：干净的 system + execution prompt（含图片多模态内容）
-            attachments_text = format_attachments_text(attachments, has_image_blocks=bool(image_blocks))
+            attachments_text = format_attachments_text(
+                attachments, has_image_blocks=bool(image_blocks),
+                supports_vision=supports_vision,
+            )
             execution_text = EXECUTION_PROMPT.format(
                 message=state["message"],
                 attachments=attachments_text,
