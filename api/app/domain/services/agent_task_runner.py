@@ -182,7 +182,7 @@ class AgentTaskRunner(TaskRunner):
         summary_llm: BaseChatModel | None = None,  # 摘要生成模型
         checkpointer_pool: object | None = None,  # checkpointer 连接池
         supports_vision: bool = True,  # 模型是否支持视觉/多模态
-        file_processor_lookup=None,  # FileProcessorLookup | None, file_view 工具的处理器
+        file_processor_lookup: object | None = None,  # FileProcessorLookup, file_view 工具的处理器
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
         self._file_processor_lookup = file_processor_lookup

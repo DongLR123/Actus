@@ -81,7 +81,7 @@ class PlannerReActFlow(BaseFlow):
         checkpointer_pool: object | None = None,
         checkpointer: Any = None,
         supports_vision: bool = True,
-        file_processor_lookup=None,
+        file_processor_lookup: Any = None,  # FileProcessorLookup | None
     ) -> None:
         self._supports_vision = supports_vision
         self._file_processor_lookup = file_processor_lookup
