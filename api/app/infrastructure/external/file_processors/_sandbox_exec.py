@@ -47,8 +47,9 @@ async def exec_and_wait(
 
     status = data.get("status", "unknown")
 
-    # If already completed, return immediately
-    if status == "completed":
+    # If completed OR status not present (e.g. mock/old sandbox that doesn't
+    # return status field — treat as completed if returncode is present)
+    if status == "completed" or (status == "unknown" and data.get("returncode") is not None):
         return {
             "returncode": data.get("returncode") if data.get("returncode") is not None else -1,
             "output": data.get("output") or "",
