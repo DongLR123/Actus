@@ -123,7 +123,7 @@ class PdfFileProcessor:
             )
             if hasattr(result, "data") and isinstance(result.data, dict):
                 if result.data.get("returncode", -1) == 0:
-                    return int(result.data.get("output", "").strip())
+                    return int((result.data.get("output") or "").strip())
         except Exception:
             pass
         return None
@@ -176,26 +176,30 @@ class PdfFileProcessor:
         script_path = "/tmp/_pdf_extract.py"
 
         try:
+            from app.infrastructure.external.file_processors._sandbox_exec import exec_and_wait
+
             await self._sandbox.write_file(script_path, _PDF_EXTRACT_SCRIPT)
             safe_args = f"{shlex.quote(sandbox_path)} {shlex.quote(work_dir)}"
-            result = await asyncio.wait_for(
-                self._sandbox.exec_command(
-                    "default", "", f"python3 {shlex.quote(script_path)} {safe_args}"
-                ),
-                timeout=120.0,
-            )
+            cmd = f"python3 {shlex.quote(script_path)} {safe_args}"
+            exec_result = await exec_and_wait(self._sandbox, cmd, timeout=120.0)
 
-            output = ""
-            if hasattr(result, "data") and isinstance(result.data, dict):
-                if result.data.get("returncode", -1) != 0:
-                    error = result.data.get("output", "")[:500]
-                    return FileProcessResult(
-                        text=f"[PDF: {filename} — extraction failed: {error}]"
-                    )
-                output = result.data.get("output", "")
-            else:
-                output = str(result)
+            if exec_result["returncode"] != 0:
+                error = exec_result["output"][:500]
+                return FileProcessResult(
+                    text=f"[PDF: {filename} — extraction failed (rc={exec_result['returncode']}): {error}]"
+                )
+            output = exec_result["output"]
+            if not output.strip():
+                return FileProcessResult(
+                    text=f"[PDF: {filename} — extraction returned empty output "
+                    f"(status={exec_result.get('status', '?')}, rc={exec_result['returncode']})]"
+                )
 
+            # Sandbox stdout may contain warnings before the JSON array.
+            # e.g. "onnxruntime cpuid_info warning: ...\n[{...}]"
+            json_start = output.find("[")
+            if json_start > 0:
+                output = output[json_start:]
             pages = json.loads(output)
             if not pages:
                 return FileProcessResult(text=f"[PDF: {filename} — empty document]")

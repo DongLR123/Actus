@@ -346,7 +346,7 @@ def _make_file_view_tools(
         mime_type = ""
         if hasattr(mime_result, "data") and isinstance(mime_result.data, dict):
             returncode = mime_result.data.get("returncode", -1)
-            output = mime_result.data.get("output", "")
+            output = mime_result.data.get("output") or ""
             if returncode == 0:
                 mime_type = output.strip()
             elif returncode in {126, 127}:

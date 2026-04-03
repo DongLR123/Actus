@@ -42,6 +42,17 @@ class AudioFileProcessor:
                 text=f"[Audio: {filename} — audio processing not configured]"
             )
 
+        try:
+            return await self._process_inner(sandbox_path, filename, mime_type)
+        except Exception as e:
+            logger.warning("Audio processing failed for %s: %s", filename, e, exc_info=True)
+            return FileProcessResult(
+                text=f"[Audio: {filename} — processing error: {e}]"
+            )
+
+    async def _process_inner(
+        self, sandbox_path: str, filename: str, mime_type: str,
+    ) -> FileProcessResult:
         # Size preflight (reliable: download + measure, shared across all providers)
         file_io = await self._sandbox.download_file(sandbox_path)
         audio_bytes = file_io.read() if hasattr(file_io, "read") else file_io
@@ -88,7 +99,7 @@ class AudioFileProcessor:
             )
             if hasattr(result, "data") and isinstance(result.data, dict):
                 if result.data.get("returncode", -1) == 0:
-                    raw = result.data.get("output", "").strip()
+                    raw = (result.data.get("output") or "").strip()
                     secs = float(raw)
                     mins, secs_r = divmod(int(secs), 60)
                     hrs, mins_r = divmod(mins, 60)
@@ -124,11 +135,15 @@ class AudioFileProcessor:
             )
             resp.raise_for_status()
             result = resp.json()
+        if not isinstance(result, dict):
+            return "[Transcription failed: unexpected API response format]"
         return self._format_segments(
             result.get("segments", []), result.get("text", "")
         )
 
     async def _transcribe_sandbox(self, sandbox_path: str) -> str:
+        from app.infrastructure.external.file_processors._sandbox_exec import exec_and_wait
+
         # Step 1: ffmpeg preprocessing — convert to WAV 16kHz mono for faster-whisper
         wav_path = f"/tmp/_audio_{uuid.uuid4().hex[:8]}.wav"
         preprocess_cmd = (
@@ -136,29 +151,16 @@ class AudioFileProcessor:
             f"-vn -acodec pcm_s16le -ar 16000 -ac 1 "
             f"{shlex.quote(wav_path)} -y 2>/dev/null"
         )
-        preprocess_result = await asyncio.wait_for(
-            self._sandbox.exec_command("default", "", preprocess_cmd),
-            timeout=60.0,
-        )
-        # Use preprocessed WAV if conversion succeeded, otherwise try original file
-        transcribe_path = sandbox_path
-        if hasattr(preprocess_result, "data") and isinstance(preprocess_result.data, dict):
-            if preprocess_result.data.get("returncode", -1) == 0:
-                transcribe_path = wav_path
-            else:
-                logger.warning("Audio preprocessing failed, using original file")
+        pre_result = await exec_and_wait(self._sandbox, preprocess_cmd, timeout=60.0)
+        transcribe_path = wav_path if pre_result["returncode"] == 0 else sandbox_path
+        if pre_result["returncode"] != 0:
+            logger.warning("Audio preprocessing failed, using original file")
 
         # Step 2: Run faster-whisper transcription
         script_path = "/tmp/_audio_transcribe.py"
         await self._sandbox.write_file(script_path, _WHISPER_SCRIPT)
-        result = await asyncio.wait_for(
-            self._sandbox.exec_command(
-                "default",
-                "",
-                f"python3 {shlex.quote(script_path)} {shlex.quote(transcribe_path)}",
-            ),
-            timeout=300.0,
-        )
+        cmd = f"python3 {shlex.quote(script_path)} {shlex.quote(transcribe_path)}"
+        exec_result = await exec_and_wait(self._sandbox, cmd, timeout=300.0)
 
         # Cleanup preprocessed file
         try:
@@ -166,15 +168,28 @@ class AudioFileProcessor:
         except Exception:
             pass
 
-        if hasattr(result, "data") and isinstance(result.data, dict):
-            if result.data.get("returncode", -1) != 0:
-                error = result.data.get("output", "")[:500]
-                return f"[Transcription failed: {error}]"
-            output = result.data.get("output", "")
-        else:
-            output = str(result)
+        if exec_result["returncode"] != 0:
+            error = exec_result["output"][:500]
+            return f"[Transcription failed (rc={exec_result['returncode']}): {error}]"
+        output = exec_result["output"]
+        if not output.strip():
+            return (
+                f"[Transcription failed: script returned empty output "
+                f"(status={exec_result.get('status', '?')}, rc={exec_result['returncode']}). "
+                f"Possible causes: model download failed, Python version mismatch, or missing dependencies]"
+            )
 
-        data = json.loads(output)
+        # Sandbox stdout may contain warnings/logs before the JSON.
+        # Find the first '{' to locate the JSON object.
+        json_start = output.find("{")
+        if json_start > 0:
+            output = output[json_start:]
+        try:
+            data = json.loads(output)
+        except (json.JSONDecodeError, ValueError) as e:
+            return f"[Transcription failed: invalid output — {e}. Raw: {output[:200]}]"
+        if not isinstance(data, dict):
+            return f"[Transcription failed: unexpected output format]"
         language = data.get("language", "unknown")
         return self._format_segments(data.get("segments", []), language_hint=language)
 

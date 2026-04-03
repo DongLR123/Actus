@@ -362,7 +362,7 @@ class VideoFileProcessor:
         if hasattr(result, "data") and isinstance(result.data, dict):
             rc = result.data.get("returncode", -1)
             if rc != 0:
-                output = result.data.get("output", "")[:200]
+                output = (result.data.get("output") or "")[:200]
                 logger.warning("%s failed (rc=%d): %s", label, rc, output)
                 return False
             return True
@@ -374,7 +374,7 @@ class VideoFileProcessor:
         )
         files: list[str] = []
         if hasattr(ls_result, "data") and isinstance(ls_result.data, dict):
-            output = ls_result.data.get("output", "")
+            output = ls_result.data.get("output") or ""
             files = [f.strip() for f in output.strip().split("\n") if f.strip()]
         return sorted(files)
 
