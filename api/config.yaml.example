@@ -11,6 +11,7 @@ llm_config:
   # api_type: chat_completions            # API 类型: chat_completions / responses / auto
   # supports_response_format: true        # 部分兼容 API 不支持 response_format 参数，设为 false 可跳过
   # supports_vision: true                 # 模型是否支持视觉/多模态（图片嵌入），非视觉模型设为 false 后强制使用 MCP 工具分析图片
+  # supports_pdf_input: false             # 是否支持原生 PDF 文件输入（需要模型支持，如 gpt-4o）
   # context_overflow_guard_enabled: false  # 开启上下文超限治理
   # token_estimator: hybrid               # token 估算策略: char(最快) / hybrid(推荐) / provider_api(需安装 tiktoken)
   # token_safety_factor: 1.15             # token 估算安全系数
@@ -146,9 +147,14 @@ skill_risk_policy:
 #     base_url: ""                   # 留空则复用主 LLM 的 base_url
 #     api_key: ""                    # 留空则复用主 LLM 的 api_key
 #     model_name: ""                 # 如 gpt-4o-mini
+#     api_type: "chat_completions"   # chat_completions / responses / auto
 #   audio:
 #     provider: "disabled"           # sandbox_whisper | openai_api | disabled
 #     openai_api_key: ""
+#     openai_base_url: "https://api.openai.com/v1"
+#     openai_model: "whisper-1"
 #   video:
-#     max_keyframes: 5
+#     max_keyframes: 20
 #     extract_audio: true
+#     frame_strategy: "scene"        # scene | uniform
+#     scene_threshold: 0.3           # 场景切换检测阈值（0~1）

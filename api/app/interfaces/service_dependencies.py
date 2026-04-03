@@ -115,7 +115,7 @@ def _load_app_config():
     return app_config_repository.load()
 
 
-def _build_llm(llm_config: LLMConfig) -> BaseChatModel:
+def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> BaseChatModel:
     """根据 api_type 配置构建 LLM 实例。
 
     - chat_completions: 仅用 Chat Completions API
@@ -137,6 +137,8 @@ def _build_llm(llm_config: LLMConfig) -> BaseChatModel:
         temperature=llm_config.temperature,
         max_tokens=llm_config.max_tokens,
         supports_response_format=getattr(llm_config, 'supports_response_format', True),
+        supports_vision=getattr(llm_config, 'supports_vision', True),
+        supports_pdf_input=supports_pdf_input,
     )
     responses = ActusResponsesModel(
         base_url=str(llm_config.base_url),
@@ -144,6 +146,8 @@ def _build_llm(llm_config: LLMConfig) -> BaseChatModel:
         model_name=llm_config.model_name,
         temperature=llm_config.temperature,
         max_tokens=llm_config.max_tokens,
+        supports_vision=getattr(llm_config, 'supports_vision', True),
+        supports_pdf_input=supports_pdf_input,
     )
     if llm_config.api_type == "responses":
         return responses
@@ -191,7 +195,11 @@ def get_agent_service(
     overflow_config = ContextOverflowConfig.from_llm_config(app_config.llm_config)
 
     # 2.构建依赖实例
-    llm = _build_llm(app_config.llm_config)
+    effective_pdf_input = (
+        getattr(app_config.llm_config, 'supports_pdf_input', False)
+        and app_config.llm_config.supports_vision
+    )
+    llm = _build_llm(app_config.llm_config, supports_pdf_input=effective_pdf_input)
     summary_llm = None
     if app_config.agent_config.memory.summary_model:
         summary_llm_config = app_config.llm_config.model_copy(
@@ -218,6 +226,8 @@ def get_agent_service(
             base_url=vf.base_url or str(app_config.llm_config.base_url),
             api_key=vf.api_key or app_config.llm_config.api_key,
             model_name=vf.model_name,
+            api_type=vf.api_type,
+            supports_vision=True,  # Force: fallback model MUST support vision
         )
         vision_fallback_model = _build_llm(vision_llm_config)
 
@@ -239,6 +249,7 @@ def get_agent_service(
         summary_llm=summary_llm,
         checkpointer_pool=checkpointer_pool,
         supports_vision=app_config.llm_config.supports_vision,
+        supports_pdf_input=effective_pdf_input,
         file_understanding_config=app_config.file_understanding,
         vision_fallback_model=vision_fallback_model,
         memory_flusher=flush_service,

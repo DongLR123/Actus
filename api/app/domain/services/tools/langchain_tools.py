@@ -21,7 +21,10 @@ from app.domain.external.search import SearchEngine
 
 
 def _unwrap(result: object) -> str:
-    """Convert a ToolResult to string, raising on failure.
+    """Extract business payload from a ToolResult, raising on failure.
+
+    ToolResult has {success, message, data}. The model should see `data`
+    (the actual tool output), not the Pydantic repr of the wrapper.
 
     If ``result`` has ``success=False``, raise so that the caller (ToolNode or
     react_graph tool_node) can handle the error structurally rather than relying
@@ -29,6 +32,20 @@ def _unwrap(result: object) -> str:
     """
     if hasattr(result, "success") and not result.success:
         raise RuntimeError(getattr(result, "message", None) or str(result))
+    # Extract .data (the actual payload); fall back to .message then str()
+    if hasattr(result, "data") and result.data is not None:
+        data = result.data
+        if isinstance(data, str):
+            return data
+        if isinstance(data, dict):
+            # Common sandbox pattern: {"returncode": 0, "output": "..."}
+            if "output" in data:
+                return str(data["output"])
+            import json
+            return json.dumps(data, ensure_ascii=False)
+        return str(data)
+    if hasattr(result, "message") and result.message:
+        return result.message
     return str(result)
 
 
@@ -305,6 +322,7 @@ def _make_file_view_tools(
     sandbox: Sandbox,
     processor_lookup: FileProcessorLookup,
     supports_vision: bool,
+    supports_pdf_input: bool = False,
 ) -> list[StructuredTool]:
     """Create file_view tool for multimodal file understanding."""
 
@@ -359,6 +377,7 @@ def _make_file_view_tools(
             filename=filename,
             mime_type=mime_type,
             supports_vision=supports_vision,
+            supports_pdf_input=supports_pdf_input,
         )
 
     return [file_view]
@@ -375,6 +394,7 @@ def create_native_tools(
     search_engine: SearchEngine,
     processor_lookup: FileProcessorLookup | None = None,
     supports_vision: bool = True,
+    supports_pdf_input: bool = False,
 ) -> list[StructuredTool]:
     """Create all native LangChain tools.
 
@@ -384,7 +404,7 @@ def create_native_tools(
     tools.extend(_make_message_tools())
     tools.extend(_make_file_tools(sandbox))
     if processor_lookup:
-        tools.extend(_make_file_view_tools(sandbox, processor_lookup, supports_vision))
+        tools.extend(_make_file_view_tools(sandbox, processor_lookup, supports_vision, supports_pdf_input))
     tools.extend(_make_shell_tools(sandbox))
     tools.extend(_make_browser_tools(browser))
     tools.extend(_make_search_tools(search_engine))

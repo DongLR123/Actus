@@ -65,6 +65,19 @@ ENV PIP_INDEX_URL=${PYTHON_PACKAGE_INDEX_URL}
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
+# 12a.安装 PDF 处理依赖
+RUN pip install --no-cache-dir pymupdf4llm
+
+# 12b.安装音频/视频处理依赖
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+
+# 12c.可选：sandbox 本地 Whisper 转录（仅当 audio.provider=sandbox_whisper 时需要）
+# 通过 build arg 控制，避免默认镜像膨胀 ~500MB
+ARG INSTALL_WHISPER=false
+RUN if [ "$INSTALL_WHISPER" = "true" ]; then \
+      pip install --no-cache-dir faster-whisper; \
+    fi
+
 # 13.拷贝当前整个项目文件
 COPY . .
 

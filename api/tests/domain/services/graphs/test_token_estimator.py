@@ -458,8 +458,9 @@ class TestEstimateMessageImageBlock:
         )
 
         est = TokenEstimator(strategy="hybrid")
+        # Use a presigned URL (not data URL) to get the fixed IMAGE_TOKEN_ESTIMATE fallback
         msg = HumanMessage(
-            content=[{"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}}]
+            content=[{"type": "image_url", "image_url": {"url": "https://minio.example.com/img.png"}}]
         )
         assert est.estimate_message(msg) == IMAGE_TOKEN_ESTIMATE + MESSAGE_OVERHEAD_TOKENS
 
@@ -471,10 +472,11 @@ class TestEstimateMessageImageBlock:
         )
 
         est = TokenEstimator(strategy="hybrid")
+        # Use a presigned URL (not data URL) to get the fixed IMAGE_TOKEN_ESTIMATE fallback
         msg = HumanMessage(
             content=[
                 {"type": "text", "text": "Look at this image:"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+                {"type": "image_url", "image_url": {"url": "https://minio.example.com/img.png"}},
             ]
         )
         text_tokens = est.estimate("Look at this image:")
@@ -498,6 +500,7 @@ class TestCheckOverflowWiring:
         overflow = ContextOverflowConfig(
             context_overflow_guard_enabled=True,
             context_window=2048,
+            soft_trigger_ratio=0.5,
             hard_trigger_ratio=0.5,
             token_estimator="hybrid",
         )
@@ -534,3 +537,82 @@ class TestCheckOverflowWiring:
         await flow._check_overflow(memory)
 
         mock_uow.session.save_memory.assert_called_once()
+
+
+class TestImageTokenDynamicEstimation:
+    """Tests for dynamic image token estimation (M1b)."""
+
+    def test_data_url_uses_base64_length(self):
+        from app.domain.services.graphs.token_estimator import _estimate_image_tokens
+        import math
+        b64_data = "A" * 1000
+        block = {"image_url": {"url": f"data:image/png;base64,{b64_data}"}}
+        result = _estimate_image_tokens(block)
+        assert result == math.ceil(1000 * 0.125)
+
+    def test_presigned_url_uses_fallback(self):
+        from app.domain.services.graphs.token_estimator import IMAGE_TOKEN_ESTIMATE, _estimate_image_tokens
+        block = {"image_url": {"url": "https://minio.example.com/presigned/img.png"}}
+        result = _estimate_image_tokens(block)
+        assert result == IMAGE_TOKEN_ESTIMATE
+
+    def test_empty_url_uses_fallback(self):
+        from app.domain.services.graphs.token_estimator import IMAGE_TOKEN_ESTIMATE, _estimate_image_tokens
+        block = {"image_url": {"url": ""}}
+        result = _estimate_image_tokens(block)
+        assert result == IMAGE_TOKEN_ESTIMATE
+
+    def test_estimate_message_uses_dynamic_for_data_url(self):
+        from app.domain.services.graphs.token_estimator import TokenEstimator
+        from langchain_core.messages import HumanMessage
+        import math
+        b64_data = "B" * 800
+        msg = HumanMessage(content=[
+            {"type": "text", "text": "look at this"},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_data}"}},
+        ])
+        est = TokenEstimator(strategy="char")
+        tokens = est.estimate_message(msg)
+        expected_image = math.ceil(800 * 0.125)
+        assert tokens < 2000 + 50  # far less than old fixed estimate
+
+    def test_file_block_estimation_scales_with_size(self):
+        from app.domain.services.graphs.token_estimator import TokenEstimator
+        from langchain_core.messages import HumanMessage
+        import base64
+        # ~320KB base64 → ceil(320000/81920) = 4 pages → 8000 tokens
+        raw_bytes = b"\x00" * 240_000
+        b64_data = base64.b64encode(raw_bytes).decode()
+        msg = HumanMessage(content=[
+            {"type": "file", "file": {"filename": "doc.pdf", "file_data": f"data:application/pdf;base64,{b64_data}"}},
+        ])
+        est = TokenEstimator(strategy="char")
+        tokens = est.estimate_message(msg)
+        # ceil(320000/81920) = 4 pages → 4 * 2000 = 8000 (+ overhead)
+        assert tokens >= 8000
+
+    def test_file_block_estimation_uses_ceil_not_floor(self):
+        """Boundary test: just over 1 page threshold should estimate 2 pages, not 1."""
+        from app.domain.services.graphs.token_estimator import TokenEstimator
+        from langchain_core.messages import HumanMessage
+        import base64
+        # 80KB + 1 byte raw → base64 slightly > 80KB → ceil says 2 pages, floor says 1
+        raw_bytes = b"\x00" * (80 * 1024 + 1)
+        b64_data = base64.b64encode(raw_bytes).decode()
+        msg = HumanMessage(content=[
+            {"type": "file", "file": {"filename": "doc.pdf", "file_data": f"data:application/pdf;base64,{b64_data}"}},
+        ])
+        est = TokenEstimator(strategy="char")
+        tokens = est.estimate_message(msg)
+        # ceil says 2 pages → 4000+ tokens; floor would say 1 → only 2000+
+        assert tokens >= 4000
+
+    def test_file_block_no_data_uses_fallback(self):
+        from app.domain.services.graphs.token_estimator import TokenEstimator
+        from langchain_core.messages import HumanMessage
+        msg = HumanMessage(content=[
+            {"type": "file", "file": {"file_id": "file-abc123"}},
+        ])
+        est = TokenEstimator(strategy="char")
+        tokens = est.estimate_message(msg)
+        assert tokens >= 5000

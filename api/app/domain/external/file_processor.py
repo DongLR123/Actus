@@ -4,11 +4,17 @@ from dataclasses import dataclass
 from typing import Protocol
 
 
+# Shared constant: max image blocks per file_view call.
+# Used by react_graph (tool_node truncation) and video processor (self-limiting).
+MAX_FILE_VIEW_IMAGES = 10
+
+
 @dataclass(frozen=True)
 class FileProcessResult:
     """文件处理结果。text 进入 ToolMessage，image_blocks 注入 HumanMessage。"""
     text: str
     image_blocks: tuple[dict, ...] = ()
+    document_blocks: tuple[dict, ...] = ()
 
 
 class FileProcessor(Protocol):
@@ -20,6 +26,7 @@ class FileProcessor(Protocol):
         filename: str,
         mime_type: str,
         supports_vision: bool,
+        supports_pdf_input: bool = False,
     ) -> FileProcessResult: ...
 
 

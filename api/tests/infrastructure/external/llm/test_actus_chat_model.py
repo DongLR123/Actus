@@ -310,6 +310,21 @@ class TestAGenerate:
         call_kwargs = mock_client.chat.completions.create.call_args.kwargs
         assert call_kwargs["tool_choice"] == "auto"
 
+    async def test_tool_choice_any_normalized_to_required(self, model: ActusChatModel) -> None:
+        """LangChain's 'any' tool_choice should be normalized to 'required' for OpenAI API."""
+        mock_response = _make_chat_completion(content="ok")
+        mock_client = AsyncMock()
+        mock_client.chat.completions.create = AsyncMock(return_value=mock_response)
+
+        with patch.object(model, "_get_client", return_value=mock_client):
+            await model._agenerate(
+                [HumanMessage(content="hi")],
+                tool_choice="any",
+            )
+
+        call_kwargs = mock_client.chat.completions.create.call_args.kwargs
+        assert call_kwargs["tool_choice"] == "required"
+
 
 class TestBindTools:
     """Test bind_tools returns new instance with tools bound."""

@@ -76,6 +76,7 @@ class AgentService:
         summary_llm: BaseChatModel | None = None,
         checkpointer_pool: object | None = None,
         supports_vision: bool = True,
+        supports_pdf_input: bool = False,
         file_understanding_config=None,
         vision_fallback_model=None,
         memory_flusher: MemoryFlusher | None = None,
@@ -84,6 +85,7 @@ class AgentService:
         """构造函数，完成Agent服务初始化"""
         self._memory_flusher = memory_flusher
         self._supports_vision = supports_vision
+        self._supports_pdf_input = supports_pdf_input
         self._file_understanding_config = file_understanding_config
         self._vision_fallback_model = vision_fallback_model
         self._uow_factory = uow_factory
@@ -186,6 +188,7 @@ class AgentService:
             summary_llm=self._summary_llm,
             checkpointer_pool=self._checkpointer_pool,
             supports_vision=self._supports_vision,
+            supports_pdf_input=self._supports_pdf_input,
             file_processor_lookup=file_processor_lookup,
             memory_flusher=self._memory_flusher,
         )

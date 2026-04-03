@@ -183,6 +183,7 @@ class AgentTaskRunner(TaskRunner):
         summary_llm: BaseChatModel | None = None,  # 摘要生成模型
         checkpointer_pool: object | None = None,  # checkpointer 连接池
         supports_vision: bool = True,  # 模型是否支持视觉/多模态
+        supports_pdf_input: bool = False,  # 是否支持原生 PDF 文件输入
         file_processor_lookup: object | None = None,  # FileProcessorLookup, file_view 工具的处理器
         memory_flusher: MemoryFlusher | None = None,  # 记忆刷写调度器
     ) -> None:
@@ -272,6 +273,7 @@ class AgentTaskRunner(TaskRunner):
         self._activated_mcp_tools: set[str] = set()
         self._image_url_map: dict[str, str] = {}  # sandbox filepath → presigned URL
         self._supports_vision = supports_vision
+        self._supports_pdf_input = supports_pdf_input
         self._file_storage = file_storage
         self._overflow_config = overflow_config or ContextOverflowConfig()
         # self._file_repository = file_repository
@@ -296,6 +298,7 @@ class AgentTaskRunner(TaskRunner):
             skill_graph_canary_percent=settings.skill_graph_canary_percent,
             checkpointer_pool=checkpointer_pool,
             supports_vision=supports_vision,
+            supports_pdf_input=supports_pdf_input,
             file_processor_lookup=file_processor_lookup,
         )
 
@@ -1009,6 +1012,7 @@ class AgentTaskRunner(TaskRunner):
             search_engine=self._search_engine,
             processor_lookup=self._file_processor_lookup,
             supports_vision=self._supports_vision,
+            supports_pdf_input=self._supports_pdf_input,
         )
         groups: dict[str, list[str]] = {}
         for tool in tools:
@@ -1242,6 +1246,7 @@ class AgentTaskRunner(TaskRunner):
             search_engine=self._search_engine,
             processor_lookup=self._file_processor_lookup,
             supports_vision=self._supports_vision,
+            supports_pdf_input=self._supports_pdf_input,
         )
         # MCP: progressive loading with auto-bind threshold
         # When total MCP tools ≤ threshold, bind all directly (skip discovery overhead)

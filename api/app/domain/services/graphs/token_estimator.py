@@ -6,6 +6,7 @@ See spec: docs/superpowers/specs/2026-03-30-token-estimator-upgrade-design.md
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Literal
 
@@ -25,6 +26,16 @@ CHARS_PER_TOKEN_SIMPLE = 3
 # --- message structure overhead ---
 MESSAGE_OVERHEAD_TOKENS = 3
 IMAGE_TOKEN_ESTIMATE = 2000
+
+
+def _estimate_image_tokens(block: dict) -> int:
+    """Estimate tokens for a single image_url block."""
+    url = block.get("image_url", {}).get("url", "")
+    if url.startswith("data:") and ";base64," in url:
+        b64_data = url.split(";base64,", 1)[1]
+        return math.ceil(len(b64_data) * 0.125)
+    return IMAGE_TOKEN_ESTIMATE
+
 
 # --- CJK Unicode ranges ---
 _CJK_RANGES = (
@@ -115,7 +126,23 @@ class TokenEstimator:
             for block in content:
                 if isinstance(block, dict):
                     if block.get("type") == "image_url":
-                        tokens += IMAGE_TOKEN_ESTIMATE
+                        tokens += _estimate_image_tokens(block)
+                    elif block.get("type") == "file":
+                        # Only handles internal unified format (Chat Completions type=file).
+                        # Anthropic type=document uses a different schema and should
+                        # not appear here — Actus normalizes to type=file internally.
+                        file_data = block.get("file", {}).get("file_data", "")
+                        if file_data and ";base64," in file_data:
+                            b64_part = file_data.split(";base64,", 1)[1]
+                            # Estimate pages from base64 size.
+                            # A typical PDF page is ~50-100KB raw, ~67-133KB base64.
+                            # Use 80KB base64 per page as midpoint.
+                            # ceil division: bias toward overestimate (safer for overflow guard)
+                            estimated_pages = max(1, -(-len(b64_part) // (80 * 1024)))
+                            # OpenAI: ~1500-3000 tokens/page (text + rendered image).
+                            tokens += estimated_pages * 2000
+                        else:
+                            tokens += 5000
                     elif block.get("type") == "text":
                         tokens += self.estimate(block.get("text", ""))
                     else:

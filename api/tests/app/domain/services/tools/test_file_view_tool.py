@@ -5,7 +5,7 @@ from app.domain.external.file_processor import FileProcessResult
 
 
 class FakeProcessor:
-    async def process(self, sandbox_path, filename, mime_type, supports_vision):
+    async def process(self, sandbox_path, filename, mime_type, supports_vision, supports_pdf_input=False):
         return FileProcessResult(
             text=f"[Image: {filename}, 100x200]",
             image_blocks=({"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},),
@@ -39,7 +39,7 @@ class TestFileViewTool:
         tools = _make_file_view_tools(_make_sandbox_mock(), FakeLookup(), supports_vision=True)
         file_view = tools[0]
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             file_view.ainvoke({"filepath": "/home/ubuntu/test.png"})
         )
         assert isinstance(result, FileProcessResult)
@@ -51,7 +51,7 @@ class TestFileViewTool:
         tools = _make_file_view_tools(_make_sandbox_mock("text/plain"), FakeLookup(), supports_vision=True)
         file_view = tools[0]
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             file_view.ainvoke({"filepath": "/home/ubuntu/readme.txt"})
         )
         assert isinstance(result, str)
@@ -66,7 +66,7 @@ class TestFileViewTool:
         )
         file_view = tools[0]
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             file_view.ainvoke({"filepath": "/home/ubuntu/photo.jpg"})
         )
         # Extension .jpg maps to image/jpeg → FakeLookup matches image/ prefix
@@ -84,7 +84,7 @@ class TestFileViewTool:
         tools = _make_file_view_tools(sandbox, FakeLookup(), supports_vision=True)
         file_view = tools[0]
 
-        result = asyncio.get_event_loop().run_until_complete(
+        result = asyncio.run(
             file_view.ainvoke({"filepath": "/home/ubuntu/upload/photo.png"})
         )
         # .png → image/png → FakeLookup matches image/ prefix
@@ -103,7 +103,7 @@ class TestFileViewTool:
         file_view = tools[0]
 
         with pytest.raises(RuntimeError, match="Cannot detect file type"):
-            asyncio.get_event_loop().run_until_complete(
+            asyncio.run(
                 file_view.ainvoke({"filepath": "/no/such/file.png"})
             )
 

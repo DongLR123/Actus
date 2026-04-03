@@ -129,7 +129,7 @@ class TestVPRealGraphToolNode:
             "llm_input_messages": [],
         }
 
-        final_state = asyncio.get_event_loop().run_until_complete(
+        final_state = asyncio.run(
             graph.ainvoke(initial_state, config={"recursion_limit": 10})
         )
 

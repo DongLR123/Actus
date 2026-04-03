@@ -22,7 +22,7 @@ def test_lc_tool_returns_file_process_result_object():
             image_blocks=({"type": "image_url", "image_url": {"url": "https://example.com/img.png"}},),
         )
 
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         fake_file_view.ainvoke({"filepath": "/tmp/test.png"})
     )
 
@@ -43,7 +43,7 @@ def test_lc_tool_string_return_still_works():
         """Fake tool."""
         return "hello"
 
-    result = asyncio.get_event_loop().run_until_complete(
+    result = asyncio.run(
         fake_tool.ainvoke({"x": "test"})
     )
     assert isinstance(result, str)

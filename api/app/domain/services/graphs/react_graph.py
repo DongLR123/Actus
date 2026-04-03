@@ -9,6 +9,7 @@ Reference: docs/plans/2026-03-10-langchain-langgraph-migration-design.md §4.3-4
 
 from __future__ import annotations
 
+import base64 as _b64
 import json
 import logging
 from typing import Any, TYPE_CHECKING
@@ -42,8 +43,91 @@ logger = logging.getLogger(__name__)
 # Max ReAct iterations to prevent infinite loops
 MAX_ITERATIONS = 30
 
-# Max image blocks per file_view call injected into HumanMessage
-_MAX_FILE_VIEW_IMAGES = 10
+from app.domain.external.file_processor import MAX_FILE_VIEW_IMAGES as _MAX_FILE_VIEW_IMAGES
+
+
+def _extract_shell_images(result_str: str) -> tuple[str, list[dict]]:
+    """Extract base64 image data URLs from shell output.
+
+    Uses str.find() prefix detection + character-set boundary scan.
+    Does NOT use regex (base64 payloads can be megabytes).
+    """
+    if "data:image/" not in result_str:
+        return result_str, []
+
+    _B64_CHARS = frozenset(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+    )
+
+    image_blocks: list[dict] = []
+    cleaned_parts: list[str] = []
+    pos = 0
+
+    while pos < len(result_str) and len(image_blocks) < _MAX_FILE_VIEW_IMAGES:
+        start = result_str.find("data:image/", pos)
+        if start == -1:
+            cleaned_parts.append(result_str[pos:])
+            break
+
+        cleaned_parts.append(result_str[pos:start])
+
+        b64_marker = result_str.find(";base64,", start, start + 50)
+        if b64_marker == -1:
+            cleaned_parts.append(result_str[start:start + 20])
+            pos = start + 20
+            continue
+
+        mime_type = result_str[start + 5:b64_marker]
+
+        # Reject non-raster MIME types (e.g. SVG) — aligned with registry exclusion
+        _ALLOWED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"}
+        if mime_type not in _ALLOWED_IMAGE_MIMES:
+            cleaned_parts.append(result_str[start:b64_marker + 8])
+            pos = b64_marker + 8
+            continue
+
+        data_start = b64_marker + 8
+
+        data_end = data_start
+        while data_end < len(result_str) and result_str[data_end] in _B64_CHARS:
+            data_end += 1
+
+        b64_data = result_str[data_start:data_end]
+
+        # Empty/too-short payload — not a valid image
+        if len(b64_data) < 16:
+            cleaned_parts.append(result_str[start:data_end])
+            pos = data_end
+            continue
+
+        from app.infrastructure.external.llm.message_sanitizer import _MAX_IMAGE_B64_CHARS
+        if len(b64_data) > _MAX_IMAGE_B64_CHARS:
+            cleaned_parts.append("[image too large, skipped]")
+            pos = data_end
+            continue
+
+        try:
+            _b64.b64decode(b64_data, validate=True)
+        except Exception:
+            cleaned_parts.append(result_str[start:data_end])
+            pos = data_end
+            continue
+
+        image_blocks.append({
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:{mime_type};base64,{b64_data}",
+                "detail": "auto",
+            },
+        })
+        cleaned_parts.append("[image extracted]")
+        pos = data_end
+
+    if pos < len(result_str):
+        cleaned_parts.append(result_str[pos:])
+
+    return "".join(cleaned_parts), image_blocks
+
 
 # Tool name → category mapping (mirrors agent_task_runner._classify_tool_name)
 _TOOL_CATEGORY_PREFIXES = {
@@ -190,6 +274,7 @@ def build_react_graph(
         # Appended AFTER all ToolMessages to preserve AIMessage → ToolMessage*
         # pairing for group_messages() (context_assembler.py).
         deferred_human_messages: list[HumanMessage] = []
+        deferred_document_messages: list[HumanMessage] = []
 
         for tc in tool_calls:
             tool_name = tc["name"]
@@ -198,7 +283,7 @@ def build_react_graph(
 
             # ---- message_ask_user: SOFT_HINT gating ---- #
             tool_success = True
-            multimodal_blocks: tuple[dict, ...] = ()
+            multimodal_blocks: list[dict] = []
             if tool_name == "message_ask_user":
                 suggest = str(args.get("suggest_user_takeover", "none")).strip().lower()
                 if suggest in {"browser", "shell"}:
@@ -225,18 +310,26 @@ def build_react_graph(
                         raw_result = await tool_fn.ainvoke(args)
                         if isinstance(raw_result, FileProcessResult):
                             result_str = raw_result.text
-                            multimodal_blocks = raw_result.image_blocks
+                            multimodal_blocks = list(raw_result.image_blocks)
+                            if raw_result.document_blocks:
+                                doc_blocks: list[dict] = list(raw_result.document_blocks)
+                                doc_blocks.insert(0, {"type": "text", "text": "[file_view: PDF document attached]"})
+                                deferred_document_messages.append(HumanMessage(content=doc_blocks))
                         elif isinstance(raw_result, str):
                             result_str = raw_result
                         else:
                             result_str = str(raw_result)
+                        # Shell image detection (M1d)
+                        if tool_name in ("shell_execute", "shell_read_output"):
+                            result_str, shell_images = _extract_shell_images(result_str)
+                            multimodal_blocks.extend(shell_images)
                     except Exception as exc:
                         result_str = f"Error executing {tool_name}: {exc}"
                         tool_success = False
 
             if not tool_success:
                 new_failures += 1
-                multimodal_blocks = ()
+                multimodal_blocks = []
 
             # Prefix error messages so the LLM can clearly identify failures
             content = f"[TOOL_ERROR] {result_str}" if not tool_success else result_str
@@ -287,6 +380,7 @@ def build_react_graph(
         # Append deferred HumanMessages AFTER all ToolMessages.
         # Preserves AIMessage → ToolMessage* pairing for group_messages().
         new_messages.extend(deferred_human_messages)
+        new_messages.extend(deferred_document_messages)
 
         result: dict = {
             "messages": new_messages,

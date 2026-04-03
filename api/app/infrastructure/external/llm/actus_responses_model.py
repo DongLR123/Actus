@@ -62,6 +62,8 @@ class ActusResponsesModel(BaseChatModel):
     model_name: str = "gpt-5.4-pro"
     temperature: float = 0.7
     max_tokens: int = 8192
+    supports_vision: bool = True
+    supports_pdf_input: bool = False
 
     # Tools bound via bind_tools() -- None means no tools bound
     _bound_tools: Optional[list] = None
@@ -158,7 +160,18 @@ class ActusResponsesModel(BaseChatModel):
             if isinstance(msg, SystemMessage):
                 result.append({"role": "system", "content": msg.content})
             elif isinstance(msg, HumanMessage):
-                result.append({"role": "user", "content": msg.content})
+                if isinstance(msg.content, list):
+                    from app.infrastructure.external.llm.message_sanitizer import (
+                        sanitize_multimodal_blocks,
+                    )
+                    content = sanitize_multimodal_blocks(
+                        msg.content,
+                        supports_vision=self.supports_vision,
+                        supports_pdf_input=self.supports_pdf_input,
+                    )
+                    result.append({"role": "user", "content": content})
+                else:
+                    result.append({"role": "user", "content": msg.content})
             elif isinstance(msg, AIMessage):
                 entry: dict[str, Any] = {
                     "role": "assistant",
@@ -205,6 +218,13 @@ class ActusResponsesModel(BaseChatModel):
                 image_url = block.get("image_url", {})
                 url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
                 converted.append({"type": "input_image", "image_url": url})
+            elif block_type == "file":
+                file_info = block.get("file", {})
+                converted.append({
+                    "type": "input_file",
+                    "filename": file_info.get("filename", "document.pdf"),
+                    "file_data": file_info.get("file_data", ""),
+                })
             else:
                 converted.append(block)
         return converted
@@ -400,7 +420,11 @@ class ActusResponsesModel(BaseChatModel):
             logger.info("调用Responses API未携带工具: %s", self.model_name)
 
         # tool_choice: per-call kwarg > bound value from bind_tools
+        # LangChain uses "any" internally (e.g. with_structured_output),
+        # but OpenAI API expects "required" for the same semantics.
         tool_choice = kwargs.get("tool_choice") or self._bound_tool_choice
+        if tool_choice == "any":
+            tool_choice = "required"
         if tool_choice is not None:
             params["tool_choice"] = tool_choice
 
@@ -498,6 +522,8 @@ class ActusResponsesModel(BaseChatModel):
             model_name=self.model_name,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            supports_vision=self.supports_vision,
+            supports_pdf_input=self.supports_pdf_input,
         )
         new_model._bound_tools = responses_format
         # Preserve tool_choice from kwargs (critical for with_structured_output)

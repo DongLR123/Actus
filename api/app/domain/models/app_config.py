@@ -26,6 +26,7 @@ class LLMConfig(BaseModel):
     )
     supports_response_format: bool = True  # 是否支持 response_format 参数，部分兼容 API 不支持需设为 False
     supports_vision: bool = True  # 模型是否支持视觉/多模态输入（图片嵌入），关闭后强制使用 MCP 工具分析图片
+    supports_pdf_input: bool = False  # 是否支持原生 PDF 文件输入
     context_overflow_guard_enabled: bool = False  # 是否开启上下文超限治理
     overflow_retry_cap: int = Field(2, ge=0, le=10)  # 超限治理自动重试次数上限
     soft_trigger_ratio: float = Field(
@@ -265,6 +266,7 @@ class VisionFallbackConfig(BaseModel):
     base_url: str = ""
     api_key: str = ""
     model_name: str = ""
+    api_type: Literal["chat_completions", "responses", "auto"] = "chat_completions"
 
 
 class AudioProcessorConfig(BaseModel):
@@ -272,13 +274,17 @@ class AudioProcessorConfig(BaseModel):
 
     provider: str = "disabled"  # sandbox_whisper | openai_api | disabled
     openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str = "whisper-1"
 
 
 class VideoProcessorConfig(BaseModel):
     """视频处理器配置"""
 
-    max_keyframes: int = 5
+    max_keyframes: int = Field(5, ge=1)
     extract_audio: bool = True
+    frame_strategy: Literal["scene", "uniform"] = "scene"
+    scene_threshold: float = Field(0.3, ge=0.0, le=1.0)
 
 
 class FileUnderstandingConfig(BaseModel):

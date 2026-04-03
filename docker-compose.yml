@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
       args:
         PYTHON_PACKAGE_INDEX_URL: ${PYTHON_PACKAGE_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        INSTALL_WHISPER: ${INSTALL_WHISPER:-false}
     image: ${SANDBOX_IMAGE:-actus-sandbox:latest}
     command: ["/bin/sh", "-c", "echo 'sandbox image is ready'"]
     restart: "no"

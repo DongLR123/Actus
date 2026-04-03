@@ -84,9 +84,11 @@ class PlannerReActFlow(BaseFlow):
         checkpointer_pool: object | None = None,
         checkpointer: Any = None,
         supports_vision: bool = True,
+        supports_pdf_input: bool = False,
         file_processor_lookup: Any = None,  # FileProcessorLookup | None
     ) -> None:
         self._supports_vision = supports_vision
+        self._supports_pdf_input = supports_pdf_input
         self._file_processor_lookup = file_processor_lookup
         self._uow_factory = uow_factory
         self._session_id = session_id
@@ -189,6 +191,7 @@ class PlannerReActFlow(BaseFlow):
             search_engine=self._search_engine,
             processor_lookup=self._file_processor_lookup,
             supports_vision=self._supports_vision,
+            supports_pdf_input=self._supports_pdf_input,
         )
 
     async def _collect_mcp_tools(self) -> list:

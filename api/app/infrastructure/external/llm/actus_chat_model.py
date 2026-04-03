@@ -17,7 +17,7 @@ import json
 import logging
 import re
 import uuid
-from typing import Any, AsyncIterator, Optional
+from typing import Any, AsyncIterator, List, Optional
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForLLMRun,
@@ -58,6 +58,8 @@ class ActusChatModel(BaseChatModel):
     temperature: float = 0.7
     max_tokens: int = 8192
     supports_response_format: bool = True
+    supports_vision: bool = True
+    supports_pdf_input: bool = False
 
     # Tools bound via bind_tools() — None means no tools bound
     _bound_tools: Optional[list[dict[str, Any]]] = None
@@ -93,14 +95,23 @@ class ActusChatModel(BaseChatModel):
                 # content may be str (text) or list[dict] (multimodal with image blocks).
                 # OpenAI Chat Completions API accepts both formats natively.
                 if isinstance(msg.content, list):
-                    block_types = [b.get("type", "?") for b in msg.content if isinstance(b, dict)]
+                    from app.infrastructure.external.llm.message_sanitizer import (
+                        sanitize_multimodal_blocks,
+                    )
+                    content = sanitize_multimodal_blocks(
+                        msg.content,
+                        supports_vision=self.supports_vision,
+                        supports_pdf_input=self.supports_pdf_input,
+                    )
+                    block_types = [b.get("type", "?") for b in content if isinstance(b, dict)]
                     image_count = sum(1 for t in block_types if t == "image_url")
                     logger.info(
-                        "[MULTIMODAL] HumanMessage has %d content blocks (%d images), "
-                        "block_types=%s",
-                        len(msg.content), image_count, block_types,
+                        "[MULTIMODAL] HumanMessage has %d content blocks (%d images), block_types=%s",
+                        len(content), image_count, block_types,
                     )
-                result.append({"role": "user", "content": msg.content})
+                    result.append({"role": "user", "content": content})
+                else:
+                    result.append({"role": "user", "content": msg.content})
             elif isinstance(msg, AIMessage):
                 entry: dict[str, Any] = {
                     "role": "assistant",
@@ -422,7 +433,11 @@ class ActusChatModel(BaseChatModel):
             params["tools"] = all_tools
 
         # tool_choice: per-call kwarg > bound value from bind_tools
+        # LangChain uses "any" internally (e.g. with_structured_output),
+        # but OpenAI API expects "required" for the same semantics.
         tool_choice = kwargs.get("tool_choice") or self._bound_tool_choice
+        if tool_choice == "any":
+            tool_choice = "required"
         if tool_choice is not None:
             params["tool_choice"] = tool_choice
 
@@ -514,7 +529,11 @@ class ActusChatModel(BaseChatModel):
             params["tools"] = all_tools
 
         # tool_choice: per-call kwarg > bound value from bind_tools
+        # LangChain uses "any" internally (e.g. with_structured_output),
+        # but OpenAI API expects "required" for the same semantics.
         tool_choice = kwargs.get("tool_choice") or self._bound_tool_choice
+        if tool_choice == "any":
+            tool_choice = "required"
         if tool_choice is not None:
             params["tool_choice"] = tool_choice
 
@@ -607,6 +626,8 @@ class ActusChatModel(BaseChatModel):
             temperature=self.temperature,
             max_tokens=self.max_tokens,
             supports_response_format=self.supports_response_format,
+            supports_vision=self.supports_vision,
+            supports_pdf_input=self.supports_pdf_input,
         )
         new_model._bound_tools = converted
         new_model._bound_tool_names = frozenset(

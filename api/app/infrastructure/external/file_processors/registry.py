@@ -34,39 +34,31 @@ class FileProcessorRegistry:
             ),
         ))
 
-        try:
-            from app.infrastructure.external.file_processors.pdf import PdfFileProcessor
-            self._processors.append((
-                "application/pdf",
-                PdfFileProcessor(sandbox=sandbox, file_uploader=file_uploader),
-            ))
-        except ImportError:
-            logger.debug("PdfFileProcessor not available, skipping PDF support")
+        from app.infrastructure.external.file_processors.pdf import PdfFileProcessor
+        self._processors.append((
+            "application/pdf",
+            PdfFileProcessor(sandbox=sandbox, file_uploader=file_uploader),
+        ))
 
+        self._audio_processor: AudioFileProcessor | None = None
         if audio_config and getattr(audio_config, "provider", "disabled") != "disabled":
-            try:
-                from app.infrastructure.external.file_processors.audio import AudioFileProcessor
-                self._processors.append((
-                    "audio/",
-                    AudioFileProcessor(sandbox=sandbox, config=audio_config),
-                ))
-            except ImportError:
-                logger.debug("AudioFileProcessor not available, skipping audio support")
+            from app.infrastructure.external.file_processors.audio import AudioFileProcessor
+            audio_proc = AudioFileProcessor(sandbox=sandbox, config=audio_config)
+            self._processors.append(("audio/", audio_proc))
+            self._audio_processor = audio_proc
 
         if video_config:
-            try:
-                from app.infrastructure.external.file_processors.video import VideoFileProcessor
-                self._processors.append((
-                    "video/",
-                    VideoFileProcessor(
-                        sandbox=sandbox,
-                        file_uploader=file_uploader,
-                        audio_config=audio_config,
-                        video_config=video_config,
-                    ),
-                ))
-            except ImportError:
-                logger.debug("VideoFileProcessor not available, skipping video support")
+            from app.infrastructure.external.file_processors.video import VideoFileProcessor
+            self._processors.append((
+                "video/",
+                VideoFileProcessor(
+                    sandbox=sandbox,
+                    file_uploader=file_uploader,
+                    audio_processor=self._audio_processor,
+                    video_config=video_config,
+                    vision_model=vision_model,
+                ),
+            ))
 
     # MIME types that match a prefix but have no working processor
     _EXCLUDED_MIMES = frozenset({"image/svg+xml"})

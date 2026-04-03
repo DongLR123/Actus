@@ -33,7 +33,7 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/hooks/use-auth";
-import type { AgentConfig, FileUnderstandingConfig, LLMConfig, MCPConfig, SkillSourceType } from "@/lib/api/types";
+import type { AgentConfig, FileUnderstandingConfig, LLMConfig, MCPConfig, SkillSourceType, VisionFallbackConfig } from "@/lib/api/types";
 import { normalizeMCPConfigInput } from "@/lib/mcp-config";
 import { useSessionStore } from "@/lib/store/session-store";
 import { useSettingsStore } from "@/lib/store/settings-store";
@@ -127,6 +127,7 @@ export function ManusSettings() {
     api_key: "",
     model_name: "deepseek-reasoner",
     supports_vision: false,
+    supports_pdf_input: false,
     api_type: "chat_completions",
     temperature: 0.7,
     max_tokens: 8192,
@@ -143,9 +144,9 @@ export function ManusSettings() {
   });
 
   const [fileForm, setFileForm] = useState<FileUnderstandingConfig>({
-    vision_fallback: { enabled: false, base_url: "", api_key: "", model_name: "" },
-    audio: { provider: "disabled", openai_api_key: "" },
-    video: { max_keyframes: 5, extract_audio: true },
+    vision_fallback: { enabled: false, base_url: "", api_key: "", model_name: "", api_type: "chat_completions" },
+    audio: { provider: "disabled", openai_api_key: "", openai_base_url: "https://api.openai.com/v1", openai_model: "whisper-1" },
+    video: { max_keyframes: 5, extract_audio: true, frame_strategy: "scene", scene_threshold: 0.3 },
   });
 
   const [mcpPayload, setMcpPayload] = useState(MCP_EXAMPLE);
@@ -528,6 +529,25 @@ export function ManusSettings() {
                         />
                         <span className="text-xs text-muted-foreground">
                           模型支持视觉/多模态输入（图片嵌入）。关闭后将强制使用 MCP 工具分析图片
+                        </span>
+                      </div>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      supports_pdf_input
+                      <div className="mt-2 flex items-center gap-3">
+                        <Switch
+                          className="data-[state=checked]:bg-primary"
+                          checked={llmForm.supports_pdf_input ?? false}
+                          onCheckedChange={(checked) =>
+                            setLLMForm((prev) => ({
+                              ...prev,
+                              supports_pdf_input: checked,
+                            }))
+                          }
+                        />
+                        <span className="text-xs text-muted-foreground">
+                          模型支持原生 PDF 文件输入（仅 OpenAI/Anthropic 原生 API 支持，需同时开启 supports_vision）
                         </span>
                       </div>
                     </label>
@@ -1507,6 +1527,27 @@ export function ManusSettings() {
                               className="mt-1"
                             />
                           </label>
+
+                          <label className="text-sm text-foreground/85">
+                            api_type
+                            <select
+                              value={fileForm.vision_fallback.api_type}
+                              onChange={(e) =>
+                                setFileForm((prev) => ({
+                                  ...prev,
+                                  vision_fallback: {
+                                    ...prev.vision_fallback,
+                                    api_type: e.target.value as VisionFallbackConfig["api_type"],
+                                  },
+                                }))
+                              }
+                              className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                            >
+                              <option value="chat_completions">Chat Completions</option>
+                              <option value="responses">Responses</option>
+                              <option value="auto">Auto (先 Chat 后 Responses)</option>
+                            </select>
+                          </label>
                         </>
                       )}
                     </fieldset>
@@ -1533,20 +1574,50 @@ export function ManusSettings() {
                       </label>
 
                       {fileForm.audio.provider === "openai_api" && (
-                        <label className="text-sm text-foreground/85">
-                          OpenAI API Key
-                          <Input
-                            type="password"
-                            value={fileForm.audio.openai_api_key ?? ""}
-                            onChange={(e) =>
-                              setFileForm((prev) => ({
-                                ...prev,
-                                audio: { ...prev.audio, openai_api_key: e.target.value },
-                              }))
-                            }
-                            className="mt-1"
-                          />
-                        </label>
+                        <>
+                          <label className="text-sm text-foreground/85">
+                            OpenAI API Key
+                            <Input
+                              type="password"
+                              value={fileForm.audio.openai_api_key ?? ""}
+                              onChange={(e) =>
+                                setFileForm((prev) => ({
+                                  ...prev,
+                                  audio: { ...prev.audio, openai_api_key: e.target.value },
+                                }))
+                              }
+                              className="mt-1"
+                            />
+                          </label>
+                          <label className="text-sm text-foreground/85">
+                            Base URL
+                            <Input
+                              value={fileForm.audio.openai_base_url ?? "https://api.openai.com/v1"}
+                              onChange={(e) =>
+                                setFileForm((prev) => ({
+                                  ...prev,
+                                  audio: { ...prev.audio, openai_base_url: e.target.value },
+                                }))
+                              }
+                              placeholder="https://api.openai.com/v1"
+                              className="mt-1"
+                            />
+                          </label>
+                          <label className="text-sm text-foreground/85">
+                            模型名称
+                            <Input
+                              value={fileForm.audio.openai_model ?? "whisper-1"}
+                              onChange={(e) =>
+                                setFileForm((prev) => ({
+                                  ...prev,
+                                  audio: { ...prev.audio, openai_model: e.target.value },
+                                }))
+                              }
+                              placeholder="whisper-1"
+                              className="mt-1"
+                            />
+                          </label>
+                        </>
                       )}
                     </fieldset>
 
@@ -1588,6 +1659,46 @@ export function ManusSettings() {
                           </span>
                         </div>
                       </label>
+
+                      <label className="text-sm text-foreground/85">
+                        帧提取策略
+                        <select
+                          value={fileForm.video.frame_strategy ?? "scene"}
+                          onChange={(e) =>
+                            setFileForm((prev) => ({
+                              ...prev,
+                              video: { ...prev.video, frame_strategy: e.target.value as "scene" | "uniform" },
+                            }))
+                          }
+                          className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                        >
+                          <option value="scene">场景检测</option>
+                          <option value="uniform">均匀采样</option>
+                        </select>
+                      </label>
+
+                      {fileForm.video.frame_strategy === "scene" && (
+                        <label className="text-sm text-foreground/85">
+                          场景检测阈值
+                          <Input
+                            type="number"
+                            min={0.1}
+                            max={0.9}
+                            step={0.05}
+                            value={fileForm.video.scene_threshold ?? 0.3}
+                            onChange={(e) =>
+                              setFileForm((prev) => ({
+                                ...prev,
+                                video: { ...prev.video, scene_threshold: Number(e.target.value) },
+                              }))
+                            }
+                            className="mt-1"
+                          />
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            值越低提取帧越多，推荐 0.3
+                          </p>
+                        </label>
+                      )}
                     </fieldset>
                   </div>
                 </div>

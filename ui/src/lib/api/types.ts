@@ -87,6 +87,7 @@ export type LLMConfig = {
   api_key?: string;
   model_name: string;
   supports_vision: boolean;
+  supports_pdf_input: boolean;
   api_type: "chat_completions" | "responses" | "auto";
   temperature: number;
   max_tokens: number;
@@ -113,16 +114,21 @@ export type VisionFallbackConfig = {
   base_url: string;
   api_key?: string;
   model_name: string;
+  api_type: "chat_completions" | "responses" | "auto";
 };
 
 export type AudioProcessorConfig = {
   provider: "disabled" | "sandbox_whisper" | "openai_api";
   openai_api_key?: string;
+  openai_base_url: string;
+  openai_model: string;
 };
 
 export type VideoProcessorConfig = {
   max_keyframes: number;
   extract_audio: boolean;
+  frame_strategy: "scene" | "uniform";
+  scene_threshold: number;
 };
 
 export type FileUnderstandingConfig = {
