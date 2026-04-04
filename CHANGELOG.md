@@ -2,6 +2,40 @@
 
 本文件记录项目的版本变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [Unreleased] - 2026-04-04
+
+### 新增
+
+- **上下文溢出治理**：两级渐进压缩（85% LLM 摘要 / 95% 硬截断）+ 同步三阶段裁剪（TokenEstimator、ContextAssembler、GradualCompactor）
+- **多模态文件理解**：音频转录（Whisper API / sandbox faster-whisper）、PDF 解析（原生 / pymupdf4llm）、图片处理、视频关键帧提取 + 视觉模型分析
+- **基于 Embedding 的 Skill 语义选择**：numpy 向量索引 + OpenAI Embedding + Redis 缓存
+- **渐进式 MCP 工具发现**：`list_mcp_tools` / `get_mcp_tool` 两阶段加载
+- **SKILL.md 解析与导出**：支持 YAML frontmatter + markdown body 双向转换
+- **Checkpointer 连接池**：psycopg AsyncConnectionPool，应用生命周期管理
+- **Memory Flush 服务**：后台异步记忆刷新，指数退避 + 熔断器（3 次失败 → 300s 冷却）
+- **消息清洗器**：LLM 调用前自动过滤不合规多模态内容（图片 >5MB、无效 MIME、PDF >50MB）
+- **SSH 隧道**：可选 autossh 反向隧道，Docker profile 启用
+- **文件传输面板**：前端上传/下载进度跟踪（EMA 测速、取消、重试）
+- **Axios 客户端**：文件传输专用 HTTP 客户端，支持 401 自动刷新 token
+- **CORS 配置与请求体大小限制**
+- **sandbox_exec 辅助工具**：处理长时间运行的沙箱命令
+
+### 变更
+
+- `agent_task_runner.py` 大幅增强：集成上下文治理、文件理解、Embedding 选择
+- `planner_react.py` 重构：支持动态工具收集、MCP 发现、Skill 指南注入
+- `react_graph.py` 扩展：集成上下文裁剪和压缩流程
+- `main_graph.py` 优化：支持中断节点、改进路由逻辑
+- `actus_chat_model.py` 增强：支持视觉模式、PDF 输入、消息清洗
+- 前端设置页扩展：新增文件理解配置面板
+
+### 修复
+
+- `exec_and_wait` 函数处理未返回状态的情况
+- 执行子步骤提示词模板中的字符串引号格式
+- `MemoryConfig` 中 `summary_min_steps` 默认值调整为 1
+- `file_processor_lookup` 参数类型注释修正
+
 ## [Unreleased] - 2026-03-07
 
 ### 文档

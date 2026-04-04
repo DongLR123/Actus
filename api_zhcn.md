@@ -109,6 +109,13 @@
 | `POST` | `/app-config/a2a-servers/{a2a_id}/delete` | 管理员 | 删除 A2A 服务 |
 | `POST` | `/app-config/a2a-servers/{a2a_id}/enabled` | 管理员 | 更新 A2A 服务全局启用状态 |
 
+### 文件理解
+
+| 方法 | 路径 | 认证 | 说明 |
+|------|------|------|------|
+| `GET` | `/app-config/file-understanding` | 是 | 获取文件理解配置（视觉降级、音频、视频�� |
+| `POST` | `/app-config/file-understanding` | 管理员 | 更新文件理解配置 |
+
 ## Skill 模块
 
 ### 旧接口（迁移提示）

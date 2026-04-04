@@ -9,7 +9,12 @@
 - 会话创建、SSE 对话流、任务停止、文件读取
 - `shell` / `browser` 接管、续期、结束、补救
 - LLM / MCP / A2A / Skill 风险策略配置
-- Skill v2 安装、启用、删除、详情查看、AI 创建
+- Skill v2 安装（GitHub / 本地 / SKILL.md）、启用、删除、详情查看、AI 创建
+- 多模态文件理解：音频转录、PDF 解析、图片处理、视频帧分析
+- 上下文溢出治理：两级渐进压缩 + 同步三阶段裁剪
+- 基于 Embedding 的 Skill 语义选择、渐进式 MCP 工具发现
+- Checkpointer 连接池（psycopg AsyncConnectionPool）
+- 后台记忆刷新（Memory Flush，含指数退避 + 熔断器）
 - 文件上传、下载、删除
 - 健康检查与 MinIO 自检
 
@@ -111,9 +116,23 @@ pytest
 ```text
 api/
 ├── app/
-│   ├── application/      # 用例编排服务
-│   ├── domain/           # 领域模型、工具、流程、Prompt
+│   ├── application/      # 用例编排服务（Skill、Memory Flush）
+│   ├── domain/           # 领域模型、工具、流程、Prompt、上下文治理
+│   │   ├── models/       # 领域模型（app_config, skill, memory_chunk 等）
+│   │   ├── external/     # 外部依赖协议（file_processor, embedding, memory_flusher）
+│   │   ├── services/
+│   │   │   ├── graphs/   # LangGraph 图（main_graph, react_graph, compaction, context_assembler, token_estimator）
+│   │   │   ├── flows/    # 流程编排（planner_react, skill_creation_graph）
+│   │   │   ├── tools/    # LangChain 工具（file, shell, browser, mcp_discovery, dynamic_skill）
+│   │   │   └── prompts/  # Prompt 模板
+│   │   └── repositories/ # 仓库接口 (ABC)
 │   ├── infrastructure/   # 仓储实现、外部服务、存储客户端
+│   │   ├── external/
+│   │   │   ├── llm/      # LLM 适配器 + 消息清洗器
+│   │   │   ├── embedding/ # Embedding 提供者、缓存、向量索引
+│   │   │   ├── file_processors/ # 文件处理器（audio, image, pdf, video）
+│   │   │   └── ...       # sandbox, file_storage, task
+│   │   └── checkpointer_pool.py  # LangGraph 检查点连接池
 │   └── interfaces/       # FastAPI 路由、Schema、依赖注入
 ├── core/                 # 环境变量与安全配置
 ├── alembic/              # 数据库迁移

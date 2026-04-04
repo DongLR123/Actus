@@ -109,6 +109,13 @@ Notes:
 | `POST` | `/app-config/a2a-servers/{a2a_id}/delete` | Admin | Delete an A2A server |
 | `POST` | `/app-config/a2a-servers/{a2a_id}/enabled` | Admin | Toggle global enable state |
 
+### File understanding
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/app-config/file-understanding` | Yes | Get file understanding config (vision fallback, audio, video) |
+| `POST` | `/app-config/file-understanding` | Admin | Update file understanding config |
+
 ## Skills
 
 ### Legacy skill routes

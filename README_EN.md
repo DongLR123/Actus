@@ -29,16 +29,24 @@ The default execution model is a **LangGraph**-based `Planner + ReAct` flow: Act
 
 - **LangGraph agent orchestration** — two-layer graph architecture with planning, step execution, and summarization
 - **LangChain tool system** — file, shell, browser, search tools registered via `@tool` decorators
-- **MCP / A2A / Skill integrations** managed as first-class agent tools
-- **Skill v2 filesystem storage** under `/app/data/skills`
+- **MCP / A2A / Skill integrations** managed as first-class agent tools, with progressive MCP tool discovery and embedding-based skill selection
+- **Skill v2 filesystem storage** under `/app/data/skills`, supporting GitHub, local directory, and SKILL.md format installation
+- **Multimodal file understanding** — audio transcription (Whisper API / sandbox faster-whisper), PDF parsing (native / pymupdf4llm), image processing, video keyframe extraction + vision model analysis
+- **Context overflow management** — two-level gradual compaction (85% LLM summarization / 95% hard truncation) + synchronous 3-phase trimming for automatic context window protection
 - **Human takeover** for both `shell` and `browser` scopes
 - **Workbench UI** with terminal preview, browser preview, VNC, timeline scrubbing, and file preview
 - **Streaming transport** via SSE and WebSocket
 - **Containerized sandbox** with Chromium, Xvfb, x11vnc, and websockify
-- **Attachment storage** through MinIO / S3-compatible object storage
+- **Attachment storage** through MinIO / S3-compatible object storage with transfer progress tracking
 - **JWT auth, admin tools, tool preferences, and runtime settings**
+- **SSH tunnel** — optional autossh reverse tunnel to expose the local API to a cloud server
 
 ## Architecture
+
+![Actus Architecture](architecture.png)
+
+<details>
+<summary>ASCII version</summary>
 
 ```text
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
@@ -56,9 +64,12 @@ The default execution model is a **LangGraph**-based `Planner + ReAct` flow: Act
                      │ Shell/File   │
                      │ Chromium/VNC │
                      └──────────────┘
-```
 
-For backend layering and runtime composition, see [项目架构.md](项目架构.md).
+(Optional) Phone ──HTTP──▶ Cloud:18082 ──SSH Tunnel──▶ API:8000
+```
+</details>
+
+For backend layering and runtime composition, see [项目架构.md](项目架构.md). Source: [architecture.excalidraw](architecture.excalidraw).
 
 ## Docker Compose Quick Start
 
@@ -176,8 +187,17 @@ npm run test
 ```text
 Actus/
 ├── api/                  # FastAPI backend
+│   ├── app/
+│   │   ├── application/  # Use case services (Skill, Memory Flush)
+│   │   ├── domain/       # Models, flows, tools, prompts, context management
+│   │   ├── infrastructure/ # DB/storage/external impls, file processors, embedding
+│   │   └── interfaces/   # Routes, schemas, dependency injection
+│   ├── core/             # Config, security
+│   ├── scripts/          # Admin scripts
+│   └── tests/            # Backend tests
 ├── ui/                   # Next.js frontend
 ├── sandbox/              # Docker sandbox source
+├── tunnel/               # SSH reverse tunnel config (optional)
 ├── docker-compose.yml    # Compose stack
 ├── DEPLOY.md             # Deployment guide
 ├── api.md                # English API reference
@@ -194,7 +214,26 @@ Actus/
 - [API README](api/README.md)
 - [UI README](ui/README.md)
 - [Sandbox README](sandbox/README.md)
+- [SSH Tunnel](tunnel/README.md)
 - [Contributing](CONTRIBUTING.md)
+
+## Tech Stack
+
+| Component | Technology |
+|-----------|------------|
+| Backend | FastAPI, Uvicorn, Pydantic v2 |
+| Database | PostgreSQL 17, SQLAlchemy 2.0 async, Alembic |
+| Cache / Rate limit | Redis |
+| Object storage | MinIO / S3-compatible |
+| Agent | LangGraph StateGraph, LangChain BaseChatModel, PlannerReActFlow |
+| Context management | TokenEstimator, ContextAssembler, GradualCompactor |
+| File understanding | Whisper (OpenAI/sandbox), pymupdf4llm, vision model frame analysis |
+| Embedding | OpenAI Embeddings, Redis cache, numpy vector index |
+| Extension protocols | MCP (with progressive discovery), A2A, Skill (with SKILL.md format) |
+| Frontend | Next.js 16, React 19, Tailwind CSS 4, Zustand |
+| Browser execution | Chromium, CDP, Playwright-style DOM operations |
+| Sandbox | Docker, Supervisor, Xvfb, x11vnc, websockify |
+| Testing | pytest, Vitest, Testing Library |
 
 ## License
 

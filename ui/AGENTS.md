@@ -103,6 +103,8 @@ alwaysApply: true
 | POST | `/app-config/a2a-servers` | 新增 A2A 服务器 |
 | POST | `/app-config/a2a-servers/{a2a_id}/delete` | 删除 A2A 服务 |
 | POST | `/app-config/a2a-servers/{a2a_id}/enabled` | 更新 A2A 启用状态 |
+| GET | `/app-config/file-understanding` | 获取文件理解配置 |
+| POST | `/app-config/file-understanding` | 更新文件理解配置 |
 
 ### 文件模块
 
@@ -140,12 +142,13 @@ alwaysApply: true
 | `step` | 步骤事件（含 id/status/description） |
 | `tool` | 工具调用事件（含 name/function/args/content） |
 | `wait` | 等待用户输入 |
+| `control` | 接管控制事件（申请、续期、结束、补救） |
 | `done` | 流结束 |
 | `error` | 错误事件 |
 
 ### 关键枚举值
 
-- **SessionStatus**: `pending` | `running` | `waiting` | `completed`
+- **SessionStatus**: `pending` | `running` | `takeover_pending` | `takeover` | `waiting` | `completed`
 - **ExecutionStatus**: `pending` | `running` | `completed` | `failed`
 - **ToolEventStatus**: `calling` | `called`
 - **MCPTransport**: `stdio` | `sse` | `streamable_http`

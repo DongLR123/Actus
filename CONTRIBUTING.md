@@ -134,14 +134,16 @@ npm run build
 - API 路由或响应格式
 - 会话状态机 / 接管流程
 - Skill / MCP / A2A 配置方式
+- 文件理解 / 上下文治理 / Embedding 配置
 - Docker Compose 服务名与部署步骤
 - 本地开发命令
 
 ## 分支与提交
 
-推荐从 `main` 创建功能分支：
+推荐从 `develop` 创建功能分支，完成后合并回 `develop`，再统一合并到 `main`：
 
 ```bash
+git checkout develop
 git checkout -b feature/<short-description>
 ```
 

@@ -21,7 +21,9 @@
   - MCP 服务器
   - A2A Agent 配置
   - Skill 生态
+  - 文件理解配置（视觉降级、音频转录、视频分析）
   - 用户管理
+- 文件传输面板：上传/下载进度跟踪、EMA 测速、取消和重试
 - 图片代理路由：`/api/image-proxy`
 
 ## 技术栈
@@ -109,6 +111,8 @@ ui/
 - `components/workbench-browser-preview.tsx`
 - `components/vnc-viewer.tsx`
 - `components/manus-settings.tsx`
+- `components/transfer-panel.tsx` — 文件传输进度面板
+- `components/transfer-progress.tsx` — 单个传输任务进度条
 
 ## 状态管理
 
@@ -117,7 +121,14 @@ Zustand store 位于：
 - `src/lib/store/auth-store.ts`
 - `src/lib/store/session-store.ts`
 - `src/lib/store/settings-store.ts`
+- `src/lib/store/transfer-store.ts` — 文件传输状态管理（进度、速度、取消）
 - `src/lib/store/ui-store.ts`
+
+## HTTP 客户端
+
+- `src/lib/api/fetch.ts` — 通用 API 请求（基于 fetch）
+- `src/lib/api/axios-client.ts` — 文件传输专用（基于 axios，支持 401 自动刷新 token、进度回调）
+- `src/lib/api/auth-utils.ts` — Token 管理与刷新逻辑
 
 ## 测试
 

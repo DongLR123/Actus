@@ -13,8 +13,10 @@
 - `sandbox/` — 沙箱服务（Docker 隔离代码执行）
 
 ### ReAct Agent 实现模式
-项目采用 **ReAct (Reasoning + Acting)** 模式，核心循环：
-1. 用户输入 → 2. LLM 推理 → 3. 工具调用（可选）→ 4. 结果整合 → 5. 递归/输出
+项目采用 **Planner + ReAct** 双阶段模式：
+1. **Planner 阶段**：用户输入 → LLM 生成执行计划（步骤列表）
+2. **ReAct 阶段**：逐步执行，每步循环：LLM 推理 → 工具调用 → 结果整合 → 递归/输出
+3. **上下文治理**：执行过程中通过 TokenEstimator + ContextAssembler + GradualCompactor 自动管理上下文窗口
 
 ### Skill 生态系统
 Skill 是独立的扩展生态层，通过 SKILL.md 定义，支持三类运行时：
@@ -32,13 +34,36 @@ Skill 存储在 **文件系统**（默认 `/app/data/skills`），每个 Skill �
 └── bundle/            # 源文件
 ```
 
+Skill 安装支持 GitHub、本地目录和 SKILL.md 格式。基于 Embedding 的语义选择在规划阶段自动匹配最相关的 Skill。
+
 Skill 相关核心代码路径：
 - 领域模型：`app/domain/models/skill.py`
 - 仓库接口：`app/domain/repositories/skill_repository.py`
 - 仓库实现：`app/infrastructure/repositories/file_skill_repository.py`（当前使用）
 - 应用服务：`app/application/services/skill_service.py`、`skill_source_loader.py`、`skill_selector.py`、`skill_index_service.py`
+- SKILL.md 解析/导出：`app/domain/services/skill_md_parser.py`、`skill_md_exporter.py`
+- Embedding 索引：`app/infrastructure/external/embedding/skill_embedding_index.py`
+- 动态工具转换：`app/domain/services/tools/langchain_dynamic_skill_tools.py`
 - 统一工具层：`app/domain/services/tools/skill.py`（SkillTool）
 - API 路由：`app/interfaces/endpoints/skill_v2_routes.py`（v2，当前活跃）
+
+### MCP 渐进式发现
+`app/domain/services/tools/langchain_mcp_discovery.py` 提供两个工具：
+- `list_mcp_tools(server_name?)` — 列出可用 MCP 工具（仅 metadata）
+- `get_mcp_tool(tool_name)` — 获取完整 schema 并激活到下一轮执行
+
+### 多模态文件理解
+`app/infrastructure/external/file_processors/` 按 MIME 类型路由：
+- **audio** — OpenAI Whisper API 或 sandbox faster-whisper 转录
+- **pdf** — 原生 PDF blocks 或 pymupdf4llm 提取
+- **image** — Base64 编解码、MIME 校验、5MB 限制
+- **video** — 关键帧提取 + 视觉模型分析 + 音频转录
+
+### 上下文溢出治理
+`app/domain/services/graphs/` 中三层递进保护：
+- **TokenEstimator** — 混合 token 估算（图片 2000、PDF ~2000/页、CJK 1.5/字）
+- **ContextAssembler** — 同步三阶段裁剪
+- **GradualCompactor** — 异步两级压缩（85% LLM 摘要 / 95% 硬截断）
 
 ### 工具定义约定
 使用 **Pydantic BaseModel** 定义工具输入参数 schema：
@@ -116,3 +141,7 @@ docker compose --env-file .env up -d --build
 - 工具调用后必须将结果以 `role: "tool"` 消息格式追加到 messages
 - `tool_call_id` 必须与对应的 tool_call 匹配
 - 递归调用 `process_query()` 时不要重复添加用户消息
+- Domain 层禁止导入 FastAPI/SQLAlchemy，仅允许 langchain-core 和 langgraph
+- 后端全异步：所有 I/O 操作使用 `async/await`
+- 前端禁止 `any` 类型
+- 消息清洗器 (`message_sanitizer.py`) 在 LLM 调用前自动过滤不合规的多模态内容

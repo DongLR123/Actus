@@ -29,16 +29,24 @@ Actus 由三个核心运行时组成：
 
 - **LangGraph Agent 编排**：两层图架构（main_graph 规划调度 + react_graph 工具执行循环），支持规划、步骤执行、等待用户输入和任务完成总结
 - **LangChain 工具体系**：文件、Shell、浏览器、搜索工具通过 `@tool` 装饰器统一注册
-- **MCP / A2A / Skill 扩展**：统一纳入 Agent 工具选择与运行时编排
-- **Skill v2 文件系统存储**：Skill 保存在 `/app/data/skills`，支持 GitHub 与本地目录安装
+- **MCP / A2A / Skill 扩展**：统一纳入 Agent 工具选择与运行时编排，支持渐进式 MCP 工具发现和基于 Embedding 的 Skill 语义选择
+- **Skill v2 文件系统存储**：Skill 保存在 `/app/data/skills`，支持 GitHub、本地目录和 SKILL.md 格式安装
+- **多模态文件理解**：音频转录（Whisper API / 沙箱 faster-whisper）、PDF 解析（原生 / pymupdf4llm）、图片处理、视频关键帧提取 + 视觉模型分析
+- **上下文溢出治理**：两级渐进压缩（85% LLM 摘要 / 95% 硬截断）+ 同步三阶段裁剪，自动保护上下文窗口
 - **人工接管**：支持 `shell` 和 `browser` 两类接管，包含申请、续期、结束、补救流程
 - **工作台视图**：终端预览、浏览器预览、VNC 画面、时间线回放、文件预览
 - **流式交互**：会话列表与对话执行均支持 SSE；接管终端和 VNC 使用 WebSocket
 - **容器化沙箱**：每个会话独立 Docker 容器，内置 Chromium、Xvfb、x11vnc、websockify
-- **对象存储与附件**：上传文件落到 MinIO/S3 兼容存储，并与会话关联
+- **对象存储与附件**：上传文件落到 MinIO/S3 兼容存储，并与会话关联；文件传输支持进度跟踪、断点续传
 - **用户与管理**：JWT 鉴权、超级管理员、用户管理、工具偏好、应用设置
+- **SSH 隧道**：可选的 autossh 反向隧道，将本地 API 暴露到云服务器
 
 ## 架构概览
+
+![Actus Architecture](architecture.png)
+
+<details>
+<summary>ASCII 版本</summary>
 
 ```text
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
@@ -56,9 +64,12 @@ Actus 由三个核心运行时组成：
                      │ Shell/File   │
                      │ Chromium/VNC │
                      └──────────────┘
-```
 
-后端分层与关键模块见 [项目架构文档](项目架构.md)。
+(可选) Phone ──HTTP──▶ Cloud:18082 ──SSH Tunnel──▶ API:8000
+```
+</details>
+
+后端分层与关键模块见 [项目架构文档](项目架构.md)。源文件：[architecture.excalidraw](architecture.excalidraw)。
 
 ## Docker Compose 快速开始
 
@@ -186,15 +197,16 @@ npm run test
 Actus/
 ├── api/                  # FastAPI 后端
 │   ├── app/
-│   │   ├── application/  # 用例编排
-│   │   ├── domain/       # 领域模型、流程、工具、Prompt
-│   │   ├── infrastructure/ # 数据库/存储/外部实现
+│   │   ├── application/  # 用例编排（Skill、Memory Flush）
+│   │   ├── domain/       # 领域模型、流程、工具、Prompt、上下文治理
+│   │   ├── infrastructure/ # 数据库/存储/外部实现、文件处理器、Embedding
 │   │   └── interfaces/   # 路由、Schema、依赖注入
 │   ├── core/             # 环境配置、安全
 │   ├── scripts/          # 管理脚本
 │   └── tests/            # 后端测试
 ├── ui/                   # Next.js 前端
 ├── sandbox/              # Docker 沙箱镜像源码
+├── tunnel/               # SSH 反向隧道配置（可选）
 ├── docker-compose.yml    # 容器编排
 ├── DEPLOY.md             # 部署说明
 ├── api_zhcn.md           # 中文 API 文档
@@ -211,6 +223,7 @@ Actus/
 - [后端 README](api/README.md)
 - [前端 README](ui/README.md)
 - [沙箱 README](sandbox/README.md)
+- [SSH 隧道](tunnel/README.md)
 - [贡献指南](CONTRIBUTING.md)
 
 ## 技术栈
@@ -222,7 +235,10 @@ Actus/
 | 缓存 / 限流 | Redis |
 | 对象存储 | MinIO / S3 兼容 |
 | Agent | LangGraph StateGraph、LangChain BaseChatModel、PlannerReActFlow |
-| 扩展协议 | MCP、A2A、Skill |
+| 上下文治理 | TokenEstimator、ContextAssembler、GradualCompactor |
+| 文件理解 | Whisper (OpenAI/sandbox)、pymupdf4llm、视觉模型帧分析 |
+| Embedding | OpenAI Embeddings、Redis 缓存、numpy 向量索引 |
+| 扩展协议 | MCP（含渐进式发现）、A2A、Skill（含 SKILL.md 格式） |
 | 前端 | Next.js 16、React 19、Tailwind CSS 4、Zustand |
 | 浏览器执行 | Chromium、CDP、Playwright 风格 DOM 操作 |
 | 沙箱 | Docker、Supervisor、Xvfb、x11vnc、websockify |

@@ -4,14 +4,17 @@
 
 ## 部署拓扑
 
+![Deployment Topology](deploy-topology.png)
+
 Compose 会启动或构建以下组件：
 
 - `postgres`：持久化会话、用户、文件元数据
-- `redis`：限流、状态与部分运行时协调
+- `redis`：限流、状态、Embedding 缓存与部分运行时协调
 - `sandbox-image`：仅用于构建沙箱镜像，不常驻运行
 - `api`：FastAPI 后端
 - `ui-app`：Next.js 运行时
 - `ui`：nginx 网关，对外暴露前端入口
+- `tunnel`：（可选，需显式启用 profile）autossh 反向隧道，将 API 暴露到云服务器
 
 Compose **不会** 启动 MinIO。你需要在外部提供一个可访问的 MinIO / S3 兼容服务，并提前创建 bucket。
 
@@ -161,10 +164,20 @@ docker compose --env-file .env up -d --force-recreate api
 docker ps --format '{{.Names}}' | grep '^actus-sb-' | xargs -r docker rm -f
 ```
 
-## 10. 常见注意事项
+## 10. 可选：启用 SSH 隧道
+
+如需将本地 API 暴露到外部网络（例如手机访问），可启用 tunnel 服务：
+
+```bash
+# 生成 SSH 密钥并配置，详见 tunnel/README.md
+docker compose --profile tunnel up -d tunnel
+```
+
+## 11. 常见注意事项
 
 - 前端 API 地址变化后，需要重新构建 `ui-app`
 - `api` 通过挂载的 Docker Socket 动态创建会话沙箱
 - 沙箱镜像本身不常驻；真正执行任务的是 API 运行时按需创建的临时容器
 - 如果 Redis 不可用，限流相关接口会返回 `503`
 - 旧版 Skill API 会返回 `410`，请使用 `/api/v2/skills/*`
+- 文件理解功能（音频转录、PDF 解析、视频分析）需要在前端设置页的「文件理解」中配置
