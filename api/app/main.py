@@ -16,6 +16,8 @@ from app.interfaces.service_dependencies import get_agent_service
 from core.config import get_settings
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # 加载配置信息
 settings = get_settings()
@@ -94,12 +96,37 @@ async def lifespan(app: FastAPI):
     await minio_client.init()
     logger.info("MinIO 客户端初始化完成")
 
+    # 5. 初始化 Checkpointer 连接池（在 try 内，确保失败时已初始化的基础设施能被清理）
+    checkpointer_pool = None
     try:
-        # 3.lifespan分界点
+        logger.info("开始初始化 Checkpointer 连接池")
+        from app.infrastructure.checkpointer_pool import CheckpointerPool
+        checkpointer_pool = CheckpointerPool(
+            db_url=settings.sqlalchemy_database_url,
+            min_size=settings.checkpointer_pool_min_size,
+            max_size=settings.checkpointer_pool_max_size,
+            timeout=settings.checkpointer_pool_timeout,
+        )
+        await checkpointer_pool.open()
+        app.state.checkpointer_pool = checkpointer_pool
+        logger.info("Checkpointer 连接池初始化完成")
+
+        # 6. 初始化 MemoryFlushService（C5.0 记忆刷写调度器）
+        from app.application.services.memory_flush_service import MemoryFlushService
+        from app.interfaces.service_dependencies import _load_app_config
+        _app_config = _load_app_config()
+        _memory_cfg = _app_config.agent_config.memory
+        flush_service = MemoryFlushService(
+            max_retries=_memory_cfg.flush_max_retries,
+            circuit_breaker_threshold=_memory_cfg.flush_circuit_breaker_threshold,
+        )
+        app.state.flush_service = flush_service
+        logger.info("MemoryFlushService 初始化完成")
+
+        # lifespan分界点
         yield
     finally:
         try:
-            # 4.等待agent服务关闭
             logger.info("Manus应用正在关闭")
             await asyncio.wait_for(get_agent_service().shutdown(), timeout=30.0)
             logger.info("Agent服务成功关闭")
@@ -108,7 +135,18 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Agent服务关闭期间出现错误: {str(e)}")
 
-        # 5. 应用关闭前的清理工作
+        # 关闭 MemoryFlushService（等待后台 flush 任务完成）
+        flush_service = getattr(app.state, "flush_service", None)
+        if flush_service:
+            try:
+                await flush_service.shutdown()
+                logger.info("MemoryFlushService 关闭成功")
+            except Exception as e:
+                logger.warning(f"MemoryFlushService 关闭时出错: {e}")
+
+        # 应用关闭前的清理工作
+        if checkpointer_pool is not None:
+            await checkpointer_pool.close()
         await redis_client.shutdown()
         await postgres_client.shutdown()
         await minio_client.shutdown()
@@ -124,14 +162,34 @@ app = FastAPI(
 )
 
 # 配置CORS中间件，解决跨域问题
+_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 允许所有来源
+    allow_origins=_origins,
     allow_credentials=True,
-    allow_methods=["*"],  # 允许所有方法
-    allow_headers=["*"],  # 允许所有头部
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def limit_request_body(request: Request, call_next):
+    """请求体大小限制中间件"""
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > settings.max_request_body_size:
+        return JSONResponse(
+            status_code=413,
+            content={"detail": "Request body too large"},
+        )
+    if request.method in ("POST", "PUT", "PATCH"):
+        body = await request.body()
+        if len(body) > settings.max_request_body_size:
+            return JSONResponse(
+                status_code=413,
+                content={"detail": "Request body too large"},
+            )
+    return await call_next(request)
 
 # 注册全局异常处理器
 register_exception_handlers(app)

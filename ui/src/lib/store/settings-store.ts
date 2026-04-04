@@ -9,6 +9,7 @@ import type {
   A2AServersData,
   AgentConfig,
   CreateA2AServerParams,
+  FileUnderstandingConfig,
   InstallSkillParams,
   LLMConfig,
   MCPConfig,
@@ -30,6 +31,7 @@ type SettingsState = {
   skills: SkillListData["skills"];
   skillTools: ToolWithPreference[];
   skillRiskPolicy: SkillRiskPolicy | null;
+  fileUnderstanding: FileUnderstandingConfig | null;
   isLoading: boolean;
   isInstallingSkill: boolean;
   isSkillRiskPolicyLoading: boolean;
@@ -55,6 +57,7 @@ type SettingsActions = {
   deleteSkill: (skillId: string) => Promise<void>;
   setSkillEnabled: (skillId: string, enabled: boolean) => Promise<void>;
   setSkillToolEnabled: (skillId: string, enabled: boolean) => Promise<void>;
+  updateFileUnderstandingConfig: (config: FileUnderstandingConfig) => Promise<void>;
 };
 
 type SettingsStore = SettingsState & SettingsActions;
@@ -69,6 +72,7 @@ const initialState: SettingsState = {
   skills: [],
   skillTools: [],
   skillRiskPolicy: null,
+  fileUnderstanding: null,
   isLoading: false,
   isInstallingSkill: false,
   isSkillRiskPolicyLoading: false,
@@ -131,6 +135,7 @@ export const useSettingsStore = create<SettingsStore>()(
           skillsResult,
           skillToolsResult,
           skillRiskPolicyResult,
+          fileUnderstandingResult,
         ] = await Promise.allSettled([
           configApi.getLLMConfig(),
           configApi.getAgentConfig(),
@@ -141,6 +146,7 @@ export const useSettingsStore = create<SettingsStore>()(
           configApi.getSkills(),
           userToolsApi.getSkillTools(),
           configApi.getSkillRiskPolicy(),
+          configApi.getFileUnderstandingConfig(),
         ]);
 
         const partialState: Partial<SettingsState> = {};
@@ -198,6 +204,12 @@ export const useSettingsStore = create<SettingsStore>()(
           partialState.skillRiskPolicy = skillRiskPolicyResult.value;
         } else {
           failedItems.push("Skill 风险策略");
+        }
+
+        if (fileUnderstandingResult.status === "fulfilled") {
+          partialState.fileUnderstanding = fileUnderstandingResult.value;
+        } else {
+          // 文件理解是新功能，旧后端可能没有这个端点，静默忽略
         }
 
         set(partialState);
@@ -396,6 +408,16 @@ export const useSettingsStore = create<SettingsStore>()(
         reportSuccess(enabled ? "Skill 个人开关已开启" : "Skill 个人开关已关闭");
       } catch (error) {
         reportError(error, "更新 Skill 个人开关失败");
+      }
+    },
+
+    updateFileUnderstandingConfig: async (config) => {
+      try {
+        const updated = await configApi.updateFileUnderstandingConfig(config);
+        set({ fileUnderstanding: updated });
+        reportSuccess("文件理解配置已保存");
+      } catch (error) {
+        reportError(error, "更新文件理解配置失败");
       }
     },
   }))

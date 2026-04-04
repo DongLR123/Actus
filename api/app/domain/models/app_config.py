@@ -25,6 +25,8 @@ class LLMConfig(BaseModel):
         "chat_completions"  # API 类型: chat_completions / responses / auto（先 chat 失败回退 responses）
     )
     supports_response_format: bool = True  # 是否支持 response_format 参数，部分兼容 API 不支持需设为 False
+    supports_vision: bool = True  # 模型是否支持视觉/多模态输入（图片嵌入），关闭后强制使用 MCP 工具分析图片
+    supports_pdf_input: bool = False  # 是否支持原生 PDF 文件输入
     context_overflow_guard_enabled: bool = False  # 是否开启上下文超限治理
     overflow_retry_cap: int = Field(2, ge=0, le=10)  # 超限治理自动重试次数上限
     soft_trigger_ratio: float = Field(
@@ -46,6 +48,12 @@ class LLMConfig(BaseModel):
     unknown_model_context_window: int = Field(
         32768, ge=1024
     )  # 未知模型的上下文窗口兜底值
+    tool_result_max_chars: int = Field(
+        8000, ge=100
+    )  # 工具结果截断阈值（字符数），Tier 1 守卫
+    tool_compress_trigger_ratio: float = Field(
+        0.75, gt=0, le=1
+    )  # Phase 1 工具结果压缩触发比例（占预算百分比）
 
     @model_validator(mode="after")
     def validate_context_budget_ratio(self):
@@ -113,6 +121,16 @@ class SkillSelectionPolicy(BaseModel):
         return self
 
 
+class SkillEmbeddingConfig(BaseModel):
+    """Skill 向量化检索配置。"""
+
+    enabled: bool = False
+    api_base: str = ""
+    api_key: str = ""
+    model: str = "text-embedding-3-small"
+    dimensions: int = 256
+
+
 class MemoryConfig(BaseModel):
     """对话记忆配置"""
 
@@ -120,9 +138,16 @@ class MemoryConfig(BaseModel):
     summary_model: Optional[str] = None
     summary_max_rounds: int = Field(5, ge=1, le=20)
     summary_token_budget: int = Field(2000, ge=200, le=10000)
-    summary_min_steps: int = Field(2, ge=1, le=10)
+    summary_min_steps: int = Field(1, ge=1, le=10)
     context_anchor_enabled: bool = True
     compact_keep_summary: bool = True
+    # Flush 调度
+    flush_enabled: bool = False
+    flush_min_steps: int = Field(2, ge=1, le=10)
+    flush_min_new_tokens: int = Field(3000, ge=500, le=20000)
+    # Flush 容错
+    flush_max_retries: int = Field(3, ge=0, le=10)
+    flush_circuit_breaker_threshold: int = Field(3, ge=1, le=10)
 
 
 class AgentConfig(BaseModel):
@@ -132,6 +157,7 @@ class AgentConfig(BaseModel):
     max_retries: int = Field(default=3, gt=1, lt=10)  # 最大重试次数
     max_search_results: int = Field(default=10, gt=1, lt=30)  # 最大搜索结果条数
     skill_selection: SkillSelectionPolicy = Field(default_factory=SkillSelectionPolicy)
+    skill_embedding: SkillEmbeddingConfig = Field(default_factory=SkillEmbeddingConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
 
 
@@ -159,6 +185,10 @@ class MCPServerConfig(BaseModel):
     # streamable_http&sse配置
     url: Optional[str] = None  # MCP服务URL地址
     headers: Optional[Dict[str, Any]] = None  # MCP服务请求头
+
+    # 渐进加载: 始终 bind 到 LLM 的工具名（短名，不含 mcp_ 前缀）
+    # None = 全走发现模式；["tool_a", "tool_b"] = 这些工具始终 bind
+    always_bind: Optional[List[str]] = None
 
     model_config = ConfigDict(extra="allow")
 
@@ -229,6 +259,42 @@ class SkillRiskPolicy(BaseModel):
         return data
 
 
+class VisionFallbackConfig(BaseModel):
+    """视觉模型 fallback 配置（非多模态主模型时，用此模型描述图片/视频帧）"""
+
+    enabled: bool = False
+    base_url: str = ""
+    api_key: str = ""
+    model_name: str = ""
+    api_type: Literal["chat_completions", "responses", "auto"] = "chat_completions"
+
+
+class AudioProcessorConfig(BaseModel):
+    """音频转录处理器配置"""
+
+    provider: str = "disabled"  # sandbox_whisper | openai_api | disabled
+    openai_api_key: str = ""
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_model: str = "whisper-1"
+
+
+class VideoProcessorConfig(BaseModel):
+    """视频处理器配置"""
+
+    max_keyframes: int = Field(5, ge=1)
+    extract_audio: bool = True
+    frame_strategy: Literal["scene", "uniform"] = "scene"
+    scene_threshold: float = Field(0.3, ge=0.0, le=1.0)
+
+
+class FileUnderstandingConfig(BaseModel):
+    """文件理解配置（file_view 工具）"""
+
+    vision_fallback: VisionFallbackConfig = VisionFallbackConfig()
+    audio: AudioProcessorConfig = AudioProcessorConfig()
+    video: VideoProcessorConfig = VideoProcessorConfig()
+
+
 class AppConfig(BaseModel):
     """应用配置信息，包含Agent配置、LLM提供商配置、MCP配置、A2A配置"""
 
@@ -237,6 +303,7 @@ class AppConfig(BaseModel):
     mcp_config: MCPConfig  # MCP服务配置
     a2a_config: A2AConfig  # A2A服务配置
     skill_risk_policy: SkillRiskPolicy = SkillRiskPolicy()
+    file_understanding: FileUnderstandingConfig = FileUnderstandingConfig()
 
     # Pydantic配置，允许传递额外的字段初始化
     model_config = ConfigDict(extra="allow")

@@ -5,6 +5,7 @@ import { usePathname } from "next/navigation";
 import { AuthGuard } from "@/components/auth/auth-guard";
 import { GlobalNotice } from "@/components/global-notice";
 import { LeftPanel } from "@/components/left-panel";
+import { TransferPanel } from "@/components/transfer-panel";
 import { SidebarProvider } from "@/components/ui/sidebar";
 
 const PUBLIC_ROUTES = new Set(["/login", "/register"]);
@@ -32,6 +33,7 @@ export function AppShell({ children }: Readonly<{ children: React.ReactNode }>) 
           <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto bg-surface-1">
             {children}
           </div>
+          <TransferPanel />
         </SidebarProvider>
       )}
     </AuthGuard>

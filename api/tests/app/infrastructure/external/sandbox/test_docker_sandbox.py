@@ -36,6 +36,7 @@ def test_create_task_sets_tz_for_spawned_sandbox_container(monkeypatch) -> None:
         sandbox_name_prefix="actus-sb",
         sandbox_ttl_minutes=60,
         sandbox_chrome_args="",
+        sandbox_mem_limit="4g",
         sandbox_https_proxy=None,
         sandbox_http_proxy=None,
         sandbox_no_proxy=None,
@@ -65,4 +66,5 @@ def test_create_task_sets_tz_for_spawned_sandbox_container(monkeypatch) -> None:
     assert sandbox.id.startswith("actus-sb-")
     assert fake_docker_client.containers.run_kwargs["environment"]["TZ"] == "Asia/Shanghai"
     assert fake_docker_client.containers.run_kwargs["network"] == "actus-net"
+    assert fake_docker_client.containers.run_kwargs["mem_limit"] == "4g"
     assert fake_docker_client.closed is True

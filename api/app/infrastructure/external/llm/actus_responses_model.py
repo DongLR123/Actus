@@ -62,9 +62,13 @@ class ActusResponsesModel(BaseChatModel):
     model_name: str = "gpt-5.4-pro"
     temperature: float = 0.7
     max_tokens: int = 8192
+    supports_vision: bool = True
+    supports_pdf_input: bool = False
 
     # Tools bound via bind_tools() -- None means no tools bound
     _bound_tools: Optional[list] = None
+    # tool_choice bound via bind_tools() — critical for with_structured_output
+    _bound_tool_choice: Optional[Any] = None
 
     # ---- Properties ------------------------------------------------------ #
 
@@ -156,7 +160,18 @@ class ActusResponsesModel(BaseChatModel):
             if isinstance(msg, SystemMessage):
                 result.append({"role": "system", "content": msg.content})
             elif isinstance(msg, HumanMessage):
-                result.append({"role": "user", "content": msg.content})
+                if isinstance(msg.content, list):
+                    from app.infrastructure.external.llm.message_sanitizer import (
+                        sanitize_multimodal_blocks,
+                    )
+                    content = sanitize_multimodal_blocks(
+                        msg.content,
+                        supports_vision=self.supports_vision,
+                        supports_pdf_input=self.supports_pdf_input,
+                    )
+                    result.append({"role": "user", "content": content})
+                else:
+                    result.append({"role": "user", "content": msg.content})
             elif isinstance(msg, AIMessage):
                 entry: dict[str, Any] = {
                     "role": "assistant",
@@ -188,12 +203,40 @@ class ActusResponsesModel(BaseChatModel):
         return result
 
     @staticmethod
+    def _convert_content_blocks_for_responses(content: list) -> list[dict[str, Any]]:
+        """Convert Chat Completions multimodal content blocks to Responses API format.
+
+        Chat Completions: {"type": "text", "text": "..."} / {"type": "image_url", "image_url": {"url": "..."}}
+        Responses API:    {"type": "input_text", "text": "..."} / {"type": "input_image", "image_url": "..."}
+        """
+        converted: list[dict[str, Any]] = []
+        for block in content:
+            block_type = block.get("type", "")
+            if block_type == "text":
+                converted.append({"type": "input_text", "text": block.get("text", "")})
+            elif block_type == "image_url":
+                image_url = block.get("image_url", {})
+                url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
+                converted.append({"type": "input_image", "image_url": url})
+            elif block_type == "file":
+                file_info = block.get("file", {})
+                converted.append({
+                    "type": "input_file",
+                    "filename": file_info.get("filename", "document.pdf"),
+                    "file_data": file_info.get("file_data", ""),
+                })
+            else:
+                converted.append(block)
+        return converted
+
+    @staticmethod
     def _convert_input_messages_from_dicts(messages: List[dict[str, Any]]) -> List[dict[str, Any]]:
         """Convert Chat-style message dicts to Responses API input items.
 
         Handles:
         - role "tool" -> type "function_call_output"
         - assistant tool_calls -> "function_call" items
+        - user messages with multimodal content (list) -> Responses API format
         - Other messages pass through unchanged
         """
         converted: List[dict[str, Any]] = []
@@ -227,6 +270,16 @@ class ActusResponsesModel(BaseChatModel):
                     })
                 continue
 
+            # Convert multimodal content blocks for user messages
+            if role == "user" and isinstance(message.get("content"), list):
+                converted.append({
+                    "role": "user",
+                    "content": ActusResponsesModel._convert_content_blocks_for_responses(
+                        message["content"]
+                    ),
+                })
+                continue
+
             converted.append(message)
 
         return converted
@@ -254,6 +307,8 @@ class ActusResponsesModel(BaseChatModel):
         - type="function_call": tool call
         """
         dumped = response.model_dump() if hasattr(response, "model_dump") else response
+        if not isinstance(dumped, dict):
+            dumped = {"output": []}
         output_items = dumped.get("output", [])
 
         content_text = ""
@@ -364,8 +419,12 @@ class ActusResponsesModel(BaseChatModel):
         else:
             logger.info("调用Responses API未携带工具: %s", self.model_name)
 
-        # tool_choice from kwargs
-        tool_choice = kwargs.get("tool_choice")
+        # tool_choice: per-call kwarg > bound value from bind_tools
+        # LangChain uses "any" internally (e.g. with_structured_output),
+        # but OpenAI API expects "required" for the same semantics.
+        tool_choice = kwargs.get("tool_choice") or self._bound_tool_choice
+        if tool_choice == "any":
+            tool_choice = "required"
         if tool_choice is not None:
             params["tool_choice"] = tool_choice
 
@@ -374,10 +433,32 @@ class ActusResponsesModel(BaseChatModel):
 
         response = await client.responses.create(**params)
 
+        # Validate response — proxies may return strings, ints, or other
+        # non-object types instead of a proper Responses API object.
+        if not hasattr(response, "model_dump") and not isinstance(response, dict):
+            from app.application.errors.exceptions import ServerRequestsError
+
+            raw = str(response)[:200]
+            raise ServerRequestsError(
+                f"LLM ({self.model_name}) returned unexpected response "
+                f"(type={type(response).__name__}): {raw}"
+            )
+
         # Normalize Responses API output to Chat Completions-compatible dict
         normalized = self._normalize_response(response)
         content = normalized.get("content") or ""
         tool_calls = self._parse_tool_calls(normalized.get("tool_calls"))
+
+        # Validate: entirely empty response is almost always a provider-side
+        # error (e.g. 404 wrapped in 200, or empty output array).
+        # Raise ServerRequestsError so RetryPolicy / fallback can act on it.
+        if not content and not tool_calls:
+            from app.application.errors.exceptions import ServerRequestsError
+
+            raise ServerRequestsError(
+                f"LLM ({self.model_name}) returned empty response "
+                f"(no content, no tool_calls)"
+            )
 
         ai_message = AIMessage(content=content, tool_calls=tool_calls)
         return ChatResult(generations=[ChatGeneration(message=ai_message)])
@@ -441,6 +522,11 @@ class ActusResponsesModel(BaseChatModel):
             model_name=self.model_name,
             temperature=self.temperature,
             max_tokens=self.max_tokens,
+            supports_vision=self.supports_vision,
+            supports_pdf_input=self.supports_pdf_input,
         )
         new_model._bound_tools = responses_format
+        # Preserve tool_choice from kwargs (critical for with_structured_output)
+        if "tool_choice" in kwargs:
+            new_model._bound_tool_choice = kwargs["tool_choice"]
         return new_model

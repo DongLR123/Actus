@@ -11,6 +11,8 @@ class Settings(BaseSettings):
     env: str = "development"  # 应用环境，默认为'development'
     log_level: str = "INFO"  # 日志级别，默认为'INFO'
     app_config_filepath: str = "config.yaml"  # 应用配置文件路径
+    cors_origins: str = "http://localhost:3000,http://localhost"  # 逗号分隔的允许来源列表
+    max_request_body_size: int = 500 * 1024 * 1024  # 500MB 请求体限制
 
     # 数据库配置
     sqlalchemy_database_url: str = (
@@ -48,6 +50,7 @@ class Settings(BaseSettings):
     sandbox_ttl_minutes: Optional[int] = 60
     sandbox_network: Optional[str] = None
     sandbox_chrome_args: Optional[str] = ""
+    sandbox_mem_limit: str = "4g"  # Docker 容器内存上限，防止 Chromium OOM
     sandbox_https_proxy: Optional[str] = None
     sandbox_http_proxy: Optional[str] = None
     sandbox_no_proxy: Optional[str] = None
@@ -74,6 +77,11 @@ class Settings(BaseSettings):
 
     # Skill 创建子图灰度配置
     skill_graph_canary_percent: int = 100  # 0-100，按 user_id 哈希分桶
+
+    # Checkpointer 连接池配置
+    checkpointer_pool_min_size: int = 2
+    checkpointer_pool_max_size: int = 10
+    checkpointer_pool_timeout: float = 30.0
 
     # JWT 配置
     jwt_secret_key: str = "change-me-in-env"

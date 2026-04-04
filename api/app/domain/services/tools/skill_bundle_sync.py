@@ -41,7 +41,7 @@ class SkillBundleSyncManager:
     ) -> None:
         self._sandbox = sandbox
         self._skills_root_dir = Path(skills_root_dir)
-        self._sandbox_skill_root = str(sandbox_skill_root).rstrip("/")
+        self.sandbox_skill_root = str(sandbox_skill_root).rstrip("/")
         self._background_concurrency = max(1, int(background_concurrency or 1))
         self._skill_pool: dict[str, Skill] = {}
         self._sync_states: dict[str, SkillSyncState] = {}
@@ -49,6 +49,7 @@ class SkillBundleSyncManager:
         self._initial_tasks: list[asyncio.Task[str | None]] = []
         self._background_task: asyncio.Task[None] | None = None
         self._background_skills: list[Skill] = []
+        self._file_listings: dict[str, list[str]] = {}
 
     async def prepare_startup_sync(
         self,
@@ -89,6 +90,21 @@ class SkillBundleSyncManager:
         if self._background_task or not self._background_skills:
             return
         self._background_task = asyncio.create_task(self._run_background_sync())
+
+    def get_file_listing(self, skill_id: str) -> list[str] | None:
+        """Return cached file listing for a skill, or None if not cached.
+
+        Returns a defensive copy to prevent external mutation.
+        """
+        listing = self._file_listings.get(skill_id)
+        return list(listing) if listing is not None else None
+
+    def get_file_listing_all(self) -> dict[str, list[str]]:
+        """Return all cached file listings. Keys are skill IDs, values are relative path lists.
+
+        Returns a deep copy to prevent external mutation of cached data.
+        """
+        return {k: list(v) for k, v in self._file_listings.items()}
 
     async def ensure_ready_for_invoke(
         self,
@@ -161,12 +177,28 @@ class SkillBundleSyncManager:
                 sandbox_dir = await self._sync_bundle(skill)
                 state.status = "success"
                 state.sandbox_dir = sandbox_dir or ""
+                # Cache file listing from bundle directory (covers both
+                # fresh upload and version-match early return paths)
+                self._cache_file_listing(skill)
                 return sandbox_dir
             except Exception as e:  # noqa: BLE001
                 state.status = "failed"
                 state.error = str(e)
                 logger.warning("Skill bundle同步失败(skill=%s): %s", skill.id, str(e))
                 return None
+
+    def _cache_file_listing(self, skill: Skill) -> None:
+        """Enumerate bundle directory and cache the relative file paths."""
+        bundle_dir = self._skills_root_dir / skill.id / "bundle"
+        if not bundle_dir.exists() or not bundle_dir.is_dir():
+            return
+        rel_paths = sorted(
+            p.relative_to(bundle_dir).as_posix()
+            for p in bundle_dir.rglob("*")
+            if p.is_file()
+        )
+        if rel_paths:
+            self._file_listings[skill.id] = rel_paths
 
     async def _run_background_sync(self) -> None:
         semaphore = asyncio.Semaphore(self._background_concurrency)
@@ -191,7 +223,7 @@ class SkillBundleSyncManager:
         if bundle_count <= 0:
             return None
 
-        sandbox_skill_dir = f"{self._sandbox_skill_root}/{skill.id}"
+        sandbox_skill_dir = f"{self.sandbox_skill_root}/{skill.id}"
         marker_path = f"{sandbox_skill_dir}/{SYNC_MARKER_FILENAME}"
         version = self._version_of(skill)
         marker_version = await self._read_marker_version(marker_path)

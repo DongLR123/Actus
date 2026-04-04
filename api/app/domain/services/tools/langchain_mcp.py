@@ -103,10 +103,71 @@ def _json_schema_to_pydantic(
     return _build_pydantic_model(model_name, schema)
 
 
-def _make_mcp_coroutine(mcp_tool: MCPTool, tool_name: str):
+_SANDBOX_PATH_PREFIX = "/home/ubuntu/"
+
+
+async def _resolve_sandbox_paths(
+    kwargs: dict[str, Any],
+    url_map: dict[str, str],
+    sandbox_file_uploader: Any | None = None,
+) -> dict[str, Any]:
+    """Replace sandbox file paths in MCP tool arguments with presigned URLs.
+
+    Two resolution paths:
+    1. Static: path found in url_map (user-uploaded files) → instant replacement
+    2. Dynamic: path starts with /home/ubuntu/ but not in url_map (agent-generated
+       files, e.g. extracted from zip) → download from sandbox, upload to storage,
+       get presigned URL, cache in url_map for future calls
+    """
+    resolved = {}
+    for key, value in kwargs.items():
+        if not isinstance(value, str) or not value.startswith(_SANDBOX_PATH_PREFIX):
+            resolved[key] = value
+            continue
+
+        # Path 1: already in URL map
+        if value in url_map:
+            resolved[key] = url_map[value]
+            continue
+
+        # Path 2: dynamic upload for agent-generated sandbox files
+        if sandbox_file_uploader is not None:
+            try:
+                url = await sandbox_file_uploader(value)
+                if url:
+                    url_map[value] = url  # cache for future calls
+                    resolved[key] = url
+                    continue
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Failed to upload sandbox file %s for MCP tool: %s", value, exc,
+                )
+
+        # Fallback: pass through unchanged (MCP tool will likely fail)
+        resolved[key] = value
+    return resolved
+
+
+def _make_mcp_coroutine(
+    mcp_tool: MCPTool,
+    tool_name: str,
+    url_map_ref: Any | None = None,
+    sandbox_file_uploader: Any | None = None,
+):
     """为每个 MCP tool 创建独立的协程，通过闭包绑定 tool_name。"""
 
     async def _invoke(**kwargs: Any) -> str:
+        # Resolve sandbox paths → presigned URLs before calling MCP server
+        if url_map_ref is not None:
+            try:
+                url_map = url_map_ref()
+                kwargs = await _resolve_sandbox_paths(
+                    kwargs, url_map, sandbox_file_uploader,
+                )
+            except Exception:
+                pass  # Don't break tool call if resolution fails
+
         result = await mcp_tool.invoke(tool_name, **kwargs)
         # Raise on failure so the caller detects errors structurally
         if hasattr(result, "success") and not result.success:
@@ -114,14 +175,31 @@ def _make_mcp_coroutine(mcp_tool: MCPTool, tool_name: str):
         if hasattr(result, "message") and result.message:
             return result.message
         if hasattr(result, "data") and result.data:
-            return json.dumps(result.data)
+            # Return string data as-is; only JSON-encode non-string data
+            # (dicts, lists) to avoid double-encoding strings with json.dumps
+            return result.data if isinstance(result.data, str) else json.dumps(result.data)
         return str(result)
 
     return _invoke
 
 
-def create_mcp_langchain_tools(mcp_tool: MCPTool) -> list[StructuredTool]:
-    """Convert MCPTool's registered tools into LangChain StructuredTool instances."""
+def create_mcp_langchain_tools(
+    mcp_tool: MCPTool,
+    tool_names: set[str] | None = None,
+    url_map_ref: Any | None = None,
+    sandbox_file_uploader: Any | None = None,
+) -> list[StructuredTool]:
+    """Convert MCPTool's registered tools into LangChain StructuredTool instances.
+
+    Parameters
+    ----------
+    tool_names : optional set of tool names to include.
+        None means all tools (backward compat); empty set means no tools.
+    url_map_ref : optional callable returning dict[str, str] mapping
+        sandbox paths to presigned URLs, for automatic path resolution.
+    sandbox_file_uploader : optional async callable(sandbox_path) -> presigned_url
+        for dynamically uploading agent-generated sandbox files to storage.
+    """
     tools: list[StructuredTool] = []
 
     for schema in mcp_tool.get_tools():
@@ -132,11 +210,17 @@ def create_mcp_langchain_tools(mcp_tool: MCPTool) -> list[StructuredTool]:
 
         if not name:
             continue
+        if tool_names is not None and name not in tool_names:
+            continue
 
         args_schema = _json_schema_to_pydantic(name, parameters)
 
         tool = StructuredTool.from_function(
-            coroutine=_make_mcp_coroutine(mcp_tool, name),
+            coroutine=_make_mcp_coroutine(
+                mcp_tool, name,
+                url_map_ref=url_map_ref,
+                sandbox_file_uploader=sandbox_file_uploader,
+            ),
             name=name,
             description=description,
             args_schema=args_schema,

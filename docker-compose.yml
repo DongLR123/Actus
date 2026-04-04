@@ -5,6 +5,7 @@ services:
       dockerfile: Dockerfile
       args:
         PYTHON_PACKAGE_INDEX_URL: ${PYTHON_PACKAGE_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        INSTALL_WHISPER: ${INSTALL_WHISPER:-false}
     image: ${SANDBOX_IMAGE:-actus-sandbox:latest}
     command: ["/bin/sh", "-c", "echo 'sandbox image is ready'"]
     restart: "no"
@@ -144,6 +145,43 @@ services:
       interval: 15s
       timeout: 5s
       retries: 20
+    networks:
+      - actus-net
+
+  # ---------- SSH 反向隧道（将 API 暴露到云服务器） ----------
+  tunnel:
+    image: alpine:3.20
+    restart: unless-stopped
+    profiles:
+      - tunnel
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      TUNNEL_REMOTE_HOST: ${TUNNEL_REMOTE_HOST:-}
+      TUNNEL_REMOTE_PORT: ${TUNNEL_REMOTE_PORT:-18082}
+      TUNNEL_SSH_USER: ${TUNNEL_SSH_USER:-root}
+      TUNNEL_SSH_PORT: ${TUNNEL_SSH_PORT:-22}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        apk add --no-cache openssh-client autossh &&
+        mkdir -p /root/.ssh &&
+        cp /ssh-key/id_rsa /root/.ssh/id_rsa &&
+        chmod 600 /root/.ssh/id_rsa &&
+        ssh-keyscan -p $${TUNNEL_SSH_PORT} $${TUNNEL_REMOTE_HOST} > /root/.ssh/known_hosts 2>/dev/null &&
+        echo "Starting tunnel: cloud:$${TUNNEL_REMOTE_PORT} -> api:8000" &&
+        exec autossh -M 0 -N \
+          -o "ServerAliveInterval=15" \
+          -o "ServerAliveCountMax=3" \
+          -o "ExitOnForwardFailure=yes" \
+          -o "StrictHostKeyChecking=accept-new" \
+          -p $${TUNNEL_SSH_PORT} \
+          -R 0.0.0.0:$${TUNNEL_REMOTE_PORT}:api:8000 \
+          $${TUNNEL_SSH_USER}@$${TUNNEL_REMOTE_HOST}
+    volumes:
+      - ${TUNNEL_SSH_KEY_PATH:-./tunnel/id_rsa}:/ssh-key/id_rsa:ro
     networks:
       - actus-net
 

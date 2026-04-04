@@ -80,6 +80,7 @@ class GraphEventBridge:
                 async for chunk in graph.astream(
                     input_state,
                     config=merged_config,
+                    stream_mode="updates",
                 ):
                     for _node_name, node_output in chunk.items():
                         if not isinstance(node_output, dict):

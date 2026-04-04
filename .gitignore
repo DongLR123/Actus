@@ -7,6 +7,10 @@ __pycache__/
 # 环境变量文件
 .env
 
+# SSH tunnel keys
+tunnel/id_rsa
+tunnel/id_rsa.pub
+
 
 .pnpm-store/
 # 虚拟环境
@@ -81,3 +85,4 @@ skills-lock.json
 
 CLAUDE.md
 TODOS.md
+TODO2.md

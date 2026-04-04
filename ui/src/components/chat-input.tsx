@@ -9,6 +9,8 @@ import { formatFileSize } from "@/lib/session-ui";
 import { cn } from "@/lib/utils";
 import { useSessionStore } from "@/lib/store/session-store";
 import { useUIStore } from "@/lib/store/ui-store";
+import { useTransferStore, selectHasActiveUploads } from "@/lib/store/transfer-store";
+import { TransferProgress } from "@/components/transfer-progress";
 import { Button } from "@/components/ui/button";
 
 interface ChatInputProps {
@@ -44,7 +46,39 @@ export function ChatInput({
 
   const [text, setText] = useState("");
   const [pendingFiles, setPendingFiles] = useState<FileInfo[]>([]);
-  const [uploading, setUploading] = useState(false);
+
+  // Transfer store: per-session upload tracking (memoize selectors to avoid re-subscribe on every render)
+  const activeUploadSelector = useMemo(() => selectHasActiveUploads(sessionId), [sessionId]);
+  const uploading = useTransferStore(activeUploadSelector);
+  const addTransferTask = useTransferStore((s) => s.addTask);
+  const updateTransferProgress = useTransferStore((s) => s.updateProgress);
+  const completeTransferTask = useTransferStore((s) => s.completeTask);
+  const failTransferTask = useTransferStore((s) => s.failTask);
+  const cancelTransferTask = useTransferStore((s) => s.cancelTask);
+  const retryTransferTask = useTransferStore((s) => s.retryTask);
+  const bindTaskSession = useTransferStore((s) => s.bindTaskSession);
+  const removeTransferTask = useTransferStore((s) => s.removeTask);
+  const getSourceFile = useTransferStore((s) => s.getSourceFile);
+
+  const allTransferTasks = useTransferStore((s) => s.tasks);
+  const uploadTasks = useMemo(
+    () => Object.values(allTransferTasks).filter(
+      (t) => t.type === "upload" && t.sessionId === sessionId &&
+             (t.status === "pending" || t.status === "transferring" || t.status === "failed" || t.status === "cancelled")
+    ),
+    [allTransferTasks, sessionId]
+  );
+
+  const completedUploads = useMemo(
+    () => Object.values(allTransferTasks)
+      .filter(
+        (t) => t.type === "upload" && t.sessionId === sessionId &&
+               t.status === "completed" && t.result !== undefined
+      )
+      .map((t) => ({ taskId: t.id, fileInfo: t.result! })),
+    [allTransferTasks, sessionId]
+  );
+  const [taskIdByFileId, setTaskIdByFileId] = useState<Record<string, string>>({});
 
   useEffect(() => {
     if (!draftText) {
@@ -56,6 +90,19 @@ export function ChatInput({
     });
     onDraftApplied?.();
   }, [draftText, onDraftApplied]);
+
+  // Recover pendingFiles from completed upload tasks on mount/session change/upload completion.
+  // Guard: only recover if pendingFiles is empty (user hasn't manually modified the list).
+  const completedUploadCount = completedUploads.length;
+  useEffect(() => {
+    if (completedUploadCount > 0 && pendingFiles.length === 0) {
+      const files = completedUploads.map((c) => c.fileInfo);
+      const mapping: Record<string, string> = {};
+      completedUploads.forEach((c) => { mapping[c.fileInfo.id] = c.taskId; });
+      setPendingFiles(files);
+      setTaskIdByFileId(mapping);
+    }
+  }, [sessionId, completedUploadCount]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     const element = textareaRef.current;
@@ -72,29 +119,58 @@ export function ChatInput({
 
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const selected = event.target.files;
-    if (!selected || selected.length === 0) {
-      return;
+    if (!selected || selected.length === 0) return;
+
+    const taskIds: string[] = [];
+    const uploads = Array.from(selected).map((file) => {
+      const { taskId, signal } = addTransferTask({
+        type: "upload",
+        filename: file.name,
+        totalBytes: file.size,
+        sourceFile: file,
+        sessionId,
+      });
+      taskIds.push(taskId);
+
+      return uploadFile(file, sessionId, {
+        signal,
+        onProgress: (loaded: number, total: number) => updateTransferProgress(taskId, loaded, total),
+      });
+    });
+
+    const results = await Promise.allSettled(uploads);
+    const succeeded: Array<{ taskId: string; fileInfo: FileInfo }> = [];
+    results.forEach((r, i) => {
+      const taskId = taskIds[i]!;
+      if (r.status === "fulfilled") {
+        completeTransferTask(taskId, r.value);
+        succeeded.push({ taskId, fileInfo: r.value });
+      } else {
+        const msg = r.reason instanceof Error ? r.reason.message : "上传文件失败";
+        failTransferTask(taskId, msg);
+      }
+    });
+
+    if (succeeded.length > 0) {
+      const newMapping: Record<string, string> = { ...taskIdByFileId };
+      succeeded.forEach((s) => { newMapping[s.fileInfo.id] = s.taskId; });
+      setTaskIdByFileId(newMapping);
+      setPendingFiles((prev) => [...prev, ...succeeded.map((s) => s.fileInfo)]);
     }
 
-    setUploading(true);
-    try {
-      const uploadedFiles = await Promise.all(
-        Array.from(selected).map((file) => uploadFile(file, sessionId))
-      );
-      setPendingFiles((prev) => [...prev, ...uploadedFiles]);
-    } catch (error) {
-      setMessage({
-        type: "error",
-        text: error instanceof Error ? error.message : "上传文件失败",
-      });
-    } finally {
-      setUploading(false);
-      event.target.value = "";
-    }
+    event.target.value = "";
   };
 
   const removePendingFile = (fileId: string) => {
     setPendingFiles((prev) => prev.filter((file) => file.id !== fileId));
+    const taskId = taskIdByFileId[fileId];
+    if (taskId) {
+      removeTransferTask(taskId);
+      setTaskIdByFileId((prev) => {
+        const { [fileId]: _, ...rest } = prev;
+        return rest;
+      });
+    }
   };
 
   const sendStructuredConfirmation = async (
@@ -131,6 +207,7 @@ export function ChatInput({
       let targetSessionId = sessionId;
       if (!targetSessionId) {
         targetSessionId = await createSession();
+        bindTaskSession(undefined, targetSessionId);
         router.push(`/sessions/${targetSessionId}`);
       }
 
@@ -146,8 +223,15 @@ export function ChatInput({
         attachments: pendingFiles.map((file) => file.id),
       });
 
+      // Clean up completed upload tasks from store
+      pendingFiles.forEach((file) => {
+        const tid = taskIdByFileId[file.id];
+        if (tid) removeTransferTask(tid);
+      });
+
       setText("");
       setPendingFiles([]);
+      setTaskIdByFileId({});
       requestAnimationFrame(() => {
         textareaRef.current?.focus();
       });
@@ -214,6 +298,33 @@ export function ChatInput({
         ref={fileInputRef}
         onChange={handleFileChange}
       />
+
+      {uploadTasks.length > 0 && (
+        <div className="mb-2 flex flex-col gap-1.5">
+          {uploadTasks.map((task) => (
+            <TransferProgress
+              key={task.id}
+              task={task}
+              onCancel={cancelTransferTask}
+              onRetry={(id) => {
+                const file = getSourceFile(id);
+                if (!file) return;
+                const { signal } = retryTransferTask(id);
+                void uploadFile(file, sessionId, {
+                  signal,
+                  onProgress: (loaded: number, total: number) => updateTransferProgress(id, loaded, total),
+                }).then((fileInfo: FileInfo) => {
+                  completeTransferTask(id, fileInfo);
+                  setPendingFiles((prev) => [...prev, fileInfo]);
+                  setTaskIdByFileId((prev) => ({ ...prev, [fileInfo.id]: id }));
+                }).catch((error: unknown) => {
+                  failTransferTask(id, error instanceof Error ? error.message : "上传失败");
+                });
+              }}
+            />
+          ))}
+        </div>
+      )}
 
       {pendingFiles.length > 0 ? (
         <div className="mb-2 flex flex-wrap gap-2">

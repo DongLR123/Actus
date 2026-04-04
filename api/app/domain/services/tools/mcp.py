@@ -294,13 +294,32 @@ class MCPClientManager:
     async def _cache_mcp_server_tools(
         self, server_name: str, session: ClientSession
     ) -> None:
-        """根据传递的服务名字+会话缓存mcp服务工具列表"""
+        """根据传递的服务名字+会话缓存mcp服务工具列表，支持分页。
+
+        使用 deadline 模式：所有分页共享总时间预算，每次请求使用剩余时间。
+        """
         try:
-            async with asyncio.timeout(MCP_SERVER_LIST_TOOLS_TIMEOUT_SECONDS):
-                tools_response = await session.list_tools()
-            tools = tools_response.tools if tools_response else []
-            self._tools[server_name] = tools
-            logger.info(f"MCP服务器[{server_name}]提供了{len(tools)}个工具")
+            all_tools: List[Tool] = []
+            cursor: str | None = None
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + MCP_SERVER_LIST_TOOLS_TIMEOUT_SECONDS
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    logger.warning(
+                        "MCP服务器[%s]分页超时，已获取 %d 个工具（可能不完整）",
+                        server_name, len(all_tools),
+                    )
+                    break
+                async with asyncio.timeout(remaining):
+                    tools_response = await session.list_tools(cursor=cursor)
+                if tools_response and tools_response.tools:
+                    all_tools.extend(tools_response.tools)
+                if not tools_response or not tools_response.nextCursor:
+                    break
+                cursor = tools_response.nextCursor
+            self._tools[server_name] = all_tools
+            logger.info(f"MCP服务器[{server_name}]提供了{len(all_tools)}个工具")
         except Exception as e:
             # 记录日志并将缓存设置为空
             logger.error(f"获取MCP服务器[{server_name}]工具列表失败: {str(e)}")

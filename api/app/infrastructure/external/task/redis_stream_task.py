@@ -119,14 +119,10 @@ class RedisStreamTask(Task):
 
     @classmethod
     async def destroy(cls) -> None:
-        for task_id in RedisStreamTask._task_registry:
-            # 1.获取对应的任务
-            task = RedisStreamTask._task_registry[task_id]
+        for task in list(RedisStreamTask._task_registry.values()):
             task.cancel()
 
-            # 2.检测任务是否有任务运行器
             if task._task_runner:
                 await task._task_runner.destroy()
 
-        # 3.清除全局变量
         cls._task_registry.clear()

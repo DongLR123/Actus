@@ -15,7 +15,7 @@ async def _make_astream_graph(chunks: list[dict]):
     """Create a fake graph whose astream yields the given chunks."""
 
     class FakeGraph:
-        async def astream(self, input_state, config=None):
+        async def astream(self, input_state, config=None, **kwargs):
             for chunk in chunks:
                 yield chunk
 
@@ -78,7 +78,7 @@ class TestGraphEventBridge:
         msg_event = MessageEvent(role="assistant", message="from queue")
 
         class QueuePushGraph:
-            async def astream(self, input_state, config=None):
+            async def astream(self, input_state, config=None, **kwargs):
                 # Simulate executor_node pushing to queue
                 queue = config["configurable"]["event_queue"]
                 await queue.put(msg_event)
@@ -105,7 +105,7 @@ class TestGraphEventBridge:
         wait_event = WaitEvent()
 
         class InterruptGraph:
-            async def astream(self, input_state, config=None):
+            async def astream(self, input_state, config=None, **kwargs):
                 # executor_node pushes WaitEvent and returns should_interrupt
                 queue = config["configurable"]["event_queue"]
                 await queue.put(wait_event)
@@ -141,7 +141,7 @@ class TestGraphEventBridge:
         from app.domain.services.graphs.event_bridge import GraphEventBridge
 
         class ErrorGraph:
-            async def astream(self, input_state, config=None):
+            async def astream(self, input_state, config=None, **kwargs):
                 yield {"node": {"events": [], "data": "ok"}}
                 raise RuntimeError("graph execution failed")
 

@@ -84,44 +84,33 @@ class SkillExportService:
     def _build_agent_skills_md(
         self, slug: str, meta: dict, manifest: dict
     ) -> str:
-        """构建符合 Agent Skills 标准的 SKILL.md。"""
-        name = self._normalize_agent_skill_name(
-            str(meta.get("slug") or meta.get("name") or slug)
-        )
-        description = str(
-            meta.get("description") or manifest.get("description") or ""
-        )[:1024]
-        version = str(meta.get("version") or manifest.get("version") or "0.1.0")
+        """构建符合 Agent Skills 标准的 SKILL.md（使用 SkillMdExporter）。"""
+        from app.domain.services.skill_md_exporter import SkillMdExporter
+
         runtime_type = str(
             meta.get("runtime_type") or manifest.get("runtime_type") or "native"
         )
-        risk_level = str((manifest.get("policy") or {}).get("risk_level") or "")
-
-        lines = ["---"]
-        lines.append(f"name: {name}")
-        lines.append(f"description: {description or name}")
-
+        # Preserve compatibility inference from original export logic
+        export_metadata = dict(manifest.get("metadata") or {})
         compatibility = self._infer_compatibility(
             runtime_type, meta.get("source_ref", "")
         )
         if compatibility:
-            lines.append(f"compatibility: {compatibility}")
+            export_metadata["compatibility"] = compatibility
 
-        lines.append("metadata:")
-        lines.append(f'  version: "{version}"')
-        lines.append(f"  runtime-type: {runtime_type}")
-        if risk_level:
-            lines.append(f"  risk-level: {risk_level}")
-
-        lines.append("---")
-
-        raw_skill_md = str(manifest.get("skill_md") or "")
-        body = self._extract_body(raw_skill_md)
-        if not body.strip():
-            body = f"\n# {meta.get('name') or name}\n\n{description}\n"
-
-        lines.append(body)
-        return "\n".join(lines)
+        exporter_meta = {
+            "name": self._normalize_agent_skill_name(
+                str(meta.get("slug") or meta.get("name") or slug)
+            ),
+            "slug": meta.get("slug") or slug,
+            "description": str(
+                meta.get("description") or manifest.get("description") or ""
+            )[:1024],
+            "version": str(meta.get("version") or manifest.get("version") or "0.1.0"),
+            "runtime_type": runtime_type,
+            "metadata": export_metadata,
+        }
+        return SkillMdExporter.export(exporter_meta, manifest)
 
     def _add_bundle_files(
         self, zf: zipfile.ZipFile, skill_dir: Path, slug: str

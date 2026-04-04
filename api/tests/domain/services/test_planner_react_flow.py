@@ -203,18 +203,39 @@ async def test_ensure_graphs_builds_tools_lazily(mock_llm, mock_uow):
     flow = _make_flow(mock_llm, mock_uow,
                       mcp_tool=mock_mcp, a2a_tool=mock_a2a)
 
+    # Configure always_bind so MCP tools are queried during _ensure_graphs
+    flow._mcp_always_bind_names = {"notion_search"}
+
     # Before _ensure_graphs: no graphs
     assert flow._graphs_built is False
     assert flow._react_graph is None
 
-    # Call _ensure_graphs: should pick up MCP tools
+    # Call _ensure_graphs: should pick up MCP tools (filtered by always_bind)
     await flow._ensure_graphs()
 
     assert flow._graphs_built is True
     assert flow._react_graph is not None
     assert flow._main_graph is not None
-    # Verify MCP tools were queried
+    # Verify MCP tools were queried (for always_bind filtering)
     mock_mcp.get_tools.assert_called()
+
+
+async def test_ensure_graphs_passes_tool_result_max_chars(mock_llm, mock_uow):
+    """_ensure_graphs should forward overflow_config.tool_result_max_chars to build_react_graph."""
+    from app.domain.models.context_overflow_config import ContextOverflowConfig
+
+    overflow = ContextOverflowConfig(tool_result_max_chars=4000)
+    flow = _make_flow(mock_llm, mock_uow, overflow_config=overflow)
+
+    with patch(
+        "app.domain.services.flows.planner_react.build_react_graph",
+        return_value=MagicMock(),
+    ) as mock_build:
+        await flow._ensure_graphs()
+
+    mock_build.assert_called_once()
+    _, kwargs = mock_build.call_args
+    assert kwargs["tool_result_max_chars"] == 4000
 
 
 async def test_generator_early_close_still_persists(

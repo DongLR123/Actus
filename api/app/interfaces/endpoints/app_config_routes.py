@@ -2,7 +2,7 @@ import logging
 from typing import Dict, Optional
 
 from app.application.services.app_config_service import AppConfigService
-from app.domain.models.app_config import AgentConfig, LLMConfig, MCPConfig
+from app.domain.models.app_config import AgentConfig, FileUnderstandingConfig, LLMConfig, MCPConfig
 from app.interfaces.dependencies import AdminUser, CurrentUser
 from app.interfaces.schemas.app_config import (
     ListA2AServerResponse,
@@ -82,6 +82,40 @@ async def update_agent_config(
     )
     return Response.success(
         msg="更新Agent信息配置成功", data=updated_agent_config.model_dump()
+    )
+
+
+@router.get(
+    path="/file-understanding",
+    response_model=Response[FileUnderstandingConfig],
+    summary="获取文件理解配置",
+)
+async def get_file_understanding_config(
+    current_user: CurrentUser,
+    app_config_service: AppConfigService = Depends(get_app_config_service),
+) -> Response[FileUnderstandingConfig]:
+    """获取文件理解配置"""
+    config = await app_config_service.get_file_understanding_config()
+    return Response.success(
+        data=config.model_dump(exclude={"vision_fallback": {"api_key"}, "audio": {"openai_api_key"}})
+    )
+
+
+@router.post(
+    path="/file-understanding",
+    response_model=Response[FileUnderstandingConfig],
+    summary="更新文件理解配置（仅限管理员）",
+)
+async def update_file_understanding_config(
+    config: FileUnderstandingConfig,
+    admin_user: AdminUser,
+    app_config_service: AppConfigService = Depends(get_app_config_service),
+) -> Response[FileUnderstandingConfig]:
+    """更新文件理解配置（仅限管理员）"""
+    updated = await app_config_service.update_file_understanding_config(config)
+    return Response.success(
+        msg="文件理解配置已保存",
+        data=updated.model_dump(exclude={"vision_fallback": {"api_key"}, "audio": {"openai_api_key"}}),
     )
 
 

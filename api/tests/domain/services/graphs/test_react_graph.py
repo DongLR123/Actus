@@ -52,6 +52,7 @@ class TestBuildReactGraph:
             "original_request": "greet",
             "language": "en",
             "attachments": [],
+            "image_content_blocks": [],
             "events": [],
             "should_interrupt": False,
             "soft_hint_sent": False,
@@ -90,6 +91,7 @@ class TestBuildReactGraph:
             "original_request": "list files",
             "language": "en",
             "attachments": [],
+            "image_content_blocks": [],
             "events": [],
             "should_interrupt": False,
             "soft_hint_sent": False,
@@ -136,6 +138,7 @@ class TestBuildReactGraph:
             "original_request": "search",
             "language": "en",
             "attachments": [],
+            "image_content_blocks": [],
             "events": [],
             "should_interrupt": False,
             "soft_hint_sent": False,
@@ -192,6 +195,7 @@ class TestBuildReactGraph:
             "original_request": "search",
             "language": "en",
             "attachments": [],
+            "image_content_blocks": [],
             "events": [],
             "should_interrupt": False,
             "soft_hint_sent": False,
@@ -209,3 +213,154 @@ class TestBuildReactGraph:
         # Tool message should be prefixed with [TOOL_ERROR]
         tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage)]
         assert any("[TOOL_ERROR]" in m.content for m in tool_msgs)
+
+
+class TestToolNodeTruncation:
+    """Verify Tier 1 truncation: tool results > tool_result_max_chars are truncated."""
+
+    async def test_tool_node_truncates_large_result(self):
+        """Tool returning > max_chars -> ToolMessage.content truncated with head+tail."""
+        from langchain_core.messages import AIMessage
+        from langchain_core.tools import tool as lc_tool
+        from app.domain.services.graphs.react_graph import build_react_graph
+
+        large_output = "X" * 500
+
+        @lc_tool
+        async def big_tool(query: str) -> str:
+            """Returns large output."""
+            return large_output
+
+        call_count = 0
+
+        async def mock_ainvoke(messages, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[{"id": "c1", "name": "big_tool", "args": {"query": "test"}}],
+                )
+            return AIMessage(content="done")
+
+        adapter = AsyncMock()
+        adapter.ainvoke = mock_ainvoke
+        adapter.bind_tools = MagicMock(return_value=adapter)
+
+        graph = build_react_graph(adapter, [big_tool], tool_result_max_chars=100)
+        result = await graph.ainvoke({
+            "messages": [{"role": "user", "content": "run big tool"}],
+            "step_description": "test",
+            "original_request": "test",
+            "language": "en",
+            "attachments": [],
+            "image_content_blocks": [],
+            "events": [],
+            "should_interrupt": False,
+            "soft_hint_sent": False,
+            "attempt_count": 0,
+            "failure_count": 0,
+        })
+
+        tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "big_tool"]
+        assert len(tool_msgs) >= 1
+        assert len(tool_msgs[0].content) < 500
+        assert "已截断" in tool_msgs[0].content
+
+    async def test_tool_node_truncates_tool_event(self):
+        """ToolEvent.function_result.message should also be truncated."""
+        from langchain_core.messages import AIMessage
+        from langchain_core.tools import tool as lc_tool
+        from app.domain.services.graphs.react_graph import build_react_graph
+
+        @lc_tool
+        async def big_tool(query: str) -> str:
+            """Returns large output."""
+            return "Y" * 500
+
+        call_count = 0
+
+        async def mock_ainvoke(messages, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[{"id": "c1", "name": "big_tool", "args": {"query": "test"}}],
+                )
+            return AIMessage(content="done")
+
+        adapter = AsyncMock()
+        adapter.ainvoke = mock_ainvoke
+        adapter.bind_tools = MagicMock(return_value=adapter)
+
+        graph = build_react_graph(adapter, [big_tool], tool_result_max_chars=100)
+        result = await graph.ainvoke({
+            "messages": [{"role": "user", "content": "run"}],
+            "step_description": "test",
+            "original_request": "test",
+            "language": "en",
+            "attachments": [],
+            "image_content_blocks": [],
+            "events": [],
+            "should_interrupt": False,
+            "soft_hint_sent": False,
+            "attempt_count": 0,
+            "failure_count": 0,
+        })
+
+        called_events = [
+            e for e in result["events"]
+            if isinstance(e, ToolEvent) and e.function_result is not None
+        ]
+        assert len(called_events) >= 1
+        event_msg = called_events[0].function_result.message
+        assert len(event_msg) < 500
+        assert "已截断" in event_msg
+
+    async def test_tool_result_max_chars_parameter(self):
+        """Passing a small tool_result_max_chars triggers truncation at that threshold."""
+        from langchain_core.messages import AIMessage
+        from langchain_core.tools import tool as lc_tool
+        from app.domain.services.graphs.react_graph import build_react_graph
+
+        @lc_tool
+        async def medium_tool(query: str) -> str:
+            """Returns medium output."""
+            return "Z" * 200
+
+        call_count = 0
+
+        async def mock_ainvoke(messages, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return AIMessage(
+                    content="",
+                    tool_calls=[{"id": "c1", "name": "medium_tool", "args": {"query": "test"}}],
+                )
+            return AIMessage(content="done")
+
+        adapter = AsyncMock()
+        adapter.ainvoke = mock_ainvoke
+        adapter.bind_tools = MagicMock(return_value=adapter)
+
+        graph = build_react_graph(adapter, [medium_tool], tool_result_max_chars=50)
+        result = await graph.ainvoke({
+            "messages": [{"role": "user", "content": "run"}],
+            "step_description": "test",
+            "original_request": "test",
+            "language": "en",
+            "attachments": [],
+            "image_content_blocks": [],
+            "events": [],
+            "should_interrupt": False,
+            "soft_hint_sent": False,
+            "attempt_count": 0,
+            "failure_count": 0,
+        })
+
+        tool_msgs = [m for m in result["messages"] if isinstance(m, ToolMessage) and m.name == "medium_tool"]
+        assert len(tool_msgs) >= 1
+        assert len(tool_msgs[0].content) < 200
+        assert "已截断" in tool_msgs[0].content

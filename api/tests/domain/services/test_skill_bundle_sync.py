@@ -189,3 +189,91 @@ async def test_sync_failure_is_reported_to_invoke_path(tmp_path: Path) -> None:
     assert sandbox_dir is None
     assert error
     assert "上传文件失败" in error
+
+
+class TestFileListingCache:
+    """Tests for post-sync file listing cache."""
+
+    def test_get_file_listing_returns_none_before_sync(self):
+        """Before sync, file listing should be None."""
+        sandbox = _FakeSandbox()
+        manager = SkillBundleSyncManager(
+            sandbox=sandbox, skills_root_dir="/tmp/skills",
+            sandbox_skill_root="/home/ubuntu/workspace/.skills",
+        )
+        assert manager.get_file_listing("nonexistent-id") is None
+
+    def test_get_file_listing_all_returns_empty_before_sync(self):
+        """Before sync, get_file_listing_all should return empty dict."""
+        sandbox = _FakeSandbox()
+        manager = SkillBundleSyncManager(
+            sandbox=sandbox, skills_root_dir="/tmp/skills",
+            sandbox_skill_root="/home/ubuntu/workspace/.skills",
+        )
+        assert manager.get_file_listing_all() == {}
+
+    async def test_file_listing_populated_after_sync(self, tmp_path):
+        """After successful sync, file listing should contain relative paths."""
+        skills_root = tmp_path / "skills"
+        _write_bundle(skills_root, "test-skill")
+
+        sandbox = _FakeSandbox()
+        manager = SkillBundleSyncManager(
+            sandbox=sandbox, skills_root_dir=skills_root,
+            sandbox_skill_root="/home/ubuntu/workspace/.skills",
+        )
+        skill = _build_native_skill("test-skill", version="v1")
+        await manager.prepare_startup_sync([skill], [skill])
+        await manager.await_initial_sync()
+
+        listing = manager.get_file_listing("test-skill")
+        assert listing is not None
+        assert "SKILL.md" in listing
+        assert "scripts/run.py" in listing
+
+    async def test_file_listing_populated_on_version_match(self, tmp_path):
+        """Cache should also be populated when sync skips upload (marker matches)."""
+        skills_root = tmp_path / "skills"
+        _write_bundle(skills_root, "cached-skill")
+
+        sandbox = _FakeSandbox()
+        manager = SkillBundleSyncManager(
+            sandbox=sandbox, skills_root_dir=skills_root,
+            sandbox_skill_root="/home/ubuntu/workspace/.skills",
+        )
+        skill = _build_native_skill("cached-skill", version="v1")
+
+        # First sync: uploads files + writes marker
+        await manager.prepare_startup_sync([skill], [skill])
+        await manager.await_initial_sync()
+
+        # Second manager: should hit version-match early return
+        manager2 = SkillBundleSyncManager(
+            sandbox=sandbox, skills_root_dir=skills_root,
+            sandbox_skill_root="/home/ubuntu/workspace/.skills",
+        )
+        await manager2.prepare_startup_sync([skill], [skill])
+        await manager2.await_initial_sync()
+
+        listing2 = manager2.get_file_listing("cached-skill")
+        assert listing2 is not None
+        assert "SKILL.md" in listing2
+
+    async def test_file_listing_empty_on_sync_failure(self, tmp_path):
+        """When sync fails, file listing should remain None."""
+        skills_root = tmp_path / "skills"
+        _write_bundle(skills_root, "fail-skill")
+
+        sandbox = _FakeSandbox()
+        sandbox.fail_upload_paths.add(
+            "/home/ubuntu/workspace/.skills/fail-skill/SKILL.md"
+        )
+        manager = SkillBundleSyncManager(
+            sandbox=sandbox, skills_root_dir=skills_root,
+            sandbox_skill_root="/home/ubuntu/workspace/.skills",
+        )
+        skill = _build_native_skill("fail-skill", version="v1")
+        await manager.prepare_startup_sync([skill], [skill])
+        await manager.await_initial_sync()
+
+        assert manager.get_file_listing("fail-skill") is None

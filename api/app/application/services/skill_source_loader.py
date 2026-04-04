@@ -3,13 +3,15 @@ from __future__ import annotations
 """Load Skill bundles from GitHub URLs or local directories."""
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 from app.application.errors.exceptions import ValidationError
 from app.domain.models.skill import SkillSourceType
+from app.domain.services.skill_md_parser import SkillMdParser
 
 MAX_BUNDLE_FILE_COUNT = 200
 MAX_BUNDLE_FILE_SIZE = 256 * 1024
@@ -32,6 +34,9 @@ class SkillBundle:
     normalized_source_ref: str
     skill_md: str
     files: dict[str, SkillBundleFile]
+    # Phase B: parser-extracted fields from SKILL.md frontmatter
+    parsed_meta: dict[str, Any] = field(default_factory=dict)
+    parsed_manifest: dict[str, Any] = field(default_factory=dict)
 
 
 class SkillSourceLoader:
@@ -87,10 +92,13 @@ class SkillSourceLoader:
             raise ValidationError(msg="目录中缺少 SKILL.md")
 
         skill_md = self._decode_utf8(files["SKILL.md"].content, "SKILL.md")
+        parse_result = SkillMdParser.parse(skill_md)
         return SkillBundle(
             normalized_source_ref=f"local:{skill_root.as_posix()}",
             skill_md=skill_md,
             files=files,
+            parsed_meta=parse_result.meta,
+            parsed_manifest=parse_result.manifest,
         )
 
     async def _load_from_github(self, source_ref: str) -> SkillBundle:
@@ -133,10 +141,13 @@ class SkillSourceLoader:
             raise ValidationError(msg="GitHub Skill 目录中缺少 SKILL.md")
 
         skill_md = self._decode_utf8(files["SKILL.md"].content, "SKILL.md")
+        parse_result = SkillMdParser.parse(skill_md)
         return SkillBundle(
             normalized_source_ref=self._build_github_source_ref(owner, repo, ref, base_path),
             skill_md=skill_md,
             files=files,
+            parsed_meta=parse_result.meta,
+            parsed_manifest=parse_result.manifest,
         )
 
     async def _fetch_github_dir(

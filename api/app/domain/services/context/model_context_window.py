@@ -1,12 +1,43 @@
 from app.domain.models.context_overflow_config import ContextOverflowConfig
 
 MODEL_CONTEXT_WINDOW_MAP: dict[str, int] = {
-    "gpt-4o": 128000,
-    "gpt-4o-mini": 128000,
+    # OpenAI — GPT 系列
+    "gpt-4o": 128_000,
+    "gpt-4o-mini": 128_000,
     "gpt-4.1": 1_048_576,
     "gpt-4.1-mini": 1_048_576,
-    "deepseek-chat": 65536,
-    "deepseek-reasoner": 65536,
+    "gpt-4.1-nano": 1_048_576,
+    "gpt-5": 1_048_576,
+    "gpt-5.4": 1_050_000,
+    "gpt-5.4-mini": 400_000,
+    "gpt-5.4-nano": 400_000,
+    # OpenAI — o 系列（推理模型）
+    "o3": 200_000,
+    "o3-mini": 200_000,
+    "o4-mini": 200_000,
+    # DeepSeek
+    "deepseek-chat": 128_000,
+    "deepseek-reasoner": 128_000,
+    # Anthropic Claude
+    "claude-3-5-sonnet": 200_000,
+    "claude-3-5-haiku": 200_000,
+    "claude-sonnet-4": 200_000,
+    "claude-opus-4": 200_000,
+    "claude-sonnet-4-5": 200_000,
+    "claude-opus-4-5": 200_000,
+    "claude-haiku-4-5": 200_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-opus-4-6": 1_000_000,
+    # Qwen（通义千问）
+    "qwen-plus": 1_000_000,
+    "qwen-turbo": 1_000_000,
+    "qwen-max": 32_768,
+    "qwen-flash": 1_000_000,
+    "qwen3-max": 262_144,
+    # Google Gemini
+    "gemini-2.5-pro": 1_000_000,
+    "gemini-2.5-flash": 1_000_000,
+    "gemini-2.0-flash": 1_000_000,
 }
 
 

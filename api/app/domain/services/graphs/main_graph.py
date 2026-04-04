@@ -13,14 +13,19 @@ import asyncio
 import logging
 import re
 import uuid
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, TYPE_CHECKING
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.runnables import RunnableConfig
-from langgraph.graph import END, START, StateGraph
-from langgraph.types import RetryPolicy, interrupt
 
+from .message_utils import truncate_tool_content
 from langchain_core.language_models import BaseChatModel
+from langchain_core.runnables import RunnableConfig
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command, RetryPolicy, interrupt
+
+from app.domain.models.app_config import AgentConfig
 
 from app.application.errors.exceptions import ServerRequestsError
 from app.domain.models.file import File
@@ -39,8 +44,11 @@ from app.domain.models.plan import ExecutionStatus, Plan, Step
 from app.domain.repositories.uow import IUnitOfWork
 from app.domain.services.flows.base import FlowStatus
 
-from .message_utils import dedup_messages
+from .message_utils import build_multimodal_content, dedup_messages, format_attachments_text
 from .state import MainGraphState
+
+if TYPE_CHECKING:
+    from .context_assembler import ContextAssembler
 
 logger = logging.getLogger(__name__)
 
@@ -54,9 +62,22 @@ def _compact_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
     Mirrors the main-branch Memory.compact() behaviour:
     - Replace browser tool results with short summaries
     - Truncate very long tool results
+    - Strip multimodal image blocks from HumanMessage to avoid re-sending
+      large base64 payloads on every subsequent step
     """
     compacted: list[BaseMessage] = []
     for msg in messages:
+        # Strip multimodal image content blocks — images were already "seen" in step 1,
+        # subsequent steps only need the text portion to avoid bloating context with base64.
+        if isinstance(msg, HumanMessage) and isinstance(msg.content, list):
+            text_parts = [
+                block.get("text", "")
+                for block in msg.content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            text_only = "\n".join(text_parts) if text_parts else str(msg.content)
+            compacted.append(HumanMessage(content=text_only))
+            continue
         if isinstance(msg, ToolMessage) and isinstance(msg.content, str) and msg.name in _BROWSER_COMPACT_TOOLS:
             # Extract title and short preview from HTML content
             content = msg.content
@@ -76,9 +97,9 @@ def _compact_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
                 name=msg.name,
             ))
         elif isinstance(msg, ToolMessage) and isinstance(msg.content, str) and len(msg.content) > 2000:
-            # Truncate very long tool results to keep context manageable
+            # Tier 2: 截断超长工具结果，压缩跨 step 存储
             compacted.append(ToolMessage(
-                content=msg.content[:2000] + "\n...(已截断)",
+                content=truncate_tool_content(msg.content, 2000),
                 tool_call_id=msg.tool_call_id,
                 name=msg.name,
             ))
@@ -89,14 +110,15 @@ def _compact_messages(messages: list[BaseMessage]) -> list[BaseMessage]:
 
 def build_main_graph(
     planner_llm: BaseChatModel,
-    react_graph: Any,  # compiled react_graph
+    react_graph: CompiledStateGraph,
     summary_llm: BaseChatModel,
     uow_factory: Callable[[], IUnitOfWork],
     session_id: str,
-    agent_config: Any = None,
-    prompts: Any = None,
-    checkpointer: Any = None,
-) -> Any:
+    agent_config: AgentConfig | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
+    assembler: ContextAssembler | None = None,
+    supports_vision: bool = True,
+) -> CompiledStateGraph:
     """Build and compile the main orchestration graph.
 
     Parameters
@@ -115,9 +137,14 @@ def build_main_graph(
     async def planner_node(state: MainGraphState) -> dict:
         """Call planner LLM to create a plan from user message."""
         attachments = state.get("attachments", [])
+        image_blocks = state.get("image_content_blocks", [])
+        # Planner 不传图片但需要知道附件包含图片，使用 planner 专用提示
         prompt = CREATE_PLAN_PROMPT.format(
             message=state["message"],
-            attachments=", ".join(attachments) if attachments else "无",
+            attachments=format_attachments_text(
+                attachments, has_image_blocks=bool(image_blocks), for_planner=True,
+                supports_vision=supports_vision,
+            ),
         )
 
         # Build system prompt with optional tool summary and conversation summaries
@@ -135,7 +162,9 @@ def build_main_graph(
         if conversation_summaries:
             system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(conversation_summaries)
 
-        # Use structured output via LangChain BaseChatModel
+        # Planner 不传图片：planner 识图不可靠，容易幻觉图片内容并写入 step description，
+        # 导致 executor 被错误的描述误导。图片分析留给 executor 通过 MCP 工具完成。
+        # 附件文本信息（路径、URL）仍保留，让 planner 知道有附件存在。
         messages = [
             SystemMessage(content=system_content),
             HumanMessage(content=prompt),
@@ -181,7 +210,9 @@ def build_main_graph(
             "events": events,
         }
 
-    async def executor_node(state: MainGraphState, config: RunnableConfig) -> dict:
+    async def executor_node(
+        state: MainGraphState, config: RunnableConfig,
+    ) -> Command[Literal["updater_node", "summarizer_node", "interrupt_node"]]:
         """Execute current step via react_graph sub-graph.
 
         Streams react events to the event_queue in real-time so the frontend
@@ -200,11 +231,27 @@ def build_main_graph(
 
         step = state["current_step"]
         if not step:
-            return {
-                "flow_status": FlowStatus.SUMMARIZING.value,
-                "events": [],
-                "messages": state.get("messages", []),
-            }
+            logger.warning("executor_node: current_step is None, routing to summarizer")
+            return Command(
+                update={
+                    "flow_status": FlowStatus.SUMMARIZING.value,
+                    "events": [],
+                    "messages": state.get("messages", []),
+                },
+                goto="summarizer_node",
+            )
+
+        # Phase 3: 获取当前 step 的编译后 react_graph（渐进式 Skill 加载）
+        # 传递步骤描述，使 provider 能按步骤选择相关 Skill 工具
+        react_graph_provider = (config.get("configurable") or {}).get("react_graph_provider")
+        if react_graph_provider:
+            try:
+                step_react = await react_graph_provider(step.description)
+            except Exception:
+                logger.warning("react_graph_provider 失败，使用默认（无动态Skill工具）")
+                step_react = react_graph
+        else:
+            step_react = react_graph
 
         resume_value = state.get("resume_value")
 
@@ -214,10 +261,18 @@ def build_main_graph(
 
         # Build initial messages with system prompt + execution prompt
         attachments = state.get("attachments", [])
+        image_blocks = state.get("image_content_blocks", [])
         language = state.get("language", "zh")
         skill_context = state.get("skill_context", "")
 
         system_content = REACT_SYSTEM_PROMPT
+
+        # Inject file_view hint when the tool is available
+        has_file_view = (config.get("configurable") or {}).get("has_file_view", False)
+        if has_file_view:
+            from app.domain.services.prompts.react import FILE_VIEW_HINT
+            system_content += FILE_VIEW_HINT
+
         if skill_context:
             system_content += f"\n\n{skill_context}"
 
@@ -250,6 +305,7 @@ def build_main_graph(
             initial_messages = saved_messages + [HumanMessage(content=resume_hint)]
         elif saved_messages:
             # 非首步/有历史：更新 system prompt 为最新版本，追加新 execution prompt
+            # 图片已在首步消息中（已被 compact 剥离），无需重复添加
             first = saved_messages[0]
             updated_first = SystemMessage(content=system_content) if isinstance(first, SystemMessage) else first
             initial_messages = [
@@ -257,21 +313,29 @@ def build_main_graph(
                 *saved_messages[1:],
                 HumanMessage(content=EXECUTION_PROMPT.format(
                     message=state["message"],
-                    attachments=", ".join(attachments) if attachments else "无",
+                    attachments=format_attachments_text(attachments),
                     language=language,
                     step=step.description,
                 )),
             ]
         else:
-            # 首步/无历史：干净的 system + execution prompt
+            # 首步/无历史：干净的 system + execution prompt（含图片多模态内容）
+            attachments_text = format_attachments_text(
+                attachments, has_image_blocks=bool(image_blocks),
+                supports_vision=supports_vision,
+            )
+            execution_text = EXECUTION_PROMPT.format(
+                message=state["message"],
+                attachments=attachments_text,
+                language=language,
+                step=step.description,
+            )
+            logger.debug("[IMG] executor_node: image_blocks=%d, attachments=%s", len(image_blocks), attachments)
+            prompt_content = build_multimodal_content(execution_text, image_blocks)
+            logger.debug("[IMG] executor_node: prompt_content type=%s, is_list=%s", type(prompt_content).__name__, isinstance(prompt_content, list))
             initial_messages = [
                 SystemMessage(content=system_content),
-                HumanMessage(content=EXECUTION_PROMPT.format(
-                    message=state["message"],
-                    attachments=", ".join(attachments) if attachments else "无",
-                    language=language,
-                    step=step.description,
-                )),
+                HumanMessage(content=prompt_content),
             ]
 
         # Build react_graph input
@@ -281,6 +345,7 @@ def build_main_graph(
             "original_request": state.get("original_request", ""),
             "language": language,
             "attachments": attachments,
+            "image_content_blocks": image_blocks,
             "events": [],
             "should_interrupt": False,
             "soft_hint_sent": False,
@@ -288,14 +353,24 @@ def build_main_graph(
             "failure_count": 0,
         }
 
+        # ── Cross-step context assembly ──
+        if assembler is not None and resume_value is None:
+            asm_result = assembler.assemble(react_input["messages"])
+            react_input["messages"] = asm_result.messages
+            if asm_result.actions:
+                logger.info("context_assembler(cross-step): %s", asm_result.actions)
+
         # Stream react_graph — emit events in real-time.
-        # ReactGraphState.messages uses add_messages reducer, so astream
-        # (default stream_mode="updates") yields only NEW messages per chunk,
-        # not the full history. We accumulate them manually here.
+        # IMPORTANT: Must use stream_mode="updates" explicitly.
+        # LangGraph 1.0.x defaults to "values" (full state per chunk), but we
+        # need "updates" ({node_name: state_update} per chunk) so that we can
+        # accumulate only NEW messages from each node and emit events in order.
         react_final: dict[str, Any] = {}
         all_react_messages: list = []
         seen_interrupt = False
-        async for chunk in react_graph.astream(react_input):
+        async for chunk in step_react.astream(
+            react_input, config=config, stream_mode="updates",
+        ):
             for _node_name, node_output in chunk.items():
                 if not isinstance(node_output, dict):
                     continue
@@ -337,16 +412,19 @@ def build_main_graph(
         if should_interrupt:
             # 中断的步骤不标记为 COMPLETED，保留 RUNNING 状态
             await _emit(WaitEvent())
-            return {
-                "messages": final_messages,
-                "current_step": step,
-                "execution_summary": summary,
-                "should_interrupt": True,
-                "resume_value": None,
-                "flow_status": FlowStatus.EXECUTING.value,
-                "original_request": state.get("original_request", ""),
-                "events": [],  # WaitEvent 已通过 _emit 发送，避免重复
-            }
+            return Command(
+                update={
+                    "messages": final_messages,
+                    "current_step": step,
+                    "execution_summary": summary,
+                    "should_interrupt": True,
+                    "resume_value": None,
+                    "flow_status": FlowStatus.EXECUTING.value,
+                    "original_request": state.get("original_request", ""),
+                    "events": [],  # WaitEvent 已通过 _emit 发送，避免重复
+                },
+                goto="interrupt_node",
+            )
 
         # 通过 model_copy 创建新对象避免直接变异 state 对象
         # （LangGraph 要求节点返回 partial update dict，不可直接修改 state）
@@ -357,16 +435,21 @@ def build_main_graph(
         })
         await _emit(StepEvent(step=step, status=StepEventStatus.COMPLETED))
 
-        return {
-            "messages": final_messages,
-            "current_step": step,
-            "execution_summary": summary,
-            "resume_value": None,
-            "flow_status": FlowStatus.UPDATING.value,
-            "events": [],  # already emitted via queue
-        }
+        return Command(
+            update={
+                "messages": final_messages,
+                "current_step": step,
+                "execution_summary": summary,
+                "resume_value": None,
+                "flow_status": FlowStatus.UPDATING.value,
+                "events": [],  # already emitted via queue
+            },
+            goto="updater_node",
+        )
 
-    async def updater_node(state: MainGraphState, config: RunnableConfig) -> dict:
+    async def updater_node(
+        state: MainGraphState, config: RunnableConfig,
+    ) -> Command[Literal["executor_node", "summarizer_node"]]:
         """Update the plan after step execution — mark step done, call planner
         to update remaining steps with execution context, then get next step.
 
@@ -382,7 +465,10 @@ def build_main_graph(
 
         plan = state["plan"]
         if not plan:
-            return {"flow_status": FlowStatus.SUMMARIZING.value, "events": []}
+            return Command(
+                update={"flow_status": FlowStatus.SUMMARIZING.value, "events": []},
+                goto="summarizer_node",
+            )
 
         # 1. Sync completed step back into plan.steps
         completed_step = state.get("current_step")
@@ -459,20 +545,39 @@ def build_main_graph(
 
         # 3. Find next step
         next_step = plan.get_next_step()
-        if not next_step:
-            return {
-                "plan": plan,
-                "current_step": None,
-                "flow_status": FlowStatus.SUMMARIZING.value,
-                "events": events,
-            }
 
-        return {
-            "plan": plan,
-            "current_step": next_step,
-            "flow_status": FlowStatus.EXECUTING.value,
-            "events": events,
-        }
+        # Phase 3: 根据下一步描述刷新 skill context
+        new_skill_context = state.get("skill_context", "")
+        if next_step:
+            refresher = (config.get("configurable") or {}).get("skill_context_refresher")
+            if refresher:
+                try:
+                    new_skill_context = await refresher(next_step.description)
+                except Exception as exc:
+                    logger.warning("Step-level skill refresh 失败: %s", exc)
+
+        if not next_step:
+            return Command(
+                update={
+                    "plan": plan,
+                    "current_step": None,
+                    "flow_status": FlowStatus.SUMMARIZING.value,
+                    "skill_context": new_skill_context,
+                    "events": events,
+                },
+                goto="summarizer_node",
+            )
+
+        return Command(
+            update={
+                "plan": plan,
+                "current_step": next_step,
+                "flow_status": FlowStatus.EXECUTING.value,
+                "skill_context": new_skill_context,
+                "events": events,
+            },
+            goto="executor_node",
+        )
 
     async def summarizer_node(state: MainGraphState, config: RunnableConfig) -> dict:
         """Generate final summary with streaming and emit completion events.
@@ -533,8 +638,8 @@ def build_main_graph(
                 if full_text:
                     try:
                         parsed = SummarizerOutput.model_validate_json(full_text)
-                        if parsed.message:
-                            summary_text = parsed.message
+                        if parsed.text:
+                            summary_text = parsed.text
                         summary_attachments = [
                             a for a in parsed.attachments
                             if isinstance(a, str) and a.strip()
@@ -612,26 +717,6 @@ def build_main_graph(
             return "updater_node"
         return "summarizer_node"
 
-    def route_after_executor(state: MainGraphState) -> str:
-        """Route after step execution."""
-        if state.get("should_interrupt"):
-            return "interrupt_node"
-        status = state.get("flow_status", "")
-        if status == FlowStatus.UPDATING.value:
-            return "updater_node"
-        if status == FlowStatus.SUMMARIZING.value:
-            return "summarizer_node"
-        return END
-
-    def route_after_updater(state: MainGraphState) -> str:
-        """Route after plan update."""
-        status = state.get("flow_status", "")
-        if status == FlowStatus.EXECUTING.value:
-            return "executor_node"
-        if status == FlowStatus.SUMMARIZING.value:
-            return "summarizer_node"
-        return END
-
     # ---- Build Graph --------------------------------------------------- #
 
     g: StateGraph = StateGraph(MainGraphState)
@@ -652,9 +737,9 @@ def build_main_graph(
 
     g.add_conditional_edges(START, route_entry)
     g.add_edge("planner_node", "executor_node")
-    g.add_conditional_edges("executor_node", route_after_executor)
+    # executor_node and updater_node use Command(goto=...) for routing —
+    # no conditional edges needed. Command handles all outgoing transitions.
     g.add_edge("interrupt_node", "executor_node")
-    g.add_conditional_edges("updater_node", route_after_updater)
     g.add_edge("summarizer_node", END)
 
     return g.compile(checkpointer=checkpointer)

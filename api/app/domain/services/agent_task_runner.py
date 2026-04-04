@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import io
 import logging
@@ -18,6 +19,7 @@ from app.application.services.continuation_intent_classifier import (
 )
 from app.domain.external.browser import Browser
 from app.domain.external.file_storage import FileStorage
+from app.domain.external.memory_flusher import MemoryFlusher
 from app.domain.external.sandbox import Sandbox
 from app.domain.external.search import SearchEngine
 from app.domain.external.task import Task, TaskRunner
@@ -32,6 +34,8 @@ from app.domain.models.event import (
     A2AToolContent,
     BaseEvent,
     BrowserToolContent,
+    CompactionEvent,
+    ContextStatusEvent,
     ControlAction,
     ControlEvent,
     DoneEvent,
@@ -89,6 +93,16 @@ SKILL_CONTEXT_MAX_SNIPPET_CHARS = 1200
 TOOL_SUMMARY_MAX_ITEMS_PER_GROUP = 6
 
 
+def _compute_has_positive_match(scores: list[float]) -> bool:
+    """基于相对排名判断是否有正向匹配（模型无关的阈值逻辑）。"""
+    if not scores or scores[0] < 0.15:
+        return False
+    if len(scores) < 2:
+        return True
+    gap = scores[0] - scores[1]
+    return gap > 0.05 or scores[0] > 0.4
+
+
 @dataclass(slots=True)
 class SelectionDebugMeta:
     selection_source: str
@@ -117,6 +131,34 @@ class StepSkillActivationState:
     reselect_count: int = 0
 
 
+class SkillGuideInjector:
+    """按需注入 Tier 2 skill guide 到 tool result 中。"""
+
+    def __init__(self, skills: list, preloaded_ids: set[str]):
+        from typing import Any
+
+        self._tool_to_skill: dict[str, Any] = {}
+        self._injected: set[str] = set()
+        self._preloaded_ids = preloaded_ids
+        for skill in skills:
+            for tool in (skill.manifest or {}).get("tools", []):
+                if isinstance(tool, dict) and tool.get("name"):
+                    # 保留第一个映射（高分 skill 优先，假设 skills 已按 score 排序）
+                    if tool["name"] not in self._tool_to_skill:
+                        self._tool_to_skill[tool["name"]] = skill
+
+    def __call__(self, tool_name: str) -> str | None:
+        skill = self._tool_to_skill.get(tool_name)
+        if not skill:
+            return None
+        if skill.id in self._preloaded_ids or skill.id in self._injected:
+            return None
+        self._injected.add(skill.id)
+        manifest = skill.manifest or {}
+        body = str(manifest.get("context_blob") or manifest.get("skill_md") or "")
+        return body[:1200] if body else None
+
+
 class AgentTaskRunner(TaskRunner):
     """基于Agent智能体的任务运行器"""
 
@@ -139,8 +181,15 @@ class AgentTaskRunner(TaskRunner):
         skill_risk_policy: SkillRiskPolicy | None = None,  # skill风险策略
         overflow_config: ContextOverflowConfig | None = None,  # 上下文治理配置
         summary_llm: BaseChatModel | None = None,  # 摘要生成模型
+        checkpointer_pool: object | None = None,  # checkpointer 连接池
+        supports_vision: bool = True,  # 模型是否支持视觉/多模态
+        supports_pdf_input: bool = False,  # 是否支持原生 PDF 文件输入
+        file_processor_lookup: object | None = None,  # FileProcessorLookup, file_view 工具的处理器
+        memory_flusher: MemoryFlusher | None = None,  # 记忆刷写调度器
     ) -> None:
         """构造函数，完成Agent任务运行器的创建"""
+        self._memory_flusher = memory_flusher
+        self._file_processor_lookup = file_processor_lookup
         self._agent_config = agent_config
         self._llm = llm
         self._uow_factory = uow_factory
@@ -216,10 +265,20 @@ class AgentTaskRunner(TaskRunner):
         self._current_message_text: str = ""
         self._last_initialized_skill_ids: tuple[str, ...] = ()
         self._last_virtual_step_id: str = ""
+        self._embedding_available: bool = False
+        self._embedding_index = None  # SkillEmbeddingIndex | None
+        self._current_embedding_scores: list[float] | None = None
+        self._tier2_preloaded_skill_ids: set[str] = set()
+        self._last_skill_context: str = ""
+        self._activated_mcp_tools: set[str] = set()
+        self._image_url_map: dict[str, str] = {}  # sandbox filepath → presigned URL
+        self._supports_vision = supports_vision
+        self._supports_pdf_input = supports_pdf_input
         self._file_storage = file_storage
         self._overflow_config = overflow_config or ContextOverflowConfig()
         # self._file_repository = file_repository
         self._browser = browser
+        self._search_engine = search_engine
         self._flow = PlannerReActFlow(
             uow_factory=uow_factory,
             llm=llm,
@@ -237,7 +296,10 @@ class AgentTaskRunner(TaskRunner):
             summary_llm=summary_llm,
             user_id=self._user_id or "",
             skill_graph_canary_percent=settings.skill_graph_canary_percent,
-            db_url=settings.sqlalchemy_database_url,
+            checkpointer_pool=checkpointer_pool,
+            supports_vision=supports_vision,
+            supports_pdf_input=supports_pdf_input,
+            file_processor_lookup=file_processor_lookup,
         )
 
     async def _put_and_add_event(
@@ -347,6 +409,143 @@ class AgentTaskRunner(TaskRunner):
             event.attachments = attachments
         except Exception as e:
             logger.exception(f"AgentTaskRunner同步消息附件到沙箱失败: {str(e)}")
+
+    # 支持多模态识图的 MIME 类型前缀
+    _IMAGE_MIME_PREFIXES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+    # base64 fallback 大小阈值（对齐 5MB API 硬限，3.75MB raw ≈ 5MB base64）
+    _IMAGE_TARGET_RAW_SIZE = 3_932_160  # 3.75 MB
+
+    async def _get_image_presigned_url(self, file: File) -> str | None:
+        """Generate presigned URL via FileStorage protocol."""
+        return await self._file_storage.get_presigned_url(file)
+
+    async def _upload_sandbox_file_for_mcp(self, sandbox_path: str) -> str | None:
+        """Download a file from sandbox and upload to storage, returning a presigned URL.
+
+        Used by MCP tool path resolver for agent-generated files (e.g. extracted from zip)
+        that don't have presigned URLs in _image_url_map.
+        """
+        import os
+        from fastapi import UploadFile
+        from io import BytesIO
+
+        try:
+            filename = os.path.basename(sandbox_path)
+            # Read file from sandbox
+            result = await self._sandbox.download_file(sandbox_path)
+            if not result or not hasattr(result, "read"):
+                logger.warning("Failed to download sandbox file %s", sandbox_path)
+                return None
+            file_bytes = result.read() if hasattr(result, "read") else result
+
+            # Upload to storage as UploadFile
+            upload = UploadFile(
+                file=BytesIO(file_bytes),
+                filename=filename,
+                size=len(file_bytes),
+            )
+            file_obj = await self._file_storage.upload_file(upload)
+
+            # Get presigned URL
+            url = await self._file_storage.get_presigned_url(file_obj)
+            if url:
+                logger.info("Uploaded sandbox file %s → %s", sandbox_path, url[:80])
+            return url
+        except Exception as e:
+            logger.warning("Failed to upload sandbox file %s for MCP: %s", sandbox_path, e)
+            return None
+
+    async def _build_image_content_blocks(self, attachments: list) -> list[dict]:
+        """为图片附件构建 OpenAI multimodal content blocks + 元数据注入。
+
+        Vision mode (supports_vision=True): 嵌入图片 blocks + 元数据
+        Tool mode (supports_vision=False): 不嵌入图片 blocks，只记录 URL 映射供 MCP 工具使用
+        """
+        blocks: list[dict] = []
+        self._image_url_map.clear()
+
+        for attachment in attachments:
+            if not isinstance(attachment, File):
+                continue
+
+            # Three-state multimodal eligibility check
+            if attachment.multimodal_eligible is False:
+                continue
+            elif attachment.multimodal_eligible is True:
+                pass
+            else:
+                # None: non-image OR pre-migration image → fallback to mime_type
+                mime = attachment.mime_type or ""
+                if not any(mime.startswith(p) for p in self._IMAGE_MIME_PREFIXES):
+                    continue
+
+            try:
+                # Always capture URL mapping (needed for MCP path resolution in both modes)
+                presigned_url = await self._get_image_presigned_url(attachment)
+                if presigned_url and attachment.filepath:
+                    self._image_url_map[attachment.filepath] = presigned_url
+
+                # Tool mode (non-vision model): skip image blocks, only keep URL mapping
+                if not self._supports_vision:
+                    continue
+
+                # Vision mode: embed image blocks
+                w = attachment.width
+                h = attachment.height
+                if w and h and w <= 512 and h <= 512:
+                    detail = "low"
+                else:
+                    detail = "high"
+
+                if presigned_url:
+                    blocks.append({
+                        "type": "image_url",
+                        "image_url": {"url": presigned_url, "detail": detail},
+                    })
+                else:
+                    # Base64 fallback with tightened guard
+                    file_data, _ = await self._file_storage.download_file(
+                        attachment.id
+                    )
+                    with file_data:
+                        raw_bytes = file_data.read()
+                    if len(raw_bytes) > self._IMAGE_TARGET_RAW_SIZE:
+                        logger.warning(
+                            "图片 %s 过大 (%d bytes)，base64 路径跳过多模态编码",
+                            attachment.id,
+                            len(raw_bytes),
+                        )
+                        continue
+                    mime = attachment.mime_type or "image/png"
+                    b64_data = base64.b64encode(raw_bytes).decode("utf-8")
+                    blocks.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime};base64,{b64_data}",
+                            "detail": detail,
+                        },
+                    })
+
+                # Metadata injection (skip for pre-migration images without dimensions)
+                if w and h:
+                    ow = attachment.original_width or w
+                    oh = attachment.original_height or h
+                    source = attachment.filepath or attachment.filename
+                    if ow != w or oh != h:
+                        scale = round(ow / w, 2)
+                        meta_text = (
+                            f"[Image: source: {source}, original {ow}x{oh}, "
+                            f"displayed at {w}x{h}. "
+                            f"Multiply coordinates by {scale:.2f} to map to original image.]"
+                        )
+                    else:
+                        meta_text = f"[Image: source: {source}, {w}x{h}]"
+                    blocks.append({"type": "text", "text": meta_text})
+
+            except Exception as e:
+                logger.warning("构建图片内容块失败 (file_id=%s): %s", attachment.id, e)
+
+        return blocks
 
     @classmethod
     def _get_stream_size(cls, f: BinaryIO) -> int:
@@ -629,7 +828,47 @@ class AgentTaskRunner(TaskRunner):
             )
             return [], debug
 
+        # Phase 1: 优先使用 embedding
+        embedding_results = None
+        if self._embedding_available and self._embedding_index is not None:
+            try:
+                embedding_results = await self._embedding_index.query(user_message, top_k=12)
+            except Exception:
+                logger.warning("Embedding 检索失败，降级为 token-overlap")
+
+        # 始终运行 token-overlap（shadow mode + fallback）
         meta = self._skill_selector.select_with_meta(skill_pool, user_message)
+
+        if embedding_results:
+            id_to_skill = {s.id: s for s in skill_pool}
+            selected = [id_to_skill[sid] for sid, _ in embedding_results if sid in id_to_skill]
+            scores = [score for sid, score in embedding_results if sid in id_to_skill]
+
+            if selected:
+                # Shadow mode 日志
+                emb_ids = [s.id for s in selected[:6]]
+                tok_ids = [s.id for s in meta.selected_skills[:6]]
+                overlap = len(set(emb_ids) & set(tok_ids))
+                logger.info("Skill选择对比 overlap=%d/6 emb=%s tok=%s", overlap, emb_ids, tok_ids)
+
+                # 映射为 SkillSelectionMeta
+                max_score = int(scores[0] * 100) if scores else 0
+                second_score = int(scores[1] * 100) if len(scores) > 1 else 0
+                has_positive = _compute_has_positive_match(scores)
+                effective_threshold = min(max_score, 1) if has_positive else max_score + 1
+                meta = SkillSelectionMeta(
+                    selected_skills=selected,
+                    max_score=max_score,
+                    second_score=second_score,
+                    token_count=len(user_message.split()),
+                    effective_threshold=effective_threshold,
+                )
+                self._current_embedding_scores = scores
+            else:
+                self._current_embedding_scores = None
+        else:
+            self._current_embedding_scores = None
+
         (
             is_continuation,
             continuation_source,
@@ -701,8 +940,24 @@ class AgentTaskRunner(TaskRunner):
                 return "\n".join(lines[idx + 1 :]).strip()
         return raw
 
-    def _build_skill_context_prompt(self, skills: list[Skill]) -> str:
-        """将已选中的 Skill 构建为运行时系统上下文。"""
+    def _get_skill_guide_body(self, manifest: dict, skill) -> str:
+        """提取 Skill 的完整 guide 内容（context_blob 或 skill_md）。"""
+        context_blob = str(manifest.get("context_blob") or "").strip()
+        if context_blob:
+            body = context_blob
+        else:
+            skill_md = str(manifest.get("skill_md") or "").strip()
+            body = self._strip_skill_frontmatter(skill_md)
+        body = re.sub(r"\n{3,}", "\n\n", body).strip()
+        if len(body) > SKILL_CONTEXT_MAX_SNIPPET_CHARS:
+            body = body[:SKILL_CONTEXT_MAX_SNIPPET_CHARS].rstrip() + "\n...(truncated)"
+        return body or (skill.description or "").strip() or "No additional guide content."
+
+    def _build_skill_context_prompt(self, skills: list[Skill], scores: list[float] | None = None) -> str:
+        """将已选中的 Skill 构建为运行时系统上下文（两级：Tier 2 完整指南 / Tier 1 轻量卡片）。"""
+        TIER2_MAX_COUNT = 2
+        TIER2_SCORE_THRESHOLD = 0.5
+
         if not skills:
             return ""
 
@@ -711,25 +966,32 @@ class AgentTaskRunner(TaskRunner):
             "Follow these selected SKILL.md guides when they are relevant to the current task.",
         ]
 
+        self._tier2_preloaded_skill_ids = set()
+        tier2_count = 0
         total_chars = sum(len(item) for item in sections)
-        for skill in skills[:SKILL_CONTEXT_MAX_SKILLS]:
+        for i, skill in enumerate(skills[:SKILL_CONTEXT_MAX_SKILLS]):
             manifest = skill.manifest if isinstance(skill.manifest, dict) else {}
-            context_blob = str(manifest.get("context_blob") or "").strip()
-            if context_blob:
-                body = context_blob
+
+            # 决定是否使用 Tier 2（完整指南）
+            if scores is not None:
+                score = scores[i] if i < len(scores) else 0.0
+                use_tier2 = score >= TIER2_SCORE_THRESHOLD and tier2_count < TIER2_MAX_COUNT
             else:
-                skill_md = str(manifest.get("skill_md") or "").strip()
-                body = self._strip_skill_frontmatter(skill_md)
-            body = re.sub(r"\n{3,}", "\n\n", body).strip()
-            if len(body) > SKILL_CONTEXT_MAX_SNIPPET_CHARS:
-                body = body[:SKILL_CONTEXT_MAX_SNIPPET_CHARS].rstrip() + "\n...(truncated)"
+                use_tier2 = i == 0  # 无分数时，top-1 使用 Tier 2
 
-            if not body:
-                body = (skill.description or "").strip()
-            if not body:
-                body = "No additional guide content."
+            if use_tier2:
+                body = self._get_skill_guide_body(manifest, skill)
+                block = f"### {skill.name} ({skill.slug})\n{body}"
+                self._tier2_preloaded_skill_ids.add(skill.id)
+                tier2_count += 1
+            else:
+                # Tier 1: 轻量卡片，仅包含名称、描述和工具名
+                desc = (skill.description or "").strip() or "No description."
+                tools_list = manifest.get("tools") or []
+                tool_names = [t["name"] for t in tools_list if isinstance(t, dict) and "name" in t]
+                tools_line = f"Tools: {', '.join(tool_names)}" if tool_names else "Tools: (none)"
+                block = f"### {skill.name} ({skill.slug})\n{desc}\n{tools_line}"
 
-            block = f"### {skill.name} ({skill.slug})\n{body}"
             if total_chars + len(block) > SKILL_CONTEXT_MAX_TOTAL_CHARS:
                 break
 
@@ -738,24 +1000,34 @@ class AgentTaskRunner(TaskRunner):
 
         return "\n\n".join(sections)
 
+    def _get_native_tool_names_by_category(self) -> dict[str, list[str]]:
+        """从 create_native_tools 动态派生原生工具名，确保摘要与实际绑定一致。"""
+        if hasattr(self, "_cached_native_tool_names"):
+            return self._cached_native_tool_names
+        from app.domain.services.tools.langchain_tools import create_native_tools
+
+        tools = create_native_tools(
+            sandbox=self._sandbox,
+            browser=self._browser,
+            search_engine=self._search_engine,
+            processor_lookup=self._file_processor_lookup,
+            supports_vision=self._supports_vision,
+            supports_pdf_input=self._supports_pdf_input,
+        )
+        groups: dict[str, list[str]] = {}
+        for tool in tools:
+            prefix = tool.name.split("_")[0]
+            groups.setdefault(prefix, []).append(tool.name)
+        self._cached_native_tool_names = groups
+        return groups
+
     def _build_available_tool_summary(self) -> str:
         """构建可用工具摘要，减少模型对工具可用性的错觉。"""
         budget_tokens = self._skill_selection_policy.available_tool_summary_token_budget
         char_budget = max(400, budget_tokens * 4)
 
-        shell_tools = [
-            "shell_exec",
-            "shell_write_to_process",
-            "shell_kill_process",
-            "shell_list_processes",
-        ]
-        browser_tools = [
-            "browser_navigate",
-            "browser_click",
-            "browser_input",
-            "browser_snapshot",
-        ]
-        message_tools = ["message_notify_user", "message_ask_user"]
+        # 从实际工具注册表动态获取，防止硬编码名称与实际绑定漂移
+        native_groups = self._get_native_tool_names_by_category()
 
         skill_tools: list[str] = []
         try:
@@ -801,19 +1073,23 @@ class AgentTaskRunner(TaskRunner):
             except Exception as exc:
                 logger.debug("读取Brainstorm工具摘要失败，降级为空: %s", exc)
 
-        lines = [
-            "## Available Tool Summary",
-            f"- shell: {', '.join(shell_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])}",
-            f"- browser: {', '.join(browser_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])}",
-            f"- message: {', '.join(message_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])}",
-        ]
+        lines = ["## Available Tool Summary"]
+        # 按固定顺序输出原生工具分组，名称从实际注册表派生
+        # native tools 数量固定且总量小（~531 chars），不截断，保证与实际绑定完全一致
+        for category in ("shell", "file", "browser", "message", "search"):
+            names = native_groups.get(category, [])
+            if names:
+                lines.append(f"- {category}: {', '.join(names)}")
         if skill_tools:
             lines.append(
                 "- active skill tools: "
                 + ", ".join(skill_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
             )
         else:
-            lines.append("- active skill tools: (none)")
+            lines.append(
+                "- active skill tools: (none, use get_skill_guide to load full guide, "
+                "tools will be bound at step execution)"
+            )
         if creator_tools:
             lines.append(
                 "- skill creator tools: "
@@ -821,35 +1097,46 @@ class AgentTaskRunner(TaskRunner):
             )
 
         # MCP 工具
-        mcp_tools: list[str] = []
+        MCP_AUTO_BIND_THRESHOLD = 15
+        mcp_all_names: list[str] = []
         try:
-            raw_mcp = self._mcp_tool.get_tools()
-            logger.info(
-                "[ToolSummary] MCP get_tools() 返回 %d 项, initialized=%s, manager=%s",
-                len(raw_mcp),
-                getattr(self._mcp_tool, "_initialized", "?"),
-                self._mcp_tool._manager is not None if hasattr(self._mcp_tool, "_manager") else "?",
-            )
-            for schema in raw_mcp:
+            for schema in self._mcp_tool.get_tools():
                 if not isinstance(schema, dict):
-                    logger.debug("[ToolSummary] MCP schema 非dict: %s", type(schema))
                     continue
-                function_info = schema.get("function")
-                if not isinstance(function_info, dict):
-                    logger.debug("[ToolSummary] MCP function 非dict: %s", type(function_info))
+                fn = schema.get("function")
+                if not isinstance(fn, dict):
                     continue
-                tool_name = function_info.get("name")
-                if isinstance(tool_name, str) and tool_name:
-                    mcp_tools.append(tool_name)
-        except Exception as exc:
-            logger.warning("读取MCP工具摘要失败，降级为空: %s", exc, exc_info=True)
-            mcp_tools = []
-        logger.info("[ToolSummary] 最终 mcp_tools=%s", mcp_tools)
-        if mcp_tools:
-            lines.append(
-                "- mcp tools: "
-                + ", ".join(mcp_tools[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
-            )
+                name = fn.get("name", "")
+                if name:
+                    mcp_all_names.append(name)
+        except Exception:
+            pass
+        if mcp_all_names:
+            if len(mcp_all_names) <= MCP_AUTO_BIND_THRESHOLD:
+                # Small set: all tools directly bound — group by server for clarity
+                # Parse server name from tool name: mcp_{server}_{tool}
+                server_tools: dict[str, list[str]] = {}
+                for name in mcp_all_names:
+                    parts = name.split("_", 2)  # ["mcp", server, tool...]
+                    server = parts[1] if len(parts) >= 3 else "unknown"
+                    server_tools.setdefault(server, []).append(name)
+                for server, tools in server_tools.items():
+                    lines.append(f"- mcp ({server}): {', '.join(tools)}")
+            else:
+                # Large set: discovery mode
+                always_bind_names = list(self._get_always_bind_tool_names())
+                mcp_discovery_names = [n for n in mcp_all_names if n not in set(always_bind_names)]
+                lines.append("- mcp discovery: list_mcp_tools, get_mcp_tool")
+                if always_bind_names:
+                    lines.append(
+                        "- mcp always-bind: "
+                        + ", ".join(always_bind_names[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
+                    )
+                if mcp_discovery_names:
+                    lines.append(
+                        "- mcp available (use get_mcp_tool to activate): "
+                        + ", ".join(mcp_discovery_names[:TOOL_SUMMARY_MAX_ITEMS_PER_GROUP])
+                    )
 
         # A2A 工具（仅在 manager 存在时才有 LangChain 工具绑定到 LLM）
         a2a_tools: list[str] = []
@@ -878,27 +1165,167 @@ class AgentTaskRunner(TaskRunner):
             summary = summary[:char_budget].rstrip() + "\n...(truncated)"
         return summary
 
-    def _build_runtime_system_context(self, skills: list[Skill]) -> str:
+    def _build_runtime_system_context(self, skills: list[Skill], scores: list[float] | None = None) -> str:
         """组装运行时上下文（Skill指南 + 可用工具摘要）。"""
         sections: list[str] = []
-        skill_context = self._build_skill_context_prompt(skills)
+        skill_context = self._build_skill_context_prompt(skills, scores=scores)
         if skill_context:
             sections.append(skill_context)
         sections.append(self._build_available_tool_summary())
         return "\n\n".join(section for section in sections if section).strip()
 
-    def _set_runtime_system_context(self, skills: list[Skill]) -> None:
-        context = self._build_runtime_system_context(skills)
+    def _set_runtime_system_context(self, skills: list[Skill], scores: list[float] | None = None) -> None:
+        context = self._build_runtime_system_context(skills, scores=scores)
         if hasattr(self._flow, "set_skill_context"):
             self._flow.set_skill_context(context)
+
+    async def _refresh_skill_context_for_step(self, step_description: str) -> str:
+        """Phase 3: 根据 step 描述重新选择 skill 并构建上下文。"""
+        query_parts = [step_description]
+        if self._current_message_text:
+            query_parts.append(self._current_message_text)
+        query = "\n".join(query_parts)[:2000]
+
+        if self._embedding_available and self._embedding_index is not None:
+            try:
+                results = await self._embedding_index.query(query, top_k=12)
+                if results and results[0][1] < 0.2:
+                    return self._last_skill_context
+                id_to_skill = {s.id: s for s in self._session_skill_pool}
+                skills = [id_to_skill[sid] for sid, _ in results if sid in id_to_skill]
+                scores = [score for sid, score in results if sid in id_to_skill]
+            except Exception:
+                logger.warning("Step-level embedding 检索失败，使用 token-overlap")
+                skills = self._skill_selector.select(self._session_skill_pool, query)
+                scores = None
+        else:
+            skills = self._skill_selector.select(self._session_skill_pool, query)
+            scores = None
+
+        if skills:
+            await self._initialize_skill_tool_if_needed(skills)
+        context = self._build_runtime_system_context(skills, scores=scores)
+        self._last_skill_context = context
+        return context
+
+    def _get_always_bind_tool_names(self) -> set[str]:
+        """从 MCPConfig 提取所有 always_bind 工具名，组装完整前缀名。"""
+        if not self._mcp_config or not self._mcp_config.mcpServers:
+            return set()
+        names: set[str] = set()
+        for server_name, config in self._mcp_config.mcpServers.items():
+            if not config.enabled or not config.always_bind:
+                continue
+            prefix = server_name if server_name.startswith("mcp_") else f"mcp_{server_name}"
+            for tool_short_name in config.always_bind:
+                names.add(f"{prefix}_{tool_short_name}")
+        return names
+
+    async def _build_step_react_graph(self, step_description: str = ""):
+        """Phase 3: 渐进式构建 react_graph — 按步骤描述选择相关 Skill 工具。
+
+        1. 根据 step_description 刷新 Skill 选择（更新 _skill_tool）
+        2. 构建包含基础工具 + 当前步骤相关 Skill 工具的 react_graph
+        """
+        # 按步骤描述刷新 skill 选择
+        if step_description:
+            try:
+                await self._refresh_skill_context_for_step(step_description)
+            except Exception as exc:
+                logger.warning("[ProgressiveSkillLoad] 步骤级 skill 刷新失败: %s", exc)
+
+        from app.domain.services.tools.langchain_tools import create_native_tools
+        from app.domain.services.tools.langchain_mcp import create_mcp_langchain_tools
+        from app.domain.services.tools.langchain_a2a import create_a2a_langchain_tools
+        from app.domain.services.tools.langchain_skill_tools import create_skill_langchain_tools
+        from app.domain.services.tools.langchain_dynamic_skill_tools import create_dynamic_skill_langchain_tools
+        from app.domain.services.graphs.react_graph import build_react_graph
+
+        lc_tools = create_native_tools(
+            sandbox=self._sandbox, browser=self._browser,
+            search_engine=self._search_engine,
+            processor_lookup=self._file_processor_lookup,
+            supports_vision=self._supports_vision,
+            supports_pdf_input=self._supports_pdf_input,
+        )
+        # MCP: progressive loading with auto-bind threshold
+        # When total MCP tools ≤ threshold, bind all directly (skip discovery overhead)
+        # When > threshold, only bind always_bind + activated tools
+        MCP_AUTO_BIND_THRESHOLD = 15
+        all_mcp_tools = self._mcp_tool.get_tools()
+        # URL map ref + sandbox uploader: MCP tools auto-resolve sandbox paths → presigned URLs
+        _url_map_ref = lambda: self._image_url_map
+        _sandbox_uploader = self._upload_sandbox_file_for_mcp
+        if len(all_mcp_tools) <= MCP_AUTO_BIND_THRESHOLD:
+            lc_tools.extend(create_mcp_langchain_tools(
+                self._mcp_tool, tool_names=None,
+                url_map_ref=_url_map_ref, sandbox_file_uploader=_sandbox_uploader,
+            ))
+        else:
+            mcp_bind_names = self._get_always_bind_tool_names() | self._activated_mcp_tools
+            lc_tools.extend(create_mcp_langchain_tools(
+                self._mcp_tool, tool_names=mcp_bind_names,
+                url_map_ref=_url_map_ref, sandbox_file_uploader=_sandbox_uploader,
+            ))
+            # Discovery tools only needed for large tool sets
+            from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
+            lc_tools.extend(create_mcp_discovery_tools(
+                mcp_tool_ref=lambda: self._mcp_tool,
+                activated_tools_ref=lambda: self._activated_mcp_tools,
+            ))
+        lc_tools.extend(create_a2a_langchain_tools(self._a2a_tool))
+        lc_tools.extend(create_skill_langchain_tools(
+            brainstorm_skill_tool=self._brainstorm_skill_tool,
+            create_skill_tool=self._create_skill_tool,
+        ))
+
+        # 渐进式注入：只绑定当前步骤相关的 Skill 工具
+        dynamic_tools = create_dynamic_skill_langchain_tools(self._skill_tool)
+        lc_tools.extend(dynamic_tools)
+
+        # get_skill_guide 始终可用（空 pool 时返回友好提示），让 LLM 能按需获取完整 SKILL.md
+        from app.domain.services.tools.langchain_skill_tools import create_skill_guide_tool
+        lc_tools.append(create_skill_guide_tool(
+            skill_pool_ref=lambda: self._session_skill_pool,
+            file_listings_ref=lambda: self._skill_bundle_sync.get_file_listing_all(),
+            sandbox_skill_root=self._skill_bundle_sync.sandbox_skill_root,
+        ))
+
+        skill_tool_names = [t.name for t in dynamic_tools]
+        logger.info(
+            "[ProgressiveSkillLoad] step='%s' → 动态Skill工具 %d 个: %s, get_skill_guide=%s",
+            step_description[:80] if step_description else "(无步骤描述)",
+            len(skill_tool_names),
+            skill_tool_names,
+            bool(self._session_skill_pool),
+        )
+
+        return build_react_graph(
+            llm=self._llm, tools=lc_tools, agent_config=self._agent_config,
+            tool_result_max_chars=(
+                self._flow._overflow_config.tool_result_max_chars
+                if self._flow._overflow_config else 8000
+            ),
+            assembler=getattr(self._flow, '_assembler', None),
+        )
 
     async def _initialize_skill_tool_if_needed(self, skills: list[Skill]) -> None:
         """仅在技能集合变化时重新初始化 SkillTool，避免同 step 内抖动。"""
         skill_ids = tuple(skill.id for skill in skills)
         if skill_ids == self._last_initialized_skill_ids:
+            logger.debug(
+                "[ProgressiveSkillLoad] SkillTool 未变化，跳过重新初始化 (skills=%d)",
+                len(skills),
+            )
             return
+        prev_ids = self._last_initialized_skill_ids
         await self._skill_tool.initialize(skills)
         self._last_initialized_skill_ids = skill_ids
+        logger.info(
+            "[ProgressiveSkillLoad] SkillTool 已更新: %s → %s",
+            list(prev_ids) if prev_ids else "[]",
+            list(skill_ids),
+        )
 
     @staticmethod
     def _is_unknown_tool_event(event: ToolEvent) -> bool:
@@ -1301,6 +1728,46 @@ class AgentTaskRunner(TaskRunner):
             # 5.将事件直接返回
             yield event
 
+        # 6.流消费完毕后，读取压缩结果并发送上下文状态/压缩事件（B3）
+        compaction_result = getattr(self._flow, "_last_compaction_result", None)
+        if compaction_result is not None:
+            overflow_config = getattr(self._flow, "_overflow_config", None)
+            context_window = 0
+            if overflow_config is not None:
+                try:
+                    from app.domain.services.context.model_context_window import resolve_context_window
+                    context_window = resolve_context_window(
+                        overflow_config.model_name, overflow_config
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to resolve context window for SSE event: %s", exc)
+                    context_window = overflow_config.context_window or 0
+
+            soft_threshold = overflow_config.soft_trigger_ratio if overflow_config else 0.85
+            hard_threshold = overflow_config.hard_trigger_ratio if overflow_config else 0.95
+
+            yield ContextStatusEvent(
+                used_tokens=compaction_result.tokens_after,
+                context_window=context_window,
+                usage_ratio=compaction_result.usage_ratio_after,
+                soft_threshold=soft_threshold,
+                hard_threshold=hard_threshold,
+            )
+
+            if compaction_result.level_applied > 0:
+                yield CompactionEvent(
+                    level=compaction_result.level_applied,
+                    tokens_before=compaction_result.tokens_before,
+                    tokens_after=compaction_result.tokens_after,
+                    messages_removed=compaction_result.messages_removed,
+                    usage_ratio_after=compaction_result.usage_ratio_after,
+                )
+
+        # 7. 读取 flush batch 并提交到后台刷写队列（C5.0）
+        flush_batch = getattr(self._flow, "_pending_flush_batch", None)
+        if flush_batch and self._memory_flusher:
+            self._memory_flusher.submit(flush_batch)
+
     async def _cleanup_tools(self) -> None:
         """清理MCP和A2A工具资源，确保在同一任务上下文中释放
 
@@ -1366,6 +1833,35 @@ class AgentTaskRunner(TaskRunner):
                 enabled_skills,
                 skill_preference_map,
             )
+            # Phase 1: Embedding 索引构建
+            embedding_config = getattr(self._agent_config, 'skill_embedding', None)
+            if embedding_config and embedding_config.enabled and embedding_config.api_base and embedding_config.api_key:
+                try:
+                    from app.infrastructure.external.embedding.openai_embedding_provider import OpenAIEmbeddingProvider
+                    from app.infrastructure.external.embedding.skill_embedding_index import SkillEmbeddingIndex
+                    provider = OpenAIEmbeddingProvider(
+                        api_base=embedding_config.api_base,
+                        api_key=embedding_config.api_key,
+                        model=embedding_config.model,
+                        dimensions=embedding_config.dimensions,
+                    )
+                    # 尝试使用 Redis 缓存
+                    embedding_cache = None
+                    try:
+                        from app.infrastructure.external.embedding.redis_embedding_cache import RedisEmbeddingCache
+                        from app.infrastructure.storage.redis import get_redis
+                        redis_client = get_redis()
+                        _ = redis_client.client  # Raises RuntimeError if not initialized
+                        embedding_cache = RedisEmbeddingCache(redis_client.client)
+                    except (RuntimeError, Exception):
+                        embedding_cache = None
+                    self._embedding_index = SkillEmbeddingIndex(provider, cache=embedding_cache)
+                    await self._embedding_index.build(self._session_skill_pool)
+                    self._embedding_available = True
+                    logger.info("Embedding 索引构建完成: skills=%d, model=%s", len(self._session_skill_pool), embedding_config.model)
+                except Exception:
+                    logger.warning("Embedding 不可用，将使用 token-overlap", exc_info=True)
+                    self._embedding_available = False
             initial_skills = self._select_skills_from_pool(
                 self._session_skill_pool,
                 "",
@@ -1379,6 +1875,18 @@ class AgentTaskRunner(TaskRunner):
             self._set_runtime_system_context(initial_skills)
             self._skill_bundle_sync.start_background_sync()
 
+            # 传递 skill pool getter 和 file listings getter 给 flow，用于 get_skill_guide 按需加载
+            # 使用 hasattr duck-typing guard，兼容测试中的 mock flow
+            if hasattr(self._flow, '_skill_pool_getter'):
+                self._flow._skill_pool_getter = lambda: self._session_skill_pool
+                self._flow._file_listings_getter = lambda: self._skill_bundle_sync.get_file_listing_all()
+                self._flow._sandbox_skill_root = self._skill_bundle_sync.sandbox_skill_root
+            # MCP progressive loading: pass discovery dependencies to flow
+            if hasattr(self._flow, '_mcp_tool_ref'):
+                self._flow._mcp_tool_ref = lambda: self._mcp_tool
+                self._flow._activated_mcp_tools_ref = lambda: self._activated_mcp_tools
+                self._flow._mcp_always_bind_names = self._get_always_bind_tool_names()
+
             # 3.循环读取任务中的输入消息队列
             while not await task.input_stream.is_empty():
                 # 4.从输入流中获取数据
@@ -1388,23 +1896,44 @@ class AgentTaskRunner(TaskRunner):
                 message = ""
 
                 # 5.判断事件类型是否为消息事件，如果是则处理消息并将附件同步到沙箱中
+                image_content_blocks: list[dict] = []
                 if isinstance(event, MessageEvent):
                     message = event.message or ""
                     await self._sync_message_attachments_to_sandbox(event)
+                    # 构建图片附件的多模态内容块，使 LLM 能直接"看到"图片
+                    print(f"[DEBUG-IMG] before _build_image_content_blocks: "
+                          f"attachments count={len(event.attachments)}, "
+                          f"types={[type(a).__name__ for a in event.attachments]}, "
+                          f"mimes={[getattr(a, 'mime_type', 'N/A') for a in event.attachments]}", flush=True)
+                    image_content_blocks = await self._build_image_content_blocks(
+                        event.attachments
+                    )
+                    print(f"[DEBUG-IMG] after _build_image_content_blocks: "
+                          f"blocks={len(image_content_blocks)}", flush=True)
                     logger.info(
-                        "AgentTaskRunner接收到新消息(len=%s, digest=%s)",
+                        "AgentTaskRunner接收到新消息(len=%s, digest=%s, images=%d)",
                         len(message),
                         hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                        len(image_content_blocks),
                     )
 
                 # 6.将消息事件转换称消息对象
+                # 附件路径附带外部可访问 URL（MCP 工具无法访问沙箱文件系统）
+                attachment_paths: list[str] = []
+                if isinstance(event, MessageEvent):
+                    for att in event.attachments:
+                        path = att.filepath
+                        url = self._image_url_map.get(path)
+                        if url:
+                            attachment_paths.append(
+                                f"{path} (external_url: {url})"
+                            )
+                        else:
+                            attachment_paths.append(path)
                 message_obj = Message(
                     message=message,
-                    attachments=(
-                        [attachment.filepath for attachment in event.attachments]
-                        if isinstance(event, MessageEvent)
-                        else []
-                    ),
+                    attachments=attachment_paths,
+                    image_content_blocks=image_content_blocks,
                     skill_confirmation_action=(
                         event.skill_confirmation_action
                         if isinstance(event, MessageEvent)
@@ -1420,8 +1949,17 @@ class AgentTaskRunner(TaskRunner):
                 self._current_message_selected_skills = list(selected_skills)
                 self._step_skill_state = None
                 self._last_virtual_step_id = ""
+                self._activated_mcp_tools.clear()  # Reset MCP activation per message
                 await self._initialize_skill_tool_if_needed(selected_skills)
-                self._set_runtime_system_context(selected_skills)
+                self._set_runtime_system_context(selected_skills, scores=self._current_embedding_scores)
+
+                # Phase 2+3: 设置 LangGraph configurable 回调
+                if hasattr(self._flow, '_skill_context_refresher'):
+                    self._flow._skill_context_refresher = self._refresh_skill_context_for_step
+                    self._flow._react_graph_provider = self._build_step_react_graph
+                    self._flow._skill_guide_injector = SkillGuideInjector(
+                        selected_skills, self._tier2_preloaded_skill_ids
+                    )
 
                 # 7.传递消息对象并运行PlannerReActFlow
                 async for event in self._run_flow(message_obj):
@@ -1530,15 +2068,28 @@ class AgentTaskRunner(TaskRunner):
             await self._cleanup_tools()
 
     async def destroy(self) -> None:
-        """销毁任务运行器并释放资源"""
-        # 1.清除沙箱
-        logger.info(f"开始清除销毁AgentTaskRunner资源")
-        if self._sandbox:
-            logger.info("销毁AgentTaskRunner中的沙箱环境")
-            await self._sandbox.destroy()
+        """销毁任务运行器并释放资源（best-effort：每步独立 try/except，确保后续清理不被跳过）"""
+        logger.info("开始清除销毁AgentTaskRunner资源")
+        try:
+            # 1.清除沙箱
+            if self._sandbox:
+                logger.info("销毁AgentTaskRunner中的沙箱环境")
+                await self._sandbox.destroy()
+        except Exception as exc:
+            logger.warning("sandbox.destroy() 失败（继续清理）: %s", exc)
 
-        # 2.清除mcp和a2a工具（幂等操作，如果invoke()中已清理则不会重复执行）
-        await self._cleanup_tools()
+        try:
+            # 2.清除mcp和a2a工具（幂等操作，如果invoke()中已清理则不会重复执行）
+            await self._cleanup_tools()
+        except Exception as exc:
+            logger.warning("_cleanup_tools() 失败（继续清理）: %s", exc)
+
+        try:
+            # 3.清理 checkpointer 引用
+            if hasattr(self._flow, "close"):
+                await self._flow.close()
+        except Exception as exc:
+            logger.warning("flow.close() 失败: %s", exc)
 
     async def on_done(self, task: Task) -> None:
         """任务结束时执行的回调函数"""

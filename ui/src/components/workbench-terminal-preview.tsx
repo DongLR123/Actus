@@ -45,7 +45,11 @@ export const WorkbenchTerminalPreview = memo(function WorkbenchTerminalPreview({
         output: record.output || "",
       }));
 
-  const rawRecords = isHistoryMode ? historyRecords : realtimeRecords;
+  const rawRecords = isHistoryMode
+    ? historyRecords
+    : realtimeRecords.length > 0
+      ? realtimeRecords
+      : historyRecords;
   const records = expanded ? rawRecords : rawRecords.slice(-PREVIEW_RECORD_LIMIT);
   const joinedRecords = records.map(formatRecord).filter(Boolean).join("\n\n");
   const fallbackText = isHistoryMode ? "" : realtimeOutput;

@@ -4,11 +4,13 @@ This module preserves the same public interface (constructor, invoke, done)
 so that AgentTaskRunner requires minimal changes.
 """
 
+import hashlib
 import logging
-from typing import Any, AsyncGenerator, Callable, Optional
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator, Callable, Optional, Sequence
 
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 
 from app.domain.external.browser import Browser
 from app.domain.external.sandbox import Sandbox
@@ -25,8 +27,9 @@ from app.domain.models.event import (
     TitleEvent,
     WaitEvent,
 )
-from app.domain.models.llm_responses import ConversationSummaryResponse, PlanResponse
+from app.domain.models.llm_responses import ConversationSummaryResponse, PlanResponse, StepDef
 from app.domain.models.memory import Memory
+from app.domain.models.memory_chunk import FlushBatch, RawChunk
 from app.domain.models.message import Message
 from app.domain.models.plan import ExecutionStatus, Plan, Step
 from app.domain.repositories.uow import IUnitOfWork
@@ -34,8 +37,14 @@ from langgraph.types import Command
 
 from app.domain.services.graphs.event_bridge import GraphEventBridge
 from app.domain.services.graphs.main_graph import build_main_graph
-from app.domain.services.graphs.message_utils import dicts_to_messages, messages_to_dicts
+from app.domain.services.graphs.message_utils import (
+    dicts_to_messages,
+    format_attachments_text,
+    messages_to_dicts,
+)
 from app.domain.services.graphs.react_graph import build_react_graph
+from app.domain.services.graphs.compaction import CompactionResult, GradualCompactor
+from app.domain.services.graphs.token_estimator import TokenEstimator
 from app.domain.services.tools.a2a import A2ATool
 from app.domain.services.tools.base import BaseTool
 from app.domain.services.tools.langchain_mcp import create_mcp_langchain_tools
@@ -72,9 +81,15 @@ class PlannerReActFlow(BaseFlow):
         summary_llm: BaseChatModel | None = None,
         user_id: str = "",
         skill_graph_canary_percent: int = 0,
-        db_url: str = "",
+        checkpointer_pool: object | None = None,
         checkpointer: Any = None,
+        supports_vision: bool = True,
+        supports_pdf_input: bool = False,
+        file_processor_lookup: Any = None,  # FileProcessorLookup | None
     ) -> None:
+        self._supports_vision = supports_vision
+        self._supports_pdf_input = supports_pdf_input
+        self._file_processor_lookup = file_processor_lookup
         self._uow_factory = uow_factory
         self._session_id = session_id
         self._summary_llm = summary_llm or llm
@@ -82,6 +97,19 @@ class PlannerReActFlow(BaseFlow):
         self.plan: Optional[Plan] = None
         self._memory_config = agent_config.memory
         self._overflow_config = overflow_config
+        self._token_estimator = TokenEstimator(
+            strategy=self._overflow_config.token_estimator,
+            model_name=self._overflow_config.model_name,
+        ) if self._overflow_config else TokenEstimator()
+        self._compactor = GradualCompactor(
+            token_estimator=self._token_estimator,
+            soft_trigger_ratio=self._overflow_config.soft_trigger_ratio,
+            hard_trigger_ratio=self._overflow_config.hard_trigger_ratio,
+            target_ratio=self._overflow_config.target_ratio,
+            summary_max_chars=self._overflow_config.summary_max_chars,
+            token_safety_factor=self._overflow_config.token_safety_factor,
+        ) if self._overflow_config else None
+        self._last_compaction_result: CompactionResult | None = None
         self._skill_context = ""
 
         # Skill creation subgraph
@@ -89,6 +117,7 @@ class PlannerReActFlow(BaseFlow):
         self._skill_graph_canary_percent = skill_graph_canary_percent
         self._brainstorm_skill_tool = brainstorm_skill_tool
         self._create_skill_tool = create_skill_tool
+        self._skill_tool = skill_tool
 
         # 延迟绑定：保存依赖引用，在 invoke() 时构建工具和图
         # MCP/A2A 在 AgentTaskRunner.run() 中异步初始化，构造时尚未就绪
@@ -105,57 +134,177 @@ class PlannerReActFlow(BaseFlow):
 
         # LangGraph checkpointer — 跨 graph 重建复用，支持 interrupt/resume
         self._checkpointer = checkpointer  # None = lazy-init AsyncPostgresSaver
-        self._db_url = db_url
+        self._checkpointer_pool = checkpointer_pool
+        self._assembler = None
+
+        # Phase 3: 动态 skill 切换回调（由 AgentTaskRunner 在 invoke 前设置）
+        self._skill_context_refresher = None
+        self._react_graph_provider = None
+        self._skill_guide_injector = None
+
+        # 会话 Skill 池 getter（由 AgentTaskRunner 在 run() 中设置），
+        # 用于 get_skill_guide 工具按需加载完整 SKILL.md。
+        # 使用 callable 而非直接列表引用，避免 runner 重新赋值后 stale。
+        self._skill_pool_getter: Callable[[], list] | None = None
+        self._file_listings_getter: Callable[[], dict[str, list[str]]] | None = None
+        self._sandbox_skill_root: str = "/home/ubuntu/workspace/.skills"
+
+        # MCP progressive loading (set by AgentTaskRunner in run())
+        self._mcp_tool_ref: Callable | None = None
+        self._activated_mcp_tools_ref: Callable[[], set[str]] | None = None
+        self._mcp_always_bind_names: set[str] = set()
+
+        # Flush scheduling: cursor + pending batch
+        self._flush_cursor: int = 0
+        self._pending_flush_batch: FlushBatch | None = None
 
     async def _get_checkpointer(self):
-        """Lazy-initialize checkpointer. Returns injected checkpointer (test) or AsyncPostgresSaver (prod).
+        """Lazy-initialize checkpointer.
 
-        Note: The lazy import of AsyncPostgresSaver in the domain layer is a pragmatic
-        DDD compromise — the checkpointer is injected in tests, and only falls back to
-        infrastructure-level initialization when no checkpointer is provided.
+        Returns injected checkpointer (test via MemorySaver) or creates
+        AsyncPostgresSaver backed by the shared connection pool (prod).
+
+        Note: AsyncPostgresSaver(pool) must be called in an async context
+        because its __init__ calls asyncio.get_running_loop().
         """
         if self._checkpointer is not None:
             return self._checkpointer
         from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
-        from psycopg import AsyncConnection
 
-        conn_string = self._db_url.replace("+asyncpg", "")
-        conn = await AsyncConnection.connect(
-            conn_string, autocommit=True, prepare_threshold=0,
-        )
-        self._checkpointer = AsyncPostgresSaver(conn=conn)
-        await self._checkpointer.setup()
+        self._checkpointer = AsyncPostgresSaver(self._checkpointer_pool)
         return self._checkpointer
+
+    async def close(self) -> None:
+        """Release checkpointer reference. Pool connections are managed by the pool."""
+        self._checkpointer = None
 
     def set_skill_context(self, skill_context: str) -> None:
         """Set activated skill context for this round."""
         self._skill_context = skill_context
+
+    # -- Tool collection sub-methods ------------------------------------------
+
+    def _collect_native_tools(self) -> list:
+        """Collect sandbox/browser/search tools."""
+        return create_native_tools(
+            sandbox=self._sandbox, browser=self._browser,
+            search_engine=self._search_engine,
+            processor_lookup=self._file_processor_lookup,
+            supports_vision=self._supports_vision,
+            supports_pdf_input=self._supports_pdf_input,
+        )
+
+    async def _collect_mcp_tools(self) -> list:
+        """Collect MCP tools with progressive loading.
+
+        Small tool set (<=15): bind all directly.
+        Large tool set (>15): only always_bind + discovery tools.
+        """
+        if not self._mcp_tool:
+            return []
+        MCP_AUTO_BIND_THRESHOLD = 15
+        all_mcp_tools = self._mcp_tool.get_tools()
+        tools: list = []
+        if len(all_mcp_tools) <= MCP_AUTO_BIND_THRESHOLD:
+            tools.extend(create_mcp_langchain_tools(self._mcp_tool, tool_names=None))
+        else:
+            if self._mcp_always_bind_names:
+                tools.extend(create_mcp_langchain_tools(
+                    self._mcp_tool, tool_names=self._mcp_always_bind_names,
+                ))
+            if self._mcp_tool_ref is not None and self._activated_mcp_tools_ref is not None:
+                from app.domain.services.tools.langchain_mcp_discovery import create_mcp_discovery_tools
+                tools.extend(create_mcp_discovery_tools(
+                    mcp_tool_ref=self._mcp_tool_ref,
+                    activated_tools_ref=self._activated_mcp_tools_ref,
+                ))
+        return tools
+
+    def _collect_a2a_tools(self) -> list:
+        """Collect A2A remote agent tools."""
+        from app.domain.services.tools.langchain_a2a import create_a2a_langchain_tools
+        return create_a2a_langchain_tools(self._a2a_tool)
+
+    def _collect_skill_creation_tools(self) -> list:
+        """Collect skill creation tools + conditional get_skill_guide."""
+        tools = create_skill_langchain_tools(
+            brainstorm_skill_tool=self._brainstorm_skill_tool,
+            create_skill_tool=self._create_skill_tool,
+        )
+        if self._skill_pool_getter is not None:
+            from app.domain.services.tools.langchain_skill_tools import create_skill_guide_tool
+            tools.append(create_skill_guide_tool(
+                skill_pool_ref=self._skill_pool_getter,
+                file_listings_ref=self._file_listings_getter,
+                sandbox_skill_root=self._sandbox_skill_root,
+            ))
+        return tools
+
+    async def _collect_all_tools(self) -> list:
+        """Aggregate all tool categories for initial graph build.
+
+        Order: native -> MCP -> A2A -> skill creation.
+        Dynamic Skill tools are NOT included here — they are injected
+        per-step by react_graph_provider.
+        """
+        tools: list = []
+        tools.extend(self._collect_native_tools())
+        tools.extend(await self._collect_mcp_tools())
+        tools.extend(self._collect_a2a_tools())
+        tools.extend(self._collect_skill_creation_tools())
+        return tools
+
+    # -- Graph construction ---------------------------------------------------
 
     async def _ensure_graphs(self) -> None:
         """延迟构建工具列表和 LangGraph 图。
 
         在 invoke() 首次调用时执行，此时 MCP/A2A 已完成异步初始化，
         能正确获取到所有可用工具。后续调用会重新构建以反映工具变化。
+
+        注意：此处只绑定 native + MCP + A2A + skill_creation 工具。
+        动态 Skill 工具（来自 SkillTool）不在此绑定，而是由
+        react_graph_provider 按步骤渐进式注入，避免一次性全量绑定。
+        Planner 和 Executor 通过 skill_context（名称+描述）了解可用 Skill。
         """
         checkpointer = await self._get_checkpointer()
-        from app.domain.services.tools.langchain_a2a import create_a2a_langchain_tools
+        lc_tools = await self._collect_all_tools()
 
-        lc_tools = create_native_tools(
-            sandbox=self._sandbox, browser=self._browser,
-            search_engine=self._search_engine,
-        )
-        lc_tools.extend(create_mcp_langchain_tools(self._mcp_tool))
-        lc_tools.extend(create_a2a_langchain_tools(self._a2a_tool))
-        lc_tools.extend(create_skill_langchain_tools(
-            brainstorm_skill_tool=self._brainstorm_skill_tool,
-            create_skill_tool=self._create_skill_tool,
-        ))
-
+        has_guide_tool = self._skill_pool_getter is not None
         tool_names = [t.name for t in lc_tools]
-        logger.info("延迟绑定工具列表 (%d tools): %s", len(lc_tools), tool_names)
+        logger.info(
+            "基础工具列表 (%d tools, get_skill_guide=%s, 不含动态Skill): %s",
+            len(lc_tools), has_guide_tool, tool_names,
+        )
+
+        # Context assembler (B2)
+        from app.domain.services.graphs.context_assembler import ContextAssembler
+        from app.domain.services.context.model_context_window import resolve_context_window
+
+        assembler = None
+        if self._overflow_config:
+            context_window = resolve_context_window(
+                self._overflow_config.model_name, self._overflow_config,
+            )
+            assembler = ContextAssembler(
+                estimator=TokenEstimator(
+                    strategy=self._overflow_config.token_estimator,
+                    model_name=self._overflow_config.model_name,
+                ),
+                context_window=context_window,
+                reserved_output_tokens=self._overflow_config.reserved_output_tokens,
+                safety_factor=self._overflow_config.token_safety_factor,
+                tool_compress_trigger_ratio=self._overflow_config.tool_compress_trigger_ratio,
+            )
+        self._assembler = assembler
 
         self._react_graph = build_react_graph(
             llm=self._llm, tools=lc_tools, agent_config=self._agent_config,
+            tool_result_max_chars=(
+                self._overflow_config.tool_result_max_chars
+                if self._overflow_config else 8000
+            ),
+            assembler=assembler,
         )
         self._main_graph = build_main_graph(
             planner_llm=self._llm,
@@ -165,6 +314,8 @@ class PlannerReActFlow(BaseFlow):
             session_id=self._session_id,
             agent_config=self._agent_config,
             checkpointer=checkpointer,
+            assembler=assembler,
+            supports_vision=self._supports_vision,
         )
         self._graphs_built = True
 
@@ -186,6 +337,46 @@ class PlannerReActFlow(BaseFlow):
                 # 截取前 300 字符以控制 token 消耗
                 line += f"\n  执行结果: {s.result[:300]}"
             lines.append(line)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_fallback_context_from_memory(raw_messages: list[dict]) -> str:
+        """从 Memory 的原始消息中提取简要上下文，作为 summary 不可用时的兜底。
+
+        提取逻辑：取第一条 user 消息（原始需求）和最后一条 assistant 消息
+        （最终结果），拼接为简要回顾。
+        """
+        first_user = ""
+        last_assistant = ""
+        # 收集 tool 消息中提到的文件路径
+        file_paths: list[str] = []
+
+        for msg in raw_messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if not isinstance(content, str):
+                continue
+            if role == "user" and not first_user:
+                first_user = content[:300]
+            elif role == "assistant" and content.strip():
+                last_assistant = content[:300]
+            elif role == "tool" and content:
+                # 从工具结果中提取文件路径（启发式，容忍少量误报）
+                for token in content.split():
+                    cleaned = token.rstrip(",.;:)]}\"'")
+                    if cleaned.startswith("/home/") and "." in cleaned.rsplit("/", 1)[-1]:
+                        file_paths.append(cleaned[:200])
+
+        if not first_user:
+            return ""
+
+        lines = ["### 前一轮上下文（从记忆恢复）"]
+        lines.append(f"- 用户需求：{first_user}")
+        if last_assistant:
+            lines.append(f"- 最终结果：{last_assistant}")
+        if file_paths:
+            unique = list(dict.fromkeys(file_paths))[:10]
+            lines.append(f"- 涉及文件：{', '.join(unique)}")
         return "\n".join(lines)
 
     def _build_context_anchor(self, message: Message) -> str:
@@ -233,24 +424,33 @@ class PlannerReActFlow(BaseFlow):
             unresolved=parsed.unresolved,
         )
 
-    async def _check_overflow(self, memory: Memory) -> None:
-        """检测上下文溢出，超过硬阈值时做激进压缩。"""
+    async def _check_overflow(self, memory: Memory) -> CompactionResult | None:
+        """检测上下文溢出，根据水位触发渐进压缩。"""
         if not self._overflow_config or not self._overflow_config.context_overflow_guard_enabled:
-            return
+            return None
+        # _compactor is always non-None when _overflow_config is non-None (see __init__)
         from app.domain.services.context.model_context_window import resolve_context_window
-        # 使用字符估算 token（粗略：1 token ≈ 3-4 字符中英混合）
-        total_chars = sum(len(str(m.get("content", ""))) for m in memory.messages)
-        estimated_tokens = int(total_chars / 3 * self._overflow_config.token_safety_factor)
-        window = resolve_context_window("", self._overflow_config)
-        hard_limit = int(window * self._overflow_config.hard_trigger_ratio)
-        if estimated_tokens > hard_limit:
-            logger.warning(f"上下文溢出: ~{estimated_tokens} tokens > hard_limit {hard_limit}, 执行硬压缩")
-            memory.compact(keep_summary=False)
-            # 保留系统消息 + 最近 N 条
-            if len(memory.messages) > 20:
-                memory.messages = memory.messages[:1] + memory.messages[-19:]
+        msgs = dicts_to_messages(memory.messages)
+        window = resolve_context_window(self._overflow_config.model_name, self._overflow_config)
+
+        result = await self._compactor.try_compact(
+            messages=msgs,
+            context_window=window,
+            summary_llm=self._summary_llm,
+        )
+
+        if result.level_applied > 0:
+            memory.messages = messages_to_dicts(result.messages)
             async with self._uow_factory() as uow:
                 await uow.session.save_memory(self._session_id, "react", memory)
+            logger.info(
+                "compaction level=%d, %d→%d tokens, removed %d msgs",
+                result.level_applied, result.tokens_before,
+                result.tokens_after, result.messages_removed,
+            )
+
+        self._last_compaction_result = result
+        return result
 
     def _is_skill_graph_active(self) -> bool:
         return is_skill_graph_enabled(self._user_id, self._skill_graph_canary_percent)
@@ -304,11 +504,24 @@ class PlannerReActFlow(BaseFlow):
                 brainstorm_tool=self._brainstorm_skill_tool,
                 create_skill_tool=self._create_skill_tool,
             )
-            new_state, events = await graph.run(
-                state=graph_state,
-                action=action,
-                original_request=graph_state.original_request,
-            )
+            try:
+                new_state, events = await graph.run(
+                    state=graph_state,
+                    action=action,
+                    original_request=graph_state.original_request,
+                )
+            except Exception as exc:
+                # graph.run() 抛出未捕获异常时，保留原始 graph_state 不清除，
+                # 确保下次重试时仍能恢复 blueprint/original_request
+                logger.error(
+                    "Skill 子图执行异常（原始状态已保留，可重试）: %s", exc,
+                    exc_info=True,
+                )
+                yield MessageEvent(
+                    role="assistant",
+                    message="Skill 创建遇到错误，请重试或取消。",
+                )
+                return
             # 关键：先持久化状态，再 yield 事件。
             ok = await self._persist_skill_graph_state(new_state)
             if not ok:
@@ -360,11 +573,19 @@ class PlannerReActFlow(BaseFlow):
             brainstorm_tool=self._brainstorm_skill_tool,
             create_skill_tool=self._create_skill_tool,
         )
-        new_state, events = await graph.run(
-            state=None,
-            action=None,
-            original_request=message.message,
-        )
+        try:
+            new_state, events = await graph.run(
+                state=None,
+                action=None,
+                original_request=message.message,
+            )
+        except Exception as exc:
+            logger.error("Skill 初始子图执行异常: %s", exc, exc_info=True)
+            yield MessageEvent(
+                role="assistant",
+                message="Skill 蓝图生成失败，请重新发起创建请求。",
+            )
+            return
         # 关键：先持久化状态，再 yield 事件。
         # 如果持久化失败，不展示蓝图（避免用户确认后找不到状态）。
         ok = await self._persist_skill_graph_state(new_state)
@@ -392,9 +613,13 @@ class PlannerReActFlow(BaseFlow):
         )
 
         attachments = getattr(message, "attachments", [])
+        image_blocks = getattr(message, "image_content_blocks", [])
         prompt = CREATE_PLAN_PROMPT.format(
             message=message.message,
-            attachments=", ".join(attachments) if attachments else "无",
+            attachments=format_attachments_text(
+                attachments, has_image_blocks=bool(image_blocks), for_planner=True,
+                supports_vision=self._supports_vision,
+            ),
         )
 
         system_content = PLANNER_SYSTEM_PROMPT
@@ -409,19 +634,24 @@ class PlannerReActFlow(BaseFlow):
         if summary_texts:
             system_content += "\n\n## 历史对话摘要\n" + "\n\n".join(summary_texts)
 
+        # Planner 不传图片（同 main_graph.planner_node），避免幻觉图片内容
         messages = [
             SystemMessage(content=system_content),
             HumanMessage(content=prompt),
         ]
         structured = self._llm.with_structured_output(PlanResponse)
-        parsed: PlanResponse | None = await structured.ainvoke(messages)
+        try:
+            parsed: PlanResponse | None = await structured.ainvoke(messages)
+        except Exception:
+            logger.warning("Planner structured output failed in detection, using fallback plan")
+            parsed = None
 
         if parsed is None:
             parsed = PlanResponse(
                 title="Task",
                 goal=message.message,
                 language=getattr(message, "language", "zh"),
-                steps=[],
+                steps=[StepDef(description=message.message)],
                 message="好的，我来帮你处理。",
             )
 
@@ -476,11 +706,27 @@ class PlannerReActFlow(BaseFlow):
         await self._ensure_graphs()
 
         # LangGraph config with thread_id for checkpointer
-        config = {"configurable": {"thread_id": self._session_id}}
+        config = {
+            "configurable": {
+                "thread_id": self._session_id,
+                "skill_context_refresher": self._skill_context_refresher,
+                "react_graph_provider": self._react_graph_provider,
+                "skill_guide_injector": self._skill_guide_injector,
+                "has_file_view": self._file_processor_lookup is not None,
+            }
+        }
 
         # === Before Graph: load summaries ===
         async with self._uow_factory() as uow:
             summaries = await uow.session.get_summary(self._session_id)
+
+        # Load flush_cursor from persisted Memory (needed for both resume and new task)
+        try:
+            async with self._uow_factory() as uow:
+                _memory_for_cursor = await uow.session.get_memory(self._session_id, "react")
+                self._flush_cursor = _memory_for_cursor.flush_cursor
+        except Exception:
+            self._flush_cursor = 0
 
         # Detect pending interrupt via checkpointer state
         is_resume = False
@@ -522,6 +768,16 @@ class PlannerReActFlow(BaseFlow):
             raw_messages = memory.get_messages()
             lc_messages = dicts_to_messages(raw_messages) if raw_messages else []
 
+            # Fallback: 当 summary_texts 为空但 Memory 中有历史消息时，
+            # 从 raw messages 中提取简要上下文。这处理以下场景：
+            # - 新任务创建了新的 PlannerReActFlow（self.plan=None）
+            # - 且 DB summary 生成失败（例如 LLM 404）
+            # 此时 raw_messages 是唯一的历史上下文来源。
+            if not summary_texts and raw_messages:
+                fallback = self._build_fallback_context_from_memory(raw_messages)
+                if fallback:
+                    summary_texts.append(fallback)
+
             # 2. Planner-first routing: run planner, check for skill creation intent
             _skill_tools_available = (
                 self._is_skill_graph_active()
@@ -547,6 +803,7 @@ class PlannerReActFlow(BaseFlow):
                     "message": message.message,
                     "language": getattr(message, "language", "zh"),
                     "attachments": getattr(message, "attachments", []),
+                    "image_content_blocks": getattr(message, "image_content_blocks", []),
                     "plan": plan,
                     "current_step": plan.get_next_step(),
                     "messages": lc_messages,
@@ -569,6 +826,7 @@ class PlannerReActFlow(BaseFlow):
                     "message": message.message,
                     "language": getattr(message, "language", "zh"),
                     "attachments": getattr(message, "attachments", []),
+                    "image_content_blocks": getattr(message, "image_content_blocks", []),
                     "plan": self.plan,
                     "current_step": None,
                     "messages": lc_messages,
@@ -630,6 +888,12 @@ class PlannerReActFlow(BaseFlow):
             logger.warning("messages_to_dicts 转换失败，使用空消息列表: %s", exc)
             dict_messages = []
 
+        # Evaluate flush gate BEFORE Memory construction (uses raw_messages)
+        try:
+            self._evaluate_flush_gate(raw_messages, final.get("plan") or self.plan)
+        except Exception as exc:
+            logger.warning("flush gate 评估失败: %s", exc)
+
         if final.get("should_interrupt"):
             # Checkpointer has automatically saved full graph state for Command(resume=...).
             # Only persist Memory (for context anchors) and update flow status.
@@ -642,7 +906,7 @@ class PlannerReActFlow(BaseFlow):
                 self.plan.title if self.plan else "<none>",
             )
 
-            memory = Memory(messages=list(dict_messages))
+            memory = Memory(messages=list(dict_messages), flush_cursor=self._flush_cursor)
             memory.compact(keep_summary=self._memory_config.compact_keep_summary)
             try:
                 async with self._uow_factory() as uow:
@@ -651,7 +915,7 @@ class PlannerReActFlow(BaseFlow):
                 logger.warning(f"中断时保存 Memory 失败: {e}")
         else:
             # === After Graph: 记忆压缩、保存、摘要生成 ===
-            memory = Memory(messages=list(dict_messages))
+            memory = Memory(messages=list(dict_messages), flush_cursor=self._flush_cursor)
             memory.compact(keep_summary=self._memory_config.compact_keep_summary)
 
             try:
@@ -683,6 +947,327 @@ class PlannerReActFlow(BaseFlow):
 
             # 正常完成：重置状态
             self.status = FlowStatus.IDLE
+
+    # ── Flush scheduling: gate + chunking ────────────────────────────────────
+
+    def _evaluate_flush_gate(
+        self,
+        raw_messages: Sequence[BaseMessage],
+        plan: Any,
+    ) -> None:
+        """Evaluate whether to produce a FlushBatch for background flushing.
+
+        Side-effects:
+        - Always clears ``_pending_flush_batch`` at entry.
+        - Sets ``_pending_flush_batch`` if the gate passes.
+        - May reset ``_flush_cursor`` on compaction shrink.
+        """
+        self._pending_flush_batch = None
+
+        if not self._memory_config.flush_enabled:
+            return
+
+        current_len = len(raw_messages)
+
+        # Compaction shrink: context was compacted and now shorter than cursor
+        if current_len < self._flush_cursor:
+            self._flush_cursor = current_len
+            return
+
+        # No new messages since last flush
+        if current_len == self._flush_cursor:
+            return
+
+        # Count completed steps
+        steps_completed = 0
+        if plan is not None and hasattr(plan, "steps"):
+            steps_completed = sum(
+                1 for s in plan.steps
+                if s.status == ExecutionStatus.COMPLETED
+            )
+
+        if steps_completed < self._memory_config.flush_min_steps:
+            return
+
+        # Estimate new tokens since last cursor
+        new_messages = raw_messages[self._flush_cursor:]
+        new_token_count = self._token_estimator.estimate_messages(new_messages)
+
+        if new_token_count < self._memory_config.flush_min_new_tokens:
+            return
+
+        # Gate passes — build chunks and FlushBatch
+        chunks = self._chunk_messages(list(new_messages), plan=plan)
+        if not chunks:
+            return
+
+        self._pending_flush_batch = FlushBatch(
+            session_id=self._session_id,
+            user_id=self._user_id,
+            from_cursor=self._flush_cursor,
+            target_cursor=current_len,
+            chunks=tuple(chunks),
+        )
+
+    def _chunk_messages(
+        self,
+        messages: list[BaseMessage],
+        plan: Any = None,
+    ) -> list[RawChunk]:
+        """Convert a sequence of LangChain messages into RawChunks.
+
+        Phases:
+        1. Group messages (skip SystemMessage, merge AIMessage+ToolMessage groups)
+        2. Merge short text groups (<50 tokens)
+        3. Split oversized groups (>500 tokens) with paragraph overlap
+        4. Build RawChunks with metadata
+        """
+        # Phase 1: Group messages
+        groups: list[dict[str, Any]] = []
+        current_group: dict[str, Any] | None = None
+
+        for idx, msg in enumerate(messages):
+            if isinstance(msg, SystemMessage):
+                continue
+
+            text = self._message_to_text(msg)
+            msg_type = type(msg).__name__
+
+            if isinstance(msg, ToolMessage):
+                # Merge ToolMessage into the preceding AIMessage group
+                if current_group is not None:
+                    current_group["texts"].append(text)
+                    current_group["message_types"].add(msg_type)
+                    tool_name = getattr(msg, "name", "") or ""
+                    if tool_name:
+                        current_group["tool_names"].add(tool_name)
+                else:
+                    # Orphaned ToolMessage — start a new group
+                    current_group = {
+                        "texts": [text],
+                        "message_types": {msg_type},
+                        "tool_names": {getattr(msg, "name", "") or ""},
+                        "turn_index": idx,
+                    }
+                    groups.append(current_group)
+                continue
+
+            if isinstance(msg, AIMessage) and current_group is not None:
+                # Check if this AI message has tool_calls — extend the group
+                tool_calls = msg.additional_kwargs.get("tool_calls", [])
+                if tool_calls:
+                    current_group["texts"].append(text)
+                    current_group["message_types"].add(msg_type)
+                    for tc in tool_calls:
+                        fn = tc.get("function", {})
+                        name = fn.get("name", "")
+                        if name:
+                            current_group["tool_names"].add(name)
+                    continue
+
+            # Start a new group (HumanMessage or AIMessage without pending tool_calls)
+            if current_group is not None:
+                pass  # Already appended
+            current_group = {
+                "texts": [text],
+                "message_types": {msg_type},
+                "tool_names": set(),
+                "turn_index": idx,
+            }
+            groups.append(current_group)
+
+        if not groups:
+            return []
+
+        # Phase 2: Merge short groups (<50 tokens)
+        merged_groups: list[dict[str, Any]] = []
+        buffer: dict[str, Any] | None = None
+
+        for group in groups:
+            group_text = "\n".join(group["texts"])
+            token_count = self._token_estimator.estimate(group_text)
+
+            if buffer is None:
+                buffer = {
+                    "texts": list(group["texts"]),
+                    "message_types": set(group["message_types"]),
+                    "tool_names": set(group["tool_names"]),
+                    "turn_index": group["turn_index"],
+                    "token_count": token_count,
+                }
+            elif buffer["token_count"] < 50:
+                # Buffer is short (<50 tokens) — merge with current group
+                buffer["texts"].extend(group["texts"])
+                buffer["message_types"].update(group["message_types"])
+                buffer["tool_names"].update(group["tool_names"])
+                buffer["token_count"] += token_count
+            else:
+                merged_groups.append(buffer)
+                buffer = {
+                    "texts": list(group["texts"]),
+                    "message_types": set(group["message_types"]),
+                    "tool_names": set(group["tool_names"]),
+                    "turn_index": group["turn_index"],
+                    "token_count": token_count,
+                }
+
+        if buffer is not None:
+            merged_groups.append(buffer)
+
+        # Phase 3 & 4: Split oversized + build RawChunks
+        chunks: list[RawChunk] = []
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Extract step title from plan if available
+        step_title = ""
+        if plan is not None and hasattr(plan, "steps") and plan.steps:
+            # Use the first completed step's description as context
+            for s in plan.steps:
+                if s.status == ExecutionStatus.COMPLETED:
+                    step_title = s.description
+                    break
+
+        for group in merged_groups:
+            content = "\n".join(group["texts"])
+            token_count = group.get("token_count") or self._token_estimator.estimate(content)
+
+            if token_count > 500:
+                # Split oversized
+                parts = self._split_with_overlap(content, target_tokens=250)
+            else:
+                parts = [content]
+
+            for part in parts:
+                if not part.strip():
+                    continue
+                content_hash = hashlib.sha256(part.encode("utf-8")).hexdigest()
+                meta: dict[str, Any] = {
+                    "turn_index": group["turn_index"],
+                    "message_types": sorted(group["message_types"]),
+                    "created_at": now_iso,
+                }
+                if step_title:
+                    meta["step_title"] = step_title
+                tool_names = group.get("tool_names", set())
+                if tool_names:
+                    meta["tool_names"] = sorted(tool_names)
+
+                chunks.append(RawChunk(
+                    content=part,
+                    session_id=self._session_id,
+                    user_id=self._user_id,
+                    source="session_flush",
+                    metadata=meta,
+                    content_hash=content_hash,
+                ))
+
+        return chunks
+
+    def _split_with_overlap(self, text: str, target_tokens: int = 250) -> list[str]:
+        """Split text on paragraph boundaries with ~50 token overlap.
+
+        Returns a list of text segments. Short texts are returned as-is.
+        """
+        estimated_tokens = self._token_estimator.estimate(text)
+        if estimated_tokens <= target_tokens:
+            return [text]
+
+        paragraphs = text.split("\n\n")
+        if len(paragraphs) <= 1:
+            # No paragraph boundaries — fall back to character-level splitting
+            return self._split_by_chars(text, target_tokens)
+
+        OVERLAP_TOKENS = 50
+        segments: list[str] = []
+        current_parts: list[str] = []
+        current_tokens = 0
+
+        for para in paragraphs:
+            para_tokens = self._token_estimator.estimate(para)
+
+            # If a single paragraph exceeds target, sub-split it first
+            if para_tokens > target_tokens:
+                # Flush current buffer before sub-splitting
+                if current_parts:
+                    segments.append("\n\n".join(current_parts))
+                    current_parts = []
+                    current_tokens = 0
+                # Sub-split the oversized paragraph by characters
+                sub_parts = self._split_by_chars(para, target_tokens)
+                segments.extend(sub_parts)
+                continue
+
+            if current_tokens + para_tokens > target_tokens and current_parts:
+                segments.append("\n\n".join(current_parts))
+                # Overlap: keep last paragraph(s) worth ~50 tokens
+                overlap_parts: list[str] = []
+                overlap_tokens = 0
+                for p in reversed(current_parts):
+                    p_tok = self._token_estimator.estimate(p)
+                    if overlap_tokens + p_tok > OVERLAP_TOKENS:
+                        break
+                    overlap_parts.insert(0, p)
+                    overlap_tokens += p_tok
+                current_parts = overlap_parts
+                current_tokens = overlap_tokens
+
+            current_parts.append(para)
+            current_tokens += para_tokens
+
+        if current_parts:
+            segments.append("\n\n".join(current_parts))
+
+        return segments if segments else [text]
+
+    def _split_by_chars(self, text: str, target_tokens: int = 250) -> list[str]:
+        """Fallback split for text without paragraph boundaries.
+
+        Splits on newline or space boundaries, with ~50 token overlap.
+        """
+        # Estimate chars per target — rough heuristic
+        total_tokens = self._token_estimator.estimate(text)
+        if total_tokens <= target_tokens:
+            return [text]
+
+        chars_per_token = len(text) / max(total_tokens, 1)
+        target_chars = int(target_tokens * chars_per_token)
+        overlap_chars = int(50 * chars_per_token)
+
+        segments: list[str] = []
+        start = 0
+        while start < len(text):
+            end = start + target_chars
+            if end >= len(text):
+                segments.append(text[start:])
+                break
+
+            # Try to break at newline or space
+            break_at = text.rfind("\n", start + target_chars // 2, end)
+            if break_at == -1:
+                break_at = text.rfind(" ", start + target_chars // 2, end)
+            if break_at == -1:
+                break_at = end
+
+            segments.append(text[start:break_at].rstrip())
+            start = max(break_at - overlap_chars, start + 1)
+
+        return segments if segments else [text]
+
+    @staticmethod
+    def _message_to_text(msg: BaseMessage) -> str:
+        """Extract text content from a LangChain BaseMessage."""
+        content = msg.content
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(block.get("text", ""))
+                elif isinstance(block, str):
+                    parts.append(block)
+            return " ".join(parts)
+        return ""
 
     @property
     def done(self) -> bool:

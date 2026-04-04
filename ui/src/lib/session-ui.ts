@@ -528,11 +528,12 @@ function getToolActionTitle(
     browser_scroll_down: "向下滚动页面",
     browser_console_exec: "执行网页脚本",
     browser_console_view: "查看控制台输出",
-    read_file: "读取文件",
-    write_file: "写入文件",
-    replace_in_file: "替换文件内容",
-    search_in_file: "搜索文件内容",
-    find_files: "查找文件",
+    file_read: "读取文件",
+    file_write: "写入文件",
+    file_str_replace: "替换文件内容",
+    file_find_in_content: "搜索文件内容",
+    file_find_by_name: "查找文件",
+    file_list: "列出目录",
     shell_execute: "执行终端命令",
     shell_read_output: "读取终端输出",
     shell_wait_process: "等待终端进程",
@@ -570,6 +571,9 @@ function getToolActionTitle(
   }
 
   const label = toolLabelByName[toolName] || "工具";
+  if (functionName) {
+    return called ? `${label} ${functionName} 已完成` : `正在调用${label} ${functionName}`;
+  }
   return called ? `${label}调用已完成` : `正在调用${label}`;
 }
 

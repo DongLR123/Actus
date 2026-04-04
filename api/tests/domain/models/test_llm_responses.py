@@ -35,9 +35,21 @@ class TestSummarizerOutput:
         assert r.message == "done"
         assert r.attachments == ["/f.md"]
 
+    def test_result_fallback(self):
+        """LLM sometimes returns 'result' instead of 'message'."""
+        r = SummarizerOutput.model_validate(
+            {"success": True, "result": "done via result", "attachments": ["/f.md"]}
+        )
+        assert r.text == "done via result"
+        assert r.attachments == ["/f.md"]
+
+    def test_message_takes_priority_over_result(self):
+        r = SummarizerOutput.model_validate({"message": "msg", "result": "res"})
+        assert r.text == "msg"
+
     def test_empty(self):
         r = SummarizerOutput.model_validate({})
-        assert r.message == ""
+        assert r.text == ""
         assert r.attachments == []
 
 

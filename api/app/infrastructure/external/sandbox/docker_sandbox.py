@@ -164,6 +164,8 @@ class DockerSandbox(Sandbox):
                     "NO_PROXY": settings.sandbox_no_proxy,
                     "TZ": settings.container_timezone,
                 },
+                # 容器级资源上限，防止 Chromium 失控导致宿主机 OOM
+                "mem_limit": settings.sandbox_mem_limit,
             }
 
             # 5.判断是否传递了网络

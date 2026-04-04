@@ -41,7 +41,8 @@ from app.infrastructure.storage.redis import RedisClient, get_redis
 
 # from app.interfaces.repository_dependencies import get_db_session_repository
 from core.config import get_settings
-from fastapi import Depends
+from fastapi import Depends, Request
+from psycopg_pool import AsyncConnectionPool
 from sqlalchemy.ext.asyncio import AsyncSession
 
 # from functools import lru_cache
@@ -114,7 +115,7 @@ def _load_app_config():
     return app_config_repository.load()
 
 
-def _build_llm(llm_config: LLMConfig) -> BaseChatModel:
+def _build_llm(llm_config: LLMConfig, *, supports_pdf_input: bool = False) -> BaseChatModel:
     """根据 api_type 配置构建 LLM 实例。
 
     - chat_completions: 仅用 Chat Completions API
@@ -136,6 +137,8 @@ def _build_llm(llm_config: LLMConfig) -> BaseChatModel:
         temperature=llm_config.temperature,
         max_tokens=llm_config.max_tokens,
         supports_response_format=getattr(llm_config, 'supports_response_format', True),
+        supports_vision=getattr(llm_config, 'supports_vision', True),
+        supports_pdf_input=supports_pdf_input,
     )
     responses = ActusResponsesModel(
         base_url=str(llm_config.base_url),
@@ -143,6 +146,8 @@ def _build_llm(llm_config: LLMConfig) -> BaseChatModel:
         model_name=llm_config.model_name,
         temperature=llm_config.temperature,
         max_tokens=llm_config.max_tokens,
+        supports_vision=getattr(llm_config, 'supports_vision', True),
+        supports_pdf_input=supports_pdf_input,
     )
     if llm_config.api_type == "responses":
         return responses
@@ -167,10 +172,22 @@ def get_skill_creator_service() -> SkillCreatorService:
     )
 
 
+def get_checkpointer_pool(request: Request) -> AsyncConnectionPool:
+    """Extract the checkpointer connection pool from app state."""
+    return request.app.state.checkpointer_pool.pool
+
+
+def get_flush_service(request: Request):
+    """Extract the MemoryFlushService from app state (may be None)."""
+    return getattr(request.app.state, "flush_service", None)
+
+
 # @lru_cache()
 def get_agent_service(
     minio_store: MinioStore = Depends(get_minio),
     redis_client: RedisClient = Depends(get_redis),
+    checkpointer_pool: AsyncConnectionPool = Depends(get_checkpointer_pool),
+    flush_service=Depends(get_flush_service),
 ) -> AgentService:
     # 1.获取应用配置信息(读取配置需要实时获取,所以不配置缓存)
     app_config = _load_app_config()
@@ -178,7 +195,11 @@ def get_agent_service(
     overflow_config = ContextOverflowConfig.from_llm_config(app_config.llm_config)
 
     # 2.构建依赖实例
-    llm = _build_llm(app_config.llm_config)
+    effective_pdf_input = (
+        getattr(app_config.llm_config, 'supports_pdf_input', False)
+        and app_config.llm_config.supports_vision
+    )
+    llm = _build_llm(app_config.llm_config, supports_pdf_input=effective_pdf_input)
     summary_llm = None
     if app_config.agent_config.memory.summary_model:
         summary_llm_config = app_config.llm_config.model_copy(
@@ -196,7 +217,21 @@ def get_agent_service(
         skill_service=_build_skill_service(),
     )
 
-    # 3.实例Agent服务并返回
+    # 3.构造 vision fallback model（非多模态主模型时用于描述图片/视频帧）
+    vision_fallback_model = None
+    vf = app_config.file_understanding.vision_fallback
+    if vf.enabled and vf.model_name:
+        from app.domain.models.app_config import LLMConfig as LLMConfigModel
+        vision_llm_config = LLMConfigModel(
+            base_url=vf.base_url or str(app_config.llm_config.base_url),
+            api_key=vf.api_key or app_config.llm_config.api_key,
+            model_name=vf.model_name,
+            api_type=vf.api_type,
+            supports_vision=True,  # Force: fallback model MUST support vision
+        )
+        vision_fallback_model = _build_llm(vision_llm_config)
+
+    # 4.实例Agent服务并返回
     return AgentService(
         uow_factory=get_uow,
         llm=llm,
@@ -212,6 +247,12 @@ def get_agent_service(
         redis_client=redis_client,
         skill_creator_service=skill_creator_service,
         summary_llm=summary_llm,
+        checkpointer_pool=checkpointer_pool,
+        supports_vision=app_config.llm_config.supports_vision,
+        supports_pdf_input=effective_pdf_input,
+        file_understanding_config=app_config.file_understanding,
+        vision_fallback_model=vision_fallback_model,
+        memory_flusher=flush_service,
         # file_repository=file_repository,
     )
 

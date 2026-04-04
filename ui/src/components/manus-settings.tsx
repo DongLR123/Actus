@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import {
   Bot,
   Cog,
+  Eye,
   Languages,
   LayoutGrid,
   LoaderCircle,
@@ -32,7 +33,7 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useAuth } from "@/hooks/use-auth";
-import type { AgentConfig, LLMConfig, MCPConfig, SkillSourceType } from "@/lib/api/types";
+import type { AgentConfig, FileUnderstandingConfig, LLMConfig, MCPConfig, SkillSourceType, VisionFallbackConfig } from "@/lib/api/types";
 import { normalizeMCPConfigInput } from "@/lib/mcp-config";
 import { useSessionStore } from "@/lib/store/session-store";
 import { useSettingsStore } from "@/lib/store/settings-store";
@@ -44,6 +45,7 @@ const TABS = [
   { key: "a2a", title: "A2A Agent 配置", icon: LayoutGrid },
   { key: "mcp", title: "MCP 服务器", icon: Server },
   { key: "skill", title: "Skill 生态", icon: Puzzle },
+  { key: "file", title: "文件理解", icon: Eye },
   { key: "admin", title: "用户管理", icon: Bot },
 ] as const;
 
@@ -111,6 +113,8 @@ export function ManusSettings() {
   const deleteSkill = useSettingsStore((state) => state.deleteSkill);
   const setSkillEnabled = useSettingsStore((state) => state.setSkillEnabled);
   const setSkillToolEnabled = useSettingsStore((state) => state.setSkillToolEnabled);
+  const fileUnderstanding = useSettingsStore((state) => state.fileUnderstanding);
+  const updateFileUnderstandingConfig = useSettingsStore((state) => state.updateFileUnderstandingConfig);
 
   const [agentForm, setAgentForm] = useState<AgentConfig>({
     max_iterations: 100,
@@ -122,6 +126,8 @@ export function ManusSettings() {
     base_url: "https://api.deepseek.com",
     api_key: "",
     model_name: "deepseek-reasoner",
+    supports_vision: false,
+    supports_pdf_input: false,
     api_type: "chat_completions",
     temperature: 0.7,
     max_tokens: 8192,
@@ -135,6 +141,12 @@ export function ManusSettings() {
     token_estimator: "hybrid",
     token_safety_factor: 1.15,
     unknown_model_context_window: 32768,
+  });
+
+  const [fileForm, setFileForm] = useState<FileUnderstandingConfig>({
+    vision_fallback: { enabled: false, base_url: "", api_key: "", model_name: "", api_type: "chat_completions" },
+    audio: { provider: "disabled", openai_api_key: "", openai_base_url: "https://api.openai.com/v1", openai_model: "whisper-1" },
+    video: { max_keyframes: 5, extract_audio: true, frame_strategy: "scene", scene_threshold: 0.3 },
   });
 
   const [mcpPayload, setMcpPayload] = useState(MCP_EXAMPLE);
@@ -169,6 +181,13 @@ export function ManusSettings() {
     }
   }, [llmConfig]);
 
+  useEffect(() => {
+    if (fileUnderstanding) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setFileForm(fileUnderstanding);
+    }
+  }, [fileUnderstanding]);
+
   const mcpToolMap = useMemo(() => {
     return new Map(mcpTools.map((item) => [item.tool_id, item]));
   }, [mcpTools]);
@@ -202,6 +221,11 @@ export function ManusSettings() {
 
     if (activeTab === "llm") {
       await updateLLMConfig(llmForm);
+      return;
+    }
+
+    if (activeTab === "file") {
+      await updateFileUnderstandingConfig(fileForm);
       return;
     }
 
@@ -488,6 +512,44 @@ export function ManusSettings() {
                       <p className="mt-1 text-xs text-muted-foreground">
                         要使用的模型标识，如 deepseek-chat、deepseek-reasoner、gpt-4o 等。使用带推理的模型时，传递 tools 会自动降级到对话模型。
                       </p>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      supports_vision
+                      <div className="mt-2 flex items-center gap-3">
+                        <Switch
+                          className="data-[state=checked]:bg-primary"
+                          checked={llmForm.supports_vision ?? true}
+                          onCheckedChange={(checked) =>
+                            setLLMForm((prev) => ({
+                              ...prev,
+                              supports_vision: checked,
+                            }))
+                          }
+                        />
+                        <span className="text-xs text-muted-foreground">
+                          模型支持视觉/多模态输入（图片嵌入）。关闭后将强制使用 MCP 工具分析图片
+                        </span>
+                      </div>
+                    </label>
+
+                    <label className="text-sm text-foreground/85">
+                      supports_pdf_input
+                      <div className="mt-2 flex items-center gap-3">
+                        <Switch
+                          className="data-[state=checked]:bg-primary"
+                          checked={llmForm.supports_pdf_input ?? false}
+                          onCheckedChange={(checked) =>
+                            setLLMForm((prev) => ({
+                              ...prev,
+                              supports_pdf_input: checked,
+                            }))
+                          }
+                        />
+                        <span className="text-xs text-muted-foreground">
+                          模型支持原生 PDF 文件输入（仅 OpenAI/Anthropic 原生 API 支持，需同时开启 supports_vision）
+                        </span>
+                      </div>
                     </label>
 
                     <label className="text-sm text-foreground/85">
@@ -1386,6 +1448,262 @@ export function ManusSettings() {
                 </div>
               ) : null}
 
+              {activeTab === "file" ? (
+                <div className="space-y-4">
+                  <h3 className="text-2xl font-semibold tracking-tight text-foreground">
+                    文件理解配置
+                  </h3>
+                  <p className="text-sm text-muted-foreground">
+                    配置 file_view 工具的文件理解能力，让 Agent 能够查看和理解图片、PDF、音频、视频等文件。
+                  </p>
+
+                  <div className="grid max-w-[420px] grid-cols-1 gap-5">
+                    <fieldset className="space-y-4 rounded-lg border border-border/50 p-4">
+                      <legend className="px-2 text-sm font-medium">视觉模型 Fallback</legend>
+                      <p className="text-xs text-muted-foreground">
+                        当主模型不支持视觉（supports_vision=false）时，使用此模型描述图片/视频帧内容。可使用不同 provider。
+                      </p>
+
+                      <label className="text-sm text-foreground/85">
+                        启用
+                        <div className="mt-2 flex items-center gap-3">
+                          <Switch
+                            className="data-[state=checked]:bg-primary"
+                            checked={fileForm.vision_fallback.enabled}
+                            onCheckedChange={(checked) =>
+                              setFileForm((prev) => ({
+                                ...prev,
+                                vision_fallback: { ...prev.vision_fallback, enabled: checked },
+                              }))
+                            }
+                          />
+                        </div>
+                      </label>
+
+                      {fileForm.vision_fallback.enabled && (
+                        <>
+                          <label className="text-sm text-foreground/85">
+                            base_url
+                            <Input
+                              value={fileForm.vision_fallback.base_url}
+                              placeholder="留空则复用主 LLM 的 base_url"
+                              onChange={(e) =>
+                                setFileForm((prev) => ({
+                                  ...prev,
+                                  vision_fallback: { ...prev.vision_fallback, base_url: e.target.value },
+                                }))
+                              }
+                              className="mt-1"
+                            />
+                          </label>
+
+                          <label className="text-sm text-foreground/85">
+                            api_key
+                            <Input
+                              type="password"
+                              value={fileForm.vision_fallback.api_key ?? ""}
+                              placeholder="留空则复用主 LLM 的 api_key"
+                              onChange={(e) =>
+                                setFileForm((prev) => ({
+                                  ...prev,
+                                  vision_fallback: { ...prev.vision_fallback, api_key: e.target.value },
+                                }))
+                              }
+                              className="mt-1"
+                            />
+                          </label>
+
+                          <label className="text-sm text-foreground/85">
+                            model_name
+                            <Input
+                              value={fileForm.vision_fallback.model_name}
+                              placeholder="如 gpt-4o-mini"
+                              onChange={(e) =>
+                                setFileForm((prev) => ({
+                                  ...prev,
+                                  vision_fallback: { ...prev.vision_fallback, model_name: e.target.value },
+                                }))
+                              }
+                              className="mt-1"
+                            />
+                          </label>
+
+                          <label className="text-sm text-foreground/85">
+                            api_type
+                            <select
+                              value={fileForm.vision_fallback.api_type}
+                              onChange={(e) =>
+                                setFileForm((prev) => ({
+                                  ...prev,
+                                  vision_fallback: {
+                                    ...prev.vision_fallback,
+                                    api_type: e.target.value as VisionFallbackConfig["api_type"],
+                                  },
+                                }))
+                              }
+                              className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                            >
+                              <option value="chat_completions">Chat Completions</option>
+                              <option value="responses">Responses</option>
+                              <option value="auto">Auto (先 Chat 后 Responses)</option>
+                            </select>
+                          </label>
+                        </>
+                      )}
+                    </fieldset>
+
+                    <fieldset className="space-y-4 rounded-lg border border-border/50 p-4">
+                      <legend className="px-2 text-sm font-medium">音频处理</legend>
+
+                      <label className="text-sm text-foreground/85">
+                        转录提供商
+                        <select
+                          value={fileForm.audio.provider}
+                          onChange={(e) =>
+                            setFileForm((prev) => ({
+                              ...prev,
+                              audio: { ...prev.audio, provider: e.target.value as "disabled" | "sandbox_whisper" | "openai_api" },
+                            }))
+                          }
+                          className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                        >
+                          <option value="disabled">禁用</option>
+                          <option value="sandbox_whisper">沙箱 Whisper</option>
+                          <option value="openai_api">OpenAI Whisper API</option>
+                        </select>
+                      </label>
+
+                      {fileForm.audio.provider === "openai_api" && (
+                        <>
+                          <label className="text-sm text-foreground/85">
+                            OpenAI API Key
+                            <Input
+                              type="password"
+                              value={fileForm.audio.openai_api_key ?? ""}
+                              onChange={(e) =>
+                                setFileForm((prev) => ({
+                                  ...prev,
+                                  audio: { ...prev.audio, openai_api_key: e.target.value },
+                                }))
+                              }
+                              className="mt-1"
+                            />
+                          </label>
+                          <label className="text-sm text-foreground/85">
+                            Base URL
+                            <Input
+                              value={fileForm.audio.openai_base_url ?? "https://api.openai.com/v1"}
+                              onChange={(e) =>
+                                setFileForm((prev) => ({
+                                  ...prev,
+                                  audio: { ...prev.audio, openai_base_url: e.target.value },
+                                }))
+                              }
+                              placeholder="https://api.openai.com/v1"
+                              className="mt-1"
+                            />
+                          </label>
+                          <label className="text-sm text-foreground/85">
+                            模型名称
+                            <Input
+                              value={fileForm.audio.openai_model ?? "whisper-1"}
+                              onChange={(e) =>
+                                setFileForm((prev) => ({
+                                  ...prev,
+                                  audio: { ...prev.audio, openai_model: e.target.value },
+                                }))
+                              }
+                              placeholder="whisper-1"
+                              className="mt-1"
+                            />
+                          </label>
+                        </>
+                      )}
+                    </fieldset>
+
+                    <fieldset className="space-y-4 rounded-lg border border-border/50 p-4">
+                      <legend className="px-2 text-sm font-medium">视频处理</legend>
+
+                      <label className="text-sm text-foreground/85">
+                        最大关键帧数
+                        <Input
+                          type="number"
+                          min={1}
+                          max={20}
+                          value={fileForm.video.max_keyframes}
+                          onChange={(e) =>
+                            setFileForm((prev) => ({
+                              ...prev,
+                              video: { ...prev.video, max_keyframes: Number(e.target.value) },
+                            }))
+                          }
+                          className="mt-1"
+                        />
+                      </label>
+
+                      <label className="text-sm text-foreground/85">
+                        提取音频转录
+                        <div className="mt-2 flex items-center gap-3">
+                          <Switch
+                            className="data-[state=checked]:bg-primary"
+                            checked={fileForm.video.extract_audio}
+                            onCheckedChange={(checked) =>
+                              setFileForm((prev) => ({
+                                ...prev,
+                                video: { ...prev.video, extract_audio: checked },
+                              }))
+                            }
+                          />
+                          <span className="text-xs text-muted-foreground">
+                            从视频中提取音轨并转录为文字
+                          </span>
+                        </div>
+                      </label>
+
+                      <label className="text-sm text-foreground/85">
+                        帧提取策略
+                        <select
+                          value={fileForm.video.frame_strategy ?? "scene"}
+                          onChange={(e) =>
+                            setFileForm((prev) => ({
+                              ...prev,
+                              video: { ...prev.video, frame_strategy: e.target.value as "scene" | "uniform" },
+                            }))
+                          }
+                          className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                        >
+                          <option value="scene">场景检测</option>
+                          <option value="uniform">均匀采样</option>
+                        </select>
+                      </label>
+
+                      {fileForm.video.frame_strategy === "scene" && (
+                        <label className="text-sm text-foreground/85">
+                          场景检测阈值
+                          <Input
+                            type="number"
+                            min={0.1}
+                            max={0.9}
+                            step={0.05}
+                            value={fileForm.video.scene_threshold ?? 0.3}
+                            onChange={(e) =>
+                              setFileForm((prev) => ({
+                                ...prev,
+                                video: { ...prev.video, scene_threshold: Number(e.target.value) },
+                              }))
+                            }
+                            className="mt-1"
+                          />
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            值越低提取帧越多，推荐 0.3
+                          </p>
+                        </label>
+                      )}
+                    </fieldset>
+                  </div>
+                </div>
+              ) : null}
+
               {activeTab === "admin" ? (
                 isAdmin ? (
                   <AdminUsersSetting />
@@ -1409,7 +1727,7 @@ export function ManusSettings() {
               </Button>
               <Button
                 className="h-10 rounded-xl bg-primary px-6 text-primary-foreground hover:bg-primary/90"
-                disabled={isLoading || (!isAdmin && (activeTab === "agent" || activeTab === "llm"))}
+                disabled={isLoading || (!isAdmin && (activeTab === "agent" || activeTab === "llm" || activeTab === "file"))}
                 onClick={() => {
                   void handleSave();
                 }}

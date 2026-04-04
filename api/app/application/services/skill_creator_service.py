@@ -50,11 +50,56 @@ class ManifestOutput(BaseModel):
     )
 
 
-def _normalize_generated_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
-    """归一化 LLM 生成的 manifest：补全 runtime_type 和 entry.command。"""
+def _normalize_generated_manifest(
+    manifest: dict[str, Any],
+    blueprint: Any = None,
+) -> dict[str, Any]:
+    """归一化 LLM 生成的 manifest：补全缺失字段、runtime_type 和 entry.command。
+
+    当 LLM 输出不完整时（缺少 name/tools），从 blueprint 回填。
+    """
     manifest = dict(manifest)
     if "runtime_type" not in manifest:
         manifest["runtime_type"] = "native"
+
+    # 从 blueprint 回填 name（当 LLM 输出缺失时）
+    if not manifest.get("name") and blueprint is not None:
+        skill_name = getattr(blueprint, "skill_name", None)
+        if skill_name:
+            manifest["name"] = skill_name
+
+    # 从 blueprint 回填 description
+    if not manifest.get("description") and blueprint is not None:
+        desc = getattr(blueprint, "description", None)
+        if desc:
+            manifest["description"] = desc
+
+    # 从 blueprint 回填 tools（当 LLM 完全未生成 tools 时）
+    if not manifest.get("tools") and blueprint is not None:
+        bp_tools = getattr(blueprint, "tools", None)
+        if bp_tools:
+            manifest["tools"] = [
+                {
+                    "name": t.name if hasattr(t, "name") else str(t),
+                    "description": getattr(t, "description", "") or "",
+                    "parameters": {
+                        p.name: {"type": p.type or "string", "description": p.description or ""}
+                        for p in (getattr(t, "parameters", None) or [])
+                        if hasattr(p, "name")
+                    } if hasattr(t, "parameters") else {},
+                    "required": [
+                        p.name for p in (getattr(t, "parameters", None) or [])
+                        if hasattr(p, "name") and getattr(p, "required", False)
+                    ] if hasattr(t, "parameters") else [],
+                }
+                for t in bp_tools
+                if hasattr(t, "name")
+            ]
+            logger.warning(
+                "LLM 未生成 tools，从 blueprint 回填 %d 个工具",
+                len(manifest["tools"]),
+            )
+
     for tool in manifest.get("tools", []):
         if isinstance(tool, dict):
             entry = tool.get("entry")
@@ -642,7 +687,7 @@ class SkillCreatorService:
         for attempt in range(3):
             try:
                 result = await structured.ainvoke(messages)
-                result.manifest = _normalize_generated_manifest(result.manifest)
+                result.manifest = _normalize_generated_manifest(result.manifest, blueprint)
                 result.dependencies = _normalize_generated_dependencies(result.dependencies)
                 return result
             except Exception as exc:
@@ -665,7 +710,7 @@ class SkillCreatorService:
                 )
                 text = response.content if hasattr(response, "content") else str(response)
                 parsed = _parse_llm_json(text)
-                manifest = _normalize_generated_manifest(parsed.get("manifest", {}))
+                manifest = _normalize_generated_manifest(parsed.get("manifest", {}), blueprint)
                 dependencies = _normalize_generated_dependencies(
                     parsed.get("dependencies", [])
                 )
@@ -776,6 +821,30 @@ class SkillCreatorService:
                     raise ValueError(
                         f"SKILL.md 缺少 --- frontmatter（前 100 字符）: {text[:100]}"
                     )
+
+                # 合并：标准 frontmatter（来自 Exporter）+ LLM body
+                try:
+                    from app.domain.services.skill_md_parser import SkillMdParser
+                    from app.domain.services.skill_md_exporter import SkillMdExporter
+
+                    llm_parse = SkillMdParser.parse(text)
+                    # Derive slug from name if not in manifest
+                    slug = manifest.get("slug") or re.sub(
+                        r"[^a-z0-9]+", "-", manifest.get("name", "").lower()
+                    ).strip("-")
+                    standard_md = SkillMdExporter.export(
+                        meta={
+                            "name": manifest.get("name", ""),
+                            "slug": slug,
+                            "description": manifest.get("description", ""),
+                            "version": manifest.get("version", "0.1.0"),
+                            "runtime_type": manifest.get("runtime_type", "native"),
+                        },
+                        manifest={**manifest, "skill_md": llm_parse.body or ""},
+                    )
+                    text = standard_md
+                except Exception as merge_exc:
+                    logger.debug("SKILL.md frontmatter merge 失败，使用 LLM 原始输出: %s", merge_exc)
 
                 return text
             except Exception as exc:

@@ -10,6 +10,14 @@ llm_config:
   max_tokens: 8192
   # api_type: chat_completions            # API 类型: chat_completions / responses / auto
   # supports_response_format: true        # 部分兼容 API 不支持 response_format 参数，设为 false 可跳过
+  # supports_vision: true                 # 模型是否支持视觉/多模态（图片嵌入），非视觉模型设为 false 后强制使用 MCP 工具分析图片
+  # supports_pdf_input: false             # 是否支持原生 PDF 文件输入（需要模型支持，如 gpt-4o）
+  # context_overflow_guard_enabled: false  # 开启上下文超限治理
+  # token_estimator: hybrid               # token 估算策略: char(最快) / hybrid(推荐) / provider_api(需安装 tiktoken)
+  # token_safety_factor: 1.15             # token 估算安全系数
+  # tool_compress_trigger_ratio: 0.75    # Phase 1 工具结果压缩触发比例
+  # target_ratio: 0.65                   # Level 2 压缩后目标水位
+  # summary_max_chars: 16000             # 摘要上限字符数
 
 # OpenAI 官方 API 示例（gpt-5.4，推荐）
 # llm_config:
@@ -72,6 +80,19 @@ agent_config:
       - "^(请)?继续(一下|吧|下去)?$"
       - "^(好的?[,，\\s]*)?(继续|接着)$"
       - "^(ok|okay)([,\\s]+(go on|continue))?$"
+  memory:
+    summary_enabled: true
+    summary_max_rounds: 5
+    summary_token_budget: 2000
+    summary_min_steps: 1
+    context_anchor_enabled: true
+    compact_keep_summary: true
+    # Flush 调度
+    flush_enabled: false
+    flush_min_steps: 2
+    flush_min_new_tokens: 3000
+    flush_max_retries: 3
+    flush_circuit_breaker_threshold: 3
 
 mcp_config:
   mcpServers:
@@ -110,3 +131,30 @@ skill_risk_policy:
 # - 目录型 Skill 会在会话启动时预同步到 sandbox（默认 /home/ubuntu/workspace/.skills，可通过 SKILL_SANDBOX_BUNDLE_ROOT 调整）
 # - 用户偏好仍存储在 user_tool_preferences（tool_type=skill）
 # - 请在前端「设置 -> Skill 生态」中安装和管理 Skill
+
+# Skill embedding configuration (optional, disabled by default)
+# skill_embedding:
+#   enabled: false
+#   api_base: "https://api.openai.com/v1"
+#   api_key: ""
+#   model: "text-embedding-3-small"
+#   dimensions: 256
+
+# 文件理解配置（file_view 工具）
+# file_understanding:
+#   vision_fallback:                 # 非多模态主模型时的视觉 fallback（独立配置，可使用不同 provider）
+#     enabled: false
+#     base_url: ""                   # 留空则复用主 LLM 的 base_url
+#     api_key: ""                    # 留空则复用主 LLM 的 api_key
+#     model_name: ""                 # 如 gpt-4o-mini
+#     api_type: "chat_completions"   # chat_completions / responses / auto
+#   audio:
+#     provider: "disabled"           # sandbox_whisper | openai_api | disabled
+#     openai_api_key: ""
+#     openai_base_url: "https://api.openai.com/v1"
+#     openai_model: "whisper-1"
+#   video:
+#     max_keyframes: 20
+#     extract_audio: true
+#     frame_strategy: "scene"        # scene | uniform
+#     scene_threshold: 0.3           # 场景切换检测阈值（0~1）

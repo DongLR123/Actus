@@ -543,6 +543,21 @@ class TestAGenerate:
         call_kwargs = mock_client.responses.create.call_args.kwargs
         assert call_kwargs["tool_choice"] == "auto"
 
+    async def test_tool_choice_any_normalized_to_required(self, model: ActusResponsesModel) -> None:
+        """LangChain's 'any' tool_choice should be normalized to 'required' for the API."""
+        mock_resp = _MockResponseObj(_make_responses_api_response(text="ok"))
+        mock_client = AsyncMock()
+        mock_client.responses.create = AsyncMock(return_value=mock_resp)
+
+        with patch.object(model, "_get_client", return_value=mock_client):
+            await model._agenerate(
+                [HumanMessage(content="hi")],
+                tool_choice="any",
+            )
+
+        call_kwargs = mock_client.responses.create.call_args.kwargs
+        assert call_kwargs["tool_choice"] == "required"
+
     async def test_messages_converted_to_input(self, model: ActusResponsesModel) -> None:
         """LangChain messages should be converted to Responses API input format."""
         mock_resp = _MockResponseObj(_make_responses_api_response(text="Done"))

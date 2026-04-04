@@ -51,8 +51,20 @@ type SessionActions = {
   stopSession: (sessionId: string) => Promise<void>;
   deleteSession: (sessionId: string) => Promise<void>;
   clearUnread: (sessionId: string) => Promise<void>;
-  uploadFile: (file: File, sessionId?: string) => Promise<FileInfo>;
-  downloadFile: (fileId: string) => Promise<Blob>;
+  uploadFile: (
+    file: File,
+    sessionId?: string,
+    options?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }
+  ) => Promise<FileInfo>;
+  downloadFile: (
+    fileId: string,
+    options?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }
+  ) => Promise<Blob>;
+  downloadSandboxFile: (
+    sessionId: string,
+    filepath: string,
+    options?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }
+  ) => Promise<Blob>;
 };
 
 type SessionStore = SessionState & SessionActions;
@@ -878,15 +890,24 @@ export const useSessionStore = create<SessionStore>()(
       });
     },
 
-    uploadFile: async (file: File, sessionId?: string) => {
-      const uploaded = await fileApi.uploadFile({ file, session_id: sessionId });
+    uploadFile: async (file: File, sessionId?: string, options?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }) => {
+      const uploaded = await fileApi.uploadFile({
+        file,
+        session_id: sessionId,
+        onProgress: options?.onProgress,
+        signal: options?.signal,
+      });
       set({ currentSessionFiles: [...get().currentSessionFiles, uploaded] });
       showMessage("success", `已上传文件：${uploaded.filename}`);
       return uploaded;
     },
 
-    downloadFile: async (fileId: string) => {
-      return fileApi.downloadFile(fileId);
+    downloadFile: async (fileId: string, options?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }) => {
+      return fileApi.downloadFile(fileId, options);
+    },
+
+    downloadSandboxFile: async (sessionId: string, filepath: string, options?: { onProgress?: (loaded: number, total: number) => void; signal?: AbortSignal }) => {
+      return sessionApi.downloadSandboxFile(sessionId, filepath, options);
     },
   }))
 );
