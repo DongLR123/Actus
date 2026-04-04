@@ -45,6 +45,7 @@ import { getSessionStatusMeta } from "@/lib/status-copy";
 import { cn } from "@/lib/utils";
 import { normalizeUnixSeconds } from "@/lib/takeover/normalize";
 import { useSessionStore } from "@/lib/store/session-store";
+import { useTransferStore } from "@/lib/store/transfer-store";
 import { useUIStore } from "@/lib/store/ui-store";
 
 type SessionEvent = {
@@ -617,10 +618,15 @@ export default function SessionPage() {
   const fetchSessionById = useSessionStore((state) => state.fetchSessionById);
   const fetchSessionFiles = useSessionStore((state) => state.fetchSessionFiles);
   const downloadFile = useSessionStore((state) => state.downloadFile);
+  const downloadSandboxFile = useSessionStore((state) => state.downloadSandboxFile);
   const isLoadingCurrentSession = useSessionStore((state) => state.isLoadingCurrentSession);
   const isChatting = useSessionStore((state) => state.isChatting);
   const chatSessionId = useSessionStore((state) => state.chatSessionId);
   const setMessage = useUIStore((state) => state.setMessage);
+  const addTransferTask = useTransferStore((s) => s.addTask);
+  const updateTransferProgress = useTransferStore((s) => s.updateProgress);
+  const completeTransferTask = useTransferStore((s) => s.completeTask);
+  const failTransferTask = useTransferStore((s) => s.failTask);
   const isMobile = useIsMobile();
 
   const [previewOpen, setPreviewOpen] = useState(false);
@@ -791,6 +797,65 @@ export default function SessionPage() {
     });
   }, [eventList]);
 
+  // Retry watcher: when global TransferPanel retries a download task,
+  // detect the status flip back to "pending" and re-initiate the download.
+  useEffect(() => {
+    const retryDownload = async (taskId: string, sourceRef: string, filename: string) => {
+      const signal = useTransferStore.getState().getSignal(taskId);
+      if (!signal) return;
+
+      try {
+        const isSandbox = sourceRef.includes("/");
+        let blob: Blob;
+
+        if (isSandbox && sessionId) {
+          blob = await downloadSandboxFile(sessionId, sourceRef, {
+            signal,
+            onProgress: (loaded: number, total: number) => updateTransferProgress(taskId, loaded, total),
+          });
+        } else {
+          blob = await downloadFile(sourceRef, {
+            signal,
+            onProgress: (loaded: number, total: number) => updateTransferProgress(taskId, loaded, total),
+          });
+        }
+
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        completeTransferTask(taskId);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        if (typeof error === "object" && error !== null && "name" in error && (error as { name: string }).name === "CanceledError") return;
+        failTransferTask(taskId, error instanceof Error ? error.message : "下载失败");
+      }
+    };
+
+    const unsubscribe = useTransferStore.subscribe((state, prevState) => {
+      for (const [id, task] of Object.entries(state.tasks)) {
+        const prev = prevState.tasks[id];
+        if (
+          task.type === "download" &&
+          task.status === "pending" &&
+          task.sourceRef &&
+          prev &&
+          (prev.status === "failed" || prev.status === "cancelled")
+        ) {
+          void retryDownload(id, task.sourceRef, task.filename);
+        }
+      }
+    });
+
+    return unsubscribe;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId, downloadFile, downloadSandboxFile, updateTransferProgress, completeTransferTask, failTransferTask]);
+
   const closePreview = useCallback(() => {
     setPreviewOpen(false);
     setPreviewFile(null);
@@ -883,7 +948,7 @@ export default function SessionPage() {
       try {
         if (nextKind === "pdf" || nextKind === "image") {
           // 二进制可预览文件：从沙箱下载 blob 后用 iframe/img 展示
-          const blob = await sessionApi.downloadSandboxFile(sessionId, filepath);
+          const blob = await downloadSandboxFile(sessionId, filepath);
           const url = URL.createObjectURL(blob);
           setPreviewBlobUrl(url);
         } else if (nextKind === "text") {
@@ -902,27 +967,89 @@ export default function SessionPage() {
         setSandboxDownloadPath(filepath);
       }
     },
-    [currentSessionFiles, fetchSessionFiles, openFilePreview, resetPreviewState, sessionId]
+    [currentSessionFiles, downloadSandboxFile, fetchSessionFiles, openFilePreview, resetPreviewState, sessionId]
   );
 
   const handleFileDownload = useCallback(
     async (file: FileInfo) => {
+      // Dedup: skip if active transfer exists for this file
+      const existingTasks = useTransferStore.getState().tasks;
+      const hasActive = Object.values(existingTasks).some(
+        (t) => t.sourceRef === file.id && (t.status === "pending" || t.status === "transferring")
+      );
+      if (hasActive) return;
+
+      const { taskId, signal } = addTransferTask({
+        type: "download",
+        filename: file.filename,
+        totalBytes: file.size,
+        sourceRef: file.id,
+      });
+
       try {
-        const blob = await downloadFile(file.id);
+        const blob = await downloadFile(file.id, {
+          signal,
+          onProgress: (loaded: number, total: number) => updateTransferProgress(taskId, loaded, total),
+        });
+
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
         a.href = url;
         a.download = file.filename;
+        document.body.appendChild(a);
         a.click();
+        document.body.removeChild(a);
         URL.revokeObjectURL(url);
+
+        completeTransferTask(taskId);
       } catch (error) {
-        setMessage({
-          type: "error",
-          text: error instanceof Error ? error.message : "下载文件失败",
-        });
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        if (typeof error === "object" && error !== null && "name" in error && (error as { name: string }).name === "CanceledError") return;
+        failTransferTask(taskId, error instanceof Error ? error.message : "下载失败");
       }
     },
-    [downloadFile, setMessage]
+    [addTransferTask, completeTransferTask, downloadFile, failTransferTask, updateTransferProgress]
+  );
+
+  const handleSandboxDownload = useCallback(
+    async (filepath: string) => {
+      if (!sessionId) return;
+
+      const existingTasks = useTransferStore.getState().tasks;
+      const hasActive = Object.values(existingTasks).some(
+        (t) => t.sourceRef === filepath && (t.status === "pending" || t.status === "transferring")
+      );
+      if (hasActive) return;
+
+      const { taskId, signal } = addTransferTask({
+        type: "download",
+        filename: getPathTail(filepath),
+        totalBytes: 0,
+        sourceRef: filepath,
+      });
+
+      try {
+        const blob = await downloadSandboxFile(sessionId, filepath, {
+          signal,
+          onProgress: (loaded: number, total: number) => updateTransferProgress(taskId, loaded, total),
+        });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = getPathTail(filepath);
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        completeTransferTask(taskId);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        if (typeof error === "object" && error !== null && "name" in error && (error as { name: string }).name === "CanceledError") return;
+        failTransferTask(taskId, error instanceof Error ? error.message : "下载失败");
+      }
+    },
+    [addTransferTask, completeTransferTask, downloadSandboxFile, failTransferTask, sessionId, updateTransferProgress]
   );
 
   const handlePreviewImage = useCallback(
@@ -1146,22 +1273,7 @@ export default function SessionPage() {
                   <Button
                     className="mt-3 rounded-xl"
                     variant="outline"
-                    onClick={async () => {
-                      try {
-                        const blob = await sessionApi.downloadSandboxFile(sessionId, sandboxDownloadPath);
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement("a");
-                        a.href = url;
-                        a.download = getPathTail(sandboxDownloadPath);
-                        a.click();
-                        URL.revokeObjectURL(url);
-                      } catch (error) {
-                        setMessage({
-                          type: "error",
-                          text: error instanceof Error ? error.message : "下载文件失败",
-                        });
-                      }
-                    }}
+                    onClick={() => void handleSandboxDownload(sandboxDownloadPath)}
                   >
                     下载文件
                   </Button>

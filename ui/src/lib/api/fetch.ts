@@ -1,42 +1,16 @@
-import { useAuthStore } from "@/lib/store/auth-store";
+import {
+  ApiError,
+  API_BASE_URL,
+  getAccessToken,
+  handleLogout,
+  maybeRefreshToken,
+} from "./auth-utils";
 
 import type { ApiResponse } from "./types";
 
-const API_CONFIG = {
-  baseURL: process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:8000/api",
-  timeout: 30000,
-} as const;
+export { ApiError } from "./auth-utils";
 
-export class ApiError extends Error {
-  code: number;
-  httpStatus: number;
-  data: unknown;
-  retryAfter?: number;
-  limit?: number;
-  bucket?: string;
-  windowSeconds?: number;
-
-  constructor(params: {
-    code: number;
-    httpStatus: number;
-    msg: string;
-    data?: unknown;
-    retryAfter?: number;
-    limit?: number;
-    bucket?: string;
-    windowSeconds?: number;
-  }) {
-    super(params.msg);
-    this.name = "ApiError";
-    this.code = params.code;
-    this.httpStatus = params.httpStatus;
-    this.data = params.data ?? null;
-    this.retryAfter = params.retryAfter;
-    this.limit = params.limit;
-    this.bucket = params.bucket;
-    this.windowSeconds = params.windowSeconds;
-  }
-}
+const API_TIMEOUT = 30000;
 
 type RequestOptions = RequestInit & {
   timeout?: number;
@@ -44,12 +18,8 @@ type RequestOptions = RequestInit & {
   retryOn401?: boolean;
 };
 
-let refreshPromise: Promise<boolean> | null = null;
-
 function normalizeEndpoint(endpoint: string): string {
-  return endpoint.startsWith("http")
-    ? endpoint
-    : `${API_CONFIG.baseURL}${endpoint}`;
+  return endpoint.startsWith("http") ? endpoint : `${API_BASE_URL}${endpoint}`;
 }
 
 function isSuccessCode(code: number): boolean {
@@ -114,25 +84,13 @@ function extractDetailMessage(detail: unknown): string | null {
   return null;
 }
 
-async function maybeRefreshToken(): Promise<boolean> {
-  if (!refreshPromise) {
-    refreshPromise = useAuthStore
-      .getState()
-      .refresh()
-      .finally(() => {
-        refreshPromise = null;
-      });
-  }
-  return refreshPromise;
-}
-
 async function requestResponse(
   endpoint: string,
   options: RequestOptions = {}
 ): Promise<Response> {
   const url = normalizeEndpoint(endpoint);
   const {
-    timeout = API_CONFIG.timeout,
+    timeout = API_TIMEOUT,
     skipAuth = false,
     retryOn401 = true,
     headers,
@@ -147,7 +105,7 @@ async function requestResponse(
       }, timeout)
     : null;
 
-  const token = useAuthStore.getState().accessToken;
+  const token = getAccessToken();
   const mergedHeaders = new Headers(headers);
 
   if (!mergedHeaders.has("Accept")) {
@@ -173,7 +131,7 @@ async function requestResponse(
     ) {
       const refreshed = await maybeRefreshToken();
       if (!refreshed) {
-        useAuthStore.getState().logout();
+        handleLogout();
         return response;
       }
       return requestResponse(endpoint, {

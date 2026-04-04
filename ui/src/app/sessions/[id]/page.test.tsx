@@ -15,6 +15,7 @@ type SessionStoreState = {
   fetchSessionById: ReturnType<typeof vi.fn>;
   fetchSessionFiles: ReturnType<typeof vi.fn>;
   downloadFile: ReturnType<typeof vi.fn>;
+  downloadSandboxFile: ReturnType<typeof vi.fn>;
   isLoadingCurrentSession: boolean;
   isChatting: boolean;
   chatSessionId: string | null;
@@ -27,6 +28,7 @@ const sessionStoreState: SessionStoreState = {
   fetchSessionById: vi.fn(async () => {}),
   fetchSessionFiles: vi.fn(async () => {}),
   downloadFile: vi.fn(async () => new Blob()),
+  downloadSandboxFile: vi.fn(async () => new Blob()),
   isLoadingCurrentSession: false,
   isChatting: false,
   chatSessionId: null,
@@ -93,6 +95,23 @@ vi.mock("@/components/ui/sheet", () => ({
   SheetTitle: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
 }));
 
+vi.mock("@/lib/store/transfer-store", () => ({
+  useTransferStore: Object.assign(
+    (selector: (state: Record<string, unknown>) => unknown) =>
+      selector({
+        tasks: {},
+        addTask: vi.fn(() => ({ taskId: "t1", signal: new AbortController().signal })),
+        updateProgress: vi.fn(),
+        completeTask: vi.fn(),
+        failTask: vi.fn(),
+      }),
+    {
+      getState: () => ({ tasks: {}, getSignal: vi.fn() }),
+      subscribe: vi.fn(() => vi.fn()),
+    }
+  ),
+}));
+
 vi.mock("@/lib/store/session-store", () => ({
   useSessionStore: (selector: (state: SessionStoreState) => unknown) =>
     selector(sessionStoreState),
@@ -125,6 +144,7 @@ describe("SessionPage", () => {
     sessionStoreState.fetchSessionById.mockClear();
     sessionStoreState.fetchSessionFiles.mockClear();
     sessionStoreState.downloadFile.mockClear();
+    sessionStoreState.downloadSandboxFile.mockClear();
     sessionStoreState.isLoadingCurrentSession = false;
     sessionStoreState.isChatting = false;
     sessionStoreState.chatSessionId = null;

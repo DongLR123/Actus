@@ -1,4 +1,5 @@
-import { createSSEStream, get, parseSSEStream, post, requestBlob } from "./fetch";
+import { createSSEStream, get, parseSSEStream, post } from "./fetch";
+import { fileTransferClient } from "./axios-client";
 import type {
   ChatParams,
   CreateSessionResponse,
@@ -161,8 +162,28 @@ export const sessionApi = {
     return post<FileReadResponse>(`/sessions/${sessionId}/file`, params);
   },
 
-  downloadSandboxFile: (sessionId: string, filepath: string): Promise<Blob> => {
-    return requestBlob(`/sessions/${sessionId}/file/download?filepath=${encodeURIComponent(filepath)}`);
+  downloadSandboxFile: async (
+    sessionId: string,
+    filepath: string,
+    options?: {
+      onProgress?: (loaded: number, total: number) => void;
+      signal?: AbortSignal;
+    }
+  ): Promise<Blob> => {
+    const response = await fileTransferClient.get(
+      `/sessions/${sessionId}/file/download`,
+      {
+        params: { filepath },
+        responseType: "blob",
+        signal: options?.signal,
+        onDownloadProgress: options?.onProgress
+          ? (event) => {
+              options.onProgress!(event.loaded, event.total ?? 0);
+            }
+          : undefined,
+      }
+    );
+    return response.data as Blob;
   },
 
   viewShell: (

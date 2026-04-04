@@ -13,6 +13,7 @@ vi.mock("@/lib/api/session", () => ({
     clearUnreadMessageCount: vi.fn(),
     viewFile: vi.fn(),
     viewShell: vi.fn(),
+    downloadSandboxFile: vi.fn(),
   },
 }));
 
@@ -23,12 +24,14 @@ vi.mock("@/lib/api/file", () => ({
   },
 }));
 
+import { fileApi } from "@/lib/api/file";
 import { sessionApi } from "@/lib/api/session";
 import type { Session } from "@/lib/api/types";
 import { useSessionStore } from "@/lib/store/session-store";
 import { useUIStore } from "@/lib/store/ui-store";
 
 const mockedSessionApi = vi.mocked(sessionApi, { deep: true });
+const mockedFileApi = vi.mocked(fileApi, { deep: true });
 
 function buildSession(overrides?: Partial<Session>): Session {
   return {
@@ -624,5 +627,44 @@ describe("session-store", () => {
     await useSessionStore.getState().fetchSessionById("s1", { silent: true });
 
     expect(useSessionStore.getState().currentSession).toBe(current);
+  });
+
+  describe("uploadFile with transfer options", () => {
+    it("forwards onProgress and signal to fileApi", async () => {
+      const mockResult = { id: "f1", filename: "a.txt", filepath: "", key: "", extension: ".txt", mime_type: "text/plain", size: 10 };
+      mockedFileApi.uploadFile.mockResolvedValue(mockResult);
+      const onProgress = vi.fn();
+      const controller = new AbortController();
+      const file = new File(["x"], "a.txt");
+
+      await useSessionStore.getState().uploadFile(file, "s1", { onProgress, signal: controller.signal });
+
+      expect(mockedFileApi.uploadFile).toHaveBeenCalledWith(
+        expect.objectContaining({ file, session_id: "s1", onProgress, signal: controller.signal })
+      );
+    });
+  });
+
+  describe("downloadFile with transfer options", () => {
+    it("forwards onProgress and signal to fileApi", async () => {
+      mockedFileApi.downloadFile.mockResolvedValue(new Blob(["data"]));
+      const onProgress = vi.fn();
+      const controller = new AbortController();
+
+      await useSessionStore.getState().downloadFile("f1", { onProgress, signal: controller.signal });
+
+      expect(mockedFileApi.downloadFile).toHaveBeenCalledWith("f1", { onProgress, signal: controller.signal });
+    });
+  });
+
+  describe("downloadSandboxFile", () => {
+    it("forwards to sessionApi with options", async () => {
+      mockedSessionApi.downloadSandboxFile.mockResolvedValue(new Blob(["data"]));
+      const onProgress = vi.fn();
+
+      await useSessionStore.getState().downloadSandboxFile("s1", "/path/file.txt", { onProgress });
+
+      expect(mockedSessionApi.downloadSandboxFile).toHaveBeenCalledWith("s1", "/path/file.txt", { onProgress });
+    });
   });
 });

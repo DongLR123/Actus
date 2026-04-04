@@ -28,6 +28,28 @@ vi.mock("@/lib/store/ui-store", () => ({
     selector({ setMessage: vi.fn() }),
 }));
 
+vi.mock("@/lib/store/transfer-store", () => ({
+  useTransferStore: (selector: (state: Record<string, unknown>) => unknown) =>
+    selector({
+      tasks: {},
+      addTask: vi.fn(() => ({ taskId: "t1", signal: new AbortController().signal })),
+      updateProgress: vi.fn(),
+      completeTask: vi.fn(),
+      failTask: vi.fn(),
+      cancelTask: vi.fn(),
+      retryTask: vi.fn(() => ({ signal: new AbortController().signal })),
+      bindTaskSession: vi.fn(),
+      removeTask: vi.fn(),
+      getSourceFile: vi.fn(),
+    }),
+  selectHasActiveUploads: () => () => false,
+  selectCompletedUploadResults: () => () => [],
+}));
+
+vi.mock("@/components/transfer-progress", () => ({
+  TransferProgress: () => null,
+}));
+
 import { ChatInput } from "./chat-input";
 
 describe("ChatInput takeover state", () => {
