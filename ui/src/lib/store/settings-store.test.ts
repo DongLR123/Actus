@@ -20,6 +20,8 @@ vi.mock("@/lib/api/config", () => ({
     updateSkillEnabled: vi.fn(),
     getSkillRiskPolicy: vi.fn(),
     updateSkillRiskPolicy: vi.fn(),
+    getFileUnderstandingConfig: vi.fn(),
+    updateFileUnderstandingConfig: vi.fn(),
   },
 }));
 
@@ -98,6 +100,25 @@ describe("settings-store", () => {
     });
     mockedConfigApi.getSkillRiskPolicy.mockResolvedValue({
       mode: "off",
+    });
+    mockedConfigApi.getFileUnderstandingConfig.mockResolvedValue({
+      vision_fallback: {
+        enabled: false,
+        base_url: "",
+        model_name: "",
+        api_type: "auto",
+      },
+      audio: {
+        provider: "disabled",
+        openai_base_url: "",
+        openai_model: "whisper-1",
+      },
+      video: {
+        max_keyframes: 10,
+        extract_audio: false,
+        frame_strategy: "uniform",
+        scene_threshold: 0.3,
+      },
     });
   });
 
